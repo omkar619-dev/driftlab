@@ -1,0 +1,5 @@
+# build output
+/bin/
+
+# run artifacts: histories are evidence, so commit the ones a finding cites, not every run
+/runs/

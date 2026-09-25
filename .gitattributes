@@ -1,0 +1,3 @@
+# Keep LF everywhere: history fixtures are compared byte-for-byte in tests,
+# and Windows CRLF conversion would make them pass in CI but fail locally.
+* text=auto eol=lf

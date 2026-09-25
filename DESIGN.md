@@ -1,0 +1,234 @@
+# driftlab: design (v0)
+
+> Status: draft, 2026-09-25. v0 = the checker + one system (NATS JetStream, Go client).
+
+## What driftlab is
+
+driftlab records what a streaming client library actually did under faults, then checks that
+record against the delivery guarantees the library documents.
+
+## Why it exists, and what it is not
+
+Jepsen asks whether a *server* keeps its promises. Its NATS 2.12.1 analysis
+(https://jepsen.io/analyses/nats-2.12.1) tested JetStream durability through the Java client, and
+it explicitly left consumer-side delivery unchecked: whether a single consumer misses messages, or
+receives them out of order.
+
+That gap is where real bugs live. https://github.com/nats-io/nats.go/issues/2107 was the Go
+client's ordered consumer silently losing messages while the server behaved correctly.
+
+driftlab's lane is **the client library you actually import**. It runs the same scenario against
+different client APIs and versions, and one checker judges all of them.
+
+What is *not* new, stated up front: the anomaly vocabulary (lost-write, poll-skip,
+nonmonotonic-poll, duplicate) comes from Jepsen's Kafka workload
+(https://jepsen-io.github.io/jepsen/jepsen.tests.kafka.html). We reuse those names on purpose, so
+anyone who knows Jepsen can read driftlab output without a glossary.
+
+## First principles
+
+Every decision below follows from one of these.
+
+1. **A guarantee is a sentence in the docs.** "Reliable" can't be tested. "An ordered consumer
+   delivers every message in stream order, with no gaps, and recovers on its own" can. Every
+   scenario starts by quoting the contract it checks.
+2. **Record first, judge later.** A run writes a *history*: a JSONL log of everything that
+   happened. A separate, pure checker reads it afterwards. Runs are nondeterministic and expensive
+   to repeat, while histories are cheap to keep. When the checker has a bug, fix it and re-check
+   the old histories without re-running anything. This is the same shape as the MIT 6.5840 KV
+   tests, which record every Get/Put and hand that history to porcupine.
+3. **An operation has three outcomes, not two.** They are `ok` (it definitely happened), `fail`
+   (it definitely did not) and `info` (unknown). A publish that timed out may still be in the
+   stream, and may even land later. Recording it as `fail` would turn every timeout into a false
+   "phantom message" report.
+4. **Order comes from the system's sequence numbers, never from clocks.** JetStream stamps each
+   stored message with a stream sequence, and that number alone decides order and gaps.
+   Timestamps are for humans reading the timeline. They answer exactly one question: did the
+   consumer catch up within the grace window after the fault ended?
+5. **Remove every legitimate reason for a gap.** Use one subject, no retention limits and no
+   deletes. Stream sequences are then exactly 1..N, and the ordered-consumer contract collapses to
+   one line: *the delivered stream sequences must be 1, 2, …, N.* Any deviation is a bug, and the
+   checker only has to classify it.
+6. **Calibrate before you measure.** A checker that has never reported a violation is untested.
+   Before any "finding" means anything, the checker must (a) flag hand-written bad histories,
+   (b) catch a real, known bug, and (c) pass the fix for that bug.
+7. **Every experiment has a control.** Each scenario also runs with no fault injected. An anomaly
+   in the control run means the harness or the environment is broken, not the system under test.
+8. **The injected fault should be the only uncontrolled thing.** The harness and the broker run
+   on the same wired machine. A flaky NIC, a Wi-Fi hop or a host that's paging produces
+   "violations" nobody can attribute to anything.
+
+## v0 scope
+
+**Server:** `nats:2.14.7` (single node, file storage). This is the same minor version the 2107
+reporter used, at its latest patch.
+
+**Client:** `github.com/nats-io/nats.go`, with two consumer APIs from the same library:
+
+- `legacy`: the push ordered consumer, `js.Subscribe(subj, cb, nats.OrderedConsumer())`. KV and
+  Object Store watchers are built on this path.
+- `jetstream`: the ordered consumer from the newer `jetstream` package.
+
+**Client versions (the calibration pair):**
+
+- `v1.53.1` is the last release that has the 2107 bug.
+- `v1.54.0` contains the fix, https://github.com/nats-io/nats.go/pull/2137 (merged 2026-09-18).
+
+**Faults in v0 are client-side only.** The consumer's callback stalls while a low pending limit is
+set, which is exactly the 2107 trigger. Network and server faults come in weekend 3.
+
+**Non-goals for v0:** multi-node clusters, Kafka/Redpanda/Redis, exactly-once, durable acked
+consumers and redelivery, and a second machine.
+
+## Scenarios
+
+Each scenario mirrors the reproduction in the issue. It publishes N=100 messages, starts the
+ordered consumer, stalls its first callback while the pending limit is 20 messages, then releases
+it. It then publishes one tail message, waits a grace window and does the final read.
+
+| Scenario | Stall | Why it exists |
+|---|---|---|
+| `control` | none | proves the harness and environment are clean |
+| `slow-short` | 2s, shorter than the 5s ordered-consumer heartbeat | the path in the issue: no reset ever fires |
+| `slow-long` | 8s, longer than the heartbeat | the heartbeat reset fires, but it resumes from a sequence that has already been advanced past messages that were never delivered |
+
+`slow-long` matters because a fix that only covers the short path passes `slow-short` and still
+fails here.
+
+## Calibration matrix (the v0 exit criterion)
+
+| Scenario | legacy @ v1.53.1 | legacy @ v1.54.0 | jetstream @ v1.53.1 | jetstream @ v1.54.0 |
+|---|---|---|---|---|
+| control | clean | clean | clean | clean |
+| slow-short | **poll-skip** (the issue's repro loses 80 of 100) | clean | clean | clean |
+| slow-long | **poll-skip** expected | clean expected | clean | clean |
+
+The expected values come from the issue and the fix, and driftlab must reproduce them from
+black-box observation alone. If `legacy @ v1.54.0` fails `slow-long`, that is a real finding. It
+goes to the nats.go maintainers with the history file attached.
+
+## History format (the wire contract)
+
+A history is one JSON object per line. The first line is a `meta` record, so every history says
+exactly what produced it.
+
+```jsonl
+{"type":"meta","driver":"natsgo","client":"github.com/nats-io/nats.go@v1.53.1","api":"legacy","server":"nats:2.14.7","scenario":"slow-short","params":{"n":100,"pending_msgs":20,"stall":"2s"},"driftlab":"<git sha>"}
+{"index":0,"time_ns":0,"process":"producer","type":"invoke","f":"publish","value":1}
+{"index":1,"time_ns":410000,"process":"producer","type":"ok","f":"publish","value":1,"stream_seq":1}
+{"index":2,"time_ns":502000000,"process":"consumer","type":"ok","f":"deliver","value":1,"stream_seq":1}
+{"index":3,"time_ns":502100000,"process":"nemesis","type":"info","f":"stall-start","detail":{"duration":"2s"}}
+{"index":4,"time_ns":611000000,"process":"consumer","type":"info","f":"client-error","error":"nats: slow consumer, messages dropped"}
+{"index":5,"time_ns":9000000000,"process":"final-read","type":"ok","f":"read","value":1,"stream_seq":1}
+```
+
+Field rules:
+
+- `type` is one of `invoke`, `ok`, `fail` or `info`, following Jepsen's vocabulary. The only other
+  value is `meta`. v0 records every publish error as `info`. Telling which errors are definite
+  failures takes care, so that comes later.
+- `value` is unique per message across the run: the producer assigns 1, 2, 3, and so on. This
+  makes every message identifiable end to end, independently of the server.
+- `stream_seq` is the server's sequence. It appears on `ok` publishes (taken from the PubAck), on
+  every delivery (taken from the message metadata) and on final-read records.
+- `process` is one of `producer`, `consumer`, `nemesis` or `final-read`. Fault events live in the
+  same history as everything else, so each anomaly can be lined up against the fault that caused
+  it.
+- `time_ns` is monotonic time since the driver started, not wall-clock time. That follows from
+  principle 4. Once one run has several processes, the harness will stamp receive times instead.
+- Unknown fields are ignored, so the format can grow.
+
+**Final read:** after the scenario ends, a fresh connection reads the whole stream from sequence 1.
+That read is the ground truth for what the stream contains.
+
+## Checker (v0)
+
+The checker is a pure function, `Check(history) -> []Anomaly`, with no network access. Its only
+use of time is the liveness window.
+
+| Anomaly | Definition | Usually whose bug |
+|---|---|---|
+| `lost-write` | an `ok` publish whose value is missing from the final read | server (durability) |
+| `poll-skip` | the consumer jumps from stream_seq a to some b > a+1; the skipped range is then classified as *delivered late* or *never delivered* | client |
+| `nonmonotonic-poll` | the consumer delivers b after a, with b < a | client |
+| `duplicate` | one consumer receives the same stream_seq twice | client |
+| `stall` | at the end of the grace window after the last fault, the consumer still hasn't reached the final read's last sequence | client (liveness) |
+| `phantom` | a delivered value that no producer ever invoked | client or server |
+
+An `info` publish may or may not appear in the stream, and neither case is an anomaly.
+
+Each anomaly carries the history indexes of the ops involved. It also carries any `client-error`
+and nemesis events that fall inside the window, so the output points at evidence instead of just
+summarising it.
+
+## Architecture
+
+```
+laptop   edit code, run checker unit tests (pure Go), git push
+           |
+           v   git pull
+newpc    docker compose: nats-server   <---   driver binary (one per client version)
+                                                  |
+                                                  v  stdout
+                                             history.jsonl  --->  driftlab check  --->  verdict
+```
+
+- **Drivers are separate binaries that write the JSONL format to stdout.** They share no Go code
+  with the checker, because the history format *is* the interface. That is what lets two nats.go
+  versions sit behind one checker, and later sarama vs franz-go, or a client written in another
+  language. It also means a driver that panics can't take the checker down with it.
+- **Two versions of one library come from `-modfile`.** `drivers/natsgo/go.mod` pins v1.54.0 and
+  `drivers/natsgo/v1.53.1.mod` pins v1.53.1, so `go build -modfile=v1.53.1.mod` builds the buggy
+  variant. `go version -m <binary>` proves which version got linked, and the driver writes that
+  version into its `meta` line too.
+- **Go versions:** the root module (the checker) targets Go 1.25 so it builds on the laptop. The
+  driver module needs Go 1.26, because nats.go v1.54.0 declares `go 1.26.0`. Build it on newpc.
+
+## Repo layout (v0)
+
+```
+driftlab/
+├── DESIGN.md
+├── go.mod                   module github.com/omkar619-dev/driftlab (checker + CLI, no client libs)
+├── cmd/driftlab/            CLI: `driftlab check <history.jsonl>`
+├── internal/history/        the Op type and the JSONL reader
+├── internal/checker/        Check() and its anomaly kinds
+│   └── testdata/            hand-written histories: one clean, one per anomaly kind
+├── drivers/natsgo/          separate module: talks to NATS, writes a history to stdout
+│   ├── go.mod               nats.go v1.54.0 (fixed)
+│   └── v1.53.1.mod          nats.go v1.53.1 (last buggy release), used via -modfile
+└── deploy/compose.yaml      nats-server with JetStream (weekend 2), toxiproxy (weekend 3)
+```
+
+## Milestones
+
+- **Tonight:** the repo, this document, go.mod and .gitattributes, pushed.
+- **Weekend 1 (the checker, no NATS at all):** the history reader, `Check`, and table-driven tests
+  over hand-written histories. The fixtures are one clean history, one per anomaly kind, plus
+  `info` publishes that are present and absent (both must pass). Exit: `driftlab check` flags
+  every bad fixture and passes every good one. That is calibration step (a).
+- **Weekend 2 (the driver and calibration):** the natsgo driver (both APIs, both versions), the
+  compose file and the matrix above. Exit: the matrix reproduces. That is calibration steps (b)
+  and (c).
+- **Weekend 3 (network and server faults):** toxiproxy between the driver and nats-server, for
+  connection cuts and latency above the heartbeat interval. Docker pause, kill and restart of
+  nats-server. Run the same matrix again. This is the first point where driftlab can find
+  something nobody has reported yet.
+
+## Beyond v0 (one line each, so v0 stays small)
+
+- **v1:** the Go Kafka client matrix (franz-go, sarama, kafka-go, confluent-kafka-go) against one
+  broker, with consumer-group rebalances and leader elections. Then Redpanda and Redis Streams.
+  The output is a published table of client × documented guarantee × verdict under each fault.
+- **v2:** backpressure, exactly-once claims, redelivery semantics, time-to-recovery.
+- **v3:** seeded fault schedules, shrinking a failing schedule down to a minimal one, and a CI mode
+  so maintainers can run it nightly.
+- **v4:** each client's documented guarantees encoded as machine-readable claims files.
+
+## Open questions (decide when we reach them)
+
+- Kafka consumers poll in batches, while push callbacks deliver one message at a time. Should
+  `deliver` events grow a batch form, the way Jepsen models polls?
+- How much harness orchestration (`driftlab run`) is needed before weekend 3?
+- Durable consumers with acks make duplicates legal, but only when they're marked as
+  redeliveries. That is a different contract, so it probably needs a separate checker mode.
