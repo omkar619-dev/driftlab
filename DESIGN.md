@@ -1,6 +1,6 @@
 # driftlab: design (v0)
 
-> Status: draft, 2026-09-25. v0 = the checker + one system (NATS JetStream, Go client).
+> Status: draft, last updated 2026-09-26. v0 = the checker + one system (NATS JetStream, Go client).
 
 ## What driftlab is
 
@@ -39,8 +39,8 @@ Every decision below follows from one of these.
    tests, which record every Get/Put and hand that history to porcupine.
 3. **An operation has three outcomes, not two.** They are `ok` (it definitely happened), `fail`
    (it definitely did not) and `info` (unknown). A publish that timed out may still be in the
-   stream, and may even land later. Recording it as `fail` would turn every timeout into a false
-   "phantom message" report.
+   stream, and may even land later. If we recorded it as `fail` and it did land, the checker would
+   report a phantom: a message that supposedly never happened, sitting in the stream.
 4. **Order comes from the system's sequence numbers, never from clocks.** JetStream stamps each
    stored message with a stream sequence, and that number alone decides order and gaps.
    Timestamps are for humans reading the timeline. They answer exactly one question: did the
@@ -153,9 +153,11 @@ use of time is the liveness window.
 | `nonmonotonic-poll` | the consumer delivers b after a, with b < a | client |
 | `duplicate` | one consumer receives the same stream_seq twice | client |
 | `stall` | at the end of the grace window after the last fault, the consumer still hasn't reached the final read's last sequence | client (liveness) |
-| `phantom` | a delivered value that no producer ever invoked | client or server |
+| `phantom` | a value seen by the consumer or the final read that no producer ever invoked, or whose publish was recorded as `fail` | client or server |
 
-An `info` publish may or may not appear in the stream, and neither case is an anomaly.
+An `info` publish may or may not appear in the stream, and neither case is an anomaly. In v0 every
+publish error is recorded as `info` (see the field rules), so only the first half of `phantom` can
+fire until definite failures are classified.
 
 Each anomaly carries the history indexes of the ops involved. It also carries any `client-error`
 and nemesis events that fall inside the window, so the output points at evidence instead of just
@@ -177,32 +179,63 @@ newpc    docker compose: nats-server   <---   driver binary (one per client vers
   with the checker, because the history format *is* the interface. That is what lets two nats.go
   versions sit behind one checker, and later sarama vs franz-go, or a client written in another
   language. It also means a driver that panics can't take the checker down with it.
-- **Two versions of one library come from `-modfile`.** `drivers/natsgo/go.mod` pins v1.54.0 and
-  `drivers/natsgo/v1.53.1.mod` pins v1.53.1, so `go build -modfile=v1.53.1.mod` builds the buggy
-  variant. `go version -m <binary>` proves which version got linked, and the driver writes that
-  version into its `meta` line too.
-- **Go versions:** the root module (the checker) targets Go 1.25 so it builds on the laptop. The
-  driver module needs Go 1.26, because nats.go v1.54.0 declares `go 1.26.0`. Build it on newpc.
+
+### Why two go.mod files
+
+Go builds a module with exactly one version of each dependency, so a single module can never link
+nats.go v1.53.1 and v1.54.0 together. That one rule decides the layout.
+
+- **The root `go.mod` belongs to the judge.** The checker and the CLI import no client library at
+  all. That keeps them buildable on the laptop's Go 1.25, and it means upgrading a client library
+  can never change how histories are judged.
+- **`drivers/natsgo/go.mod` belongs to the witness.** The driver is the only code that imports
+  nats.go. It pins v1.54.0 and needs Go 1.26, because nats.go v1.54.0 declares `go 1.26.0`, so it
+  gets built on newpc. A separate module keeps both of those out of the checker.
+- **`drivers/natsgo/v1.53.1.mod` is not a third module.** It is a second recipe for the same
+  driver: the same source code with the older nats.go. `go build -modfile=v1.53.1.mod` uses it, and
+  Go keeps its checksums in a matching `v1.53.1.sum`. So one source tree produces two binaries.
+  `go version -m <binary>` proves which nats.go got linked, and the driver also writes that version
+  into its `meta` line.
+- **The two modules never import each other.** They only share the JSONL format. So the repo needs
+  no `go.work` file, and `go build ./...` at the root skips `drivers/`, because a folder with its
+  own `go.mod` belongs to that module instead.
+- **In v1, every Kafka client gets its own driver module**, so their dependency trees can never
+  collide.
 
 ## Repo layout (v0)
 
 ```
 driftlab/
 ├── DESIGN.md
-├── go.mod                   module github.com/omkar619-dev/driftlab (checker + CLI, no client libs)
-├── cmd/driftlab/            CLI: `driftlab check <history.jsonl>`
-├── internal/history/        the Op type and the JSONL reader
-├── internal/checker/        Check() and its anomaly kinds
-│   └── testdata/            hand-written histories: one clean, one per anomaly kind
-├── drivers/natsgo/          separate module: talks to NATS, writes a history to stdout
-│   ├── go.mod               nats.go v1.54.0 (fixed)
-│   └── v1.53.1.mod          nats.go v1.53.1 (last buggy release), used via -modfile
-└── deploy/compose.yaml      nats-server with JetStream (weekend 2), toxiproxy (weekend 3)
+├── go.mod
+├── cmd/driftlab/
+├── internal/
+│   ├── history/
+│   └── checker/
+│       └── testdata/
+├── drivers/
+│   └── natsgo/
+│       ├── go.mod
+│       └── v1.53.1.mod
+└── deploy/
+    └── compose.yaml
 ```
+
+| Path | What it is |
+|---|---|
+| `go.mod` | the root module: the checker and the CLI, with no client libraries |
+| `cmd/driftlab/` | the CLI: `driftlab check <history.jsonl>` |
+| `internal/history/` | the Op type and the JSONL reader |
+| `internal/checker/` | `Check()` and its anomaly kinds |
+| `internal/checker/testdata/` | hand-written histories: one clean, one per anomaly kind |
+| `drivers/natsgo/` | a separate module that talks to NATS and writes a history to stdout |
+| `drivers/natsgo/go.mod` | pins nats.go v1.54.0 (the fixed release) |
+| `drivers/natsgo/v1.53.1.mod` | pins nats.go v1.53.1 (the last buggy release), used via `-modfile` |
+| `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 
 ## Milestones
 
-- **Tonight:** the repo, this document, go.mod and .gitattributes, pushed.
+- **2026-09-25 (done):** the repo, this document, go.mod and .gitattributes, pushed.
 - **Weekend 1 (the checker, no NATS at all):** the history reader, `Check`, and table-driven tests
   over hand-written histories. The fixtures are one clean history, one per anomaly kind, plus
   `info` publishes that are present and absent (both must pass). Exit: `driftlab check` flags
@@ -225,10 +258,14 @@ driftlab/
   so maintainers can run it nightly.
 - **v4:** each client's documented guarantees encoded as machine-readable claims files.
 
-## Open questions (decide when we reach them)
+## Open questions (decided when we reach them)
 
-- Kafka consumers poll in batches, while push callbacks deliver one message at a time. Should
-  `deliver` events grow a batch form, the way Jepsen models polls?
-- How much harness orchestration (`driftlab run`) is needed before weekend 3?
-- Durable consumers with acks make duplicates legal, but only when they're marked as
-  redeliveries. That is a different contract, so it probably needs a separate checker mode.
+- **Batch deliveries.** Kafka consumers poll in batches, while push callbacks deliver one message
+  at a time. Should `deliver` events grow a batch form, the way Jepsen models polls?
+  *Comes up:* in v1, when the first Kafka driver is written.
+- **Orchestration.** How much of a `driftlab run` command do we need? *Comes up:* at the end of
+  weekend 2. The matrix is 12 runs (3 scenarios × 2 APIs × 2 versions). That's fine by hand once,
+  and worth a script by the second time.
+- **Durable consumers.** With acks, duplicates become legal, but only when they're marked as
+  redeliveries. That's a different contract, so it probably needs a separate checker mode.
+  *Comes up:* in v2, with redelivery semantics.
