@@ -261,7 +261,8 @@ driftlab/
 ## Open questions (decided when we reach them)
 
 - **Batch deliveries.** Kafka consumers poll in batches, while push callbacks deliver one message
-  at a time. Should `deliver` events grow a batch form, the way Jepsen models polls?
+  at a time. Should `deliver` events grow a batch form, the way Jepsen models polls? Kafka offsets
+  also start at 0, which breaks the history package's convention that 0 means "absent".
   *Comes up:* in v1, when the first Kafka driver is written.
 - **Orchestration.** How much of a `driftlab run` command do we need? *Comes up:* at the end of
   weekend 2. The matrix is 12 runs (3 scenarios × 2 APIs × 2 versions). That's fine by hand once,
