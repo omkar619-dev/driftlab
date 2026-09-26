@@ -40,7 +40,10 @@ Every decision below follows from one of these.
 3. **An operation has three outcomes, not two.** They are `ok` (it definitely happened), `fail`
    (it definitely did not) and `info` (unknown). A publish that timed out may still be in the
    stream, and may even land later. If we recorded it as `fail` and it did land, the checker would
-   report a phantom: a message that supposedly never happened, sitting in the stream.
+   report a phantom: a message that supposedly never happened, sitting in the stream. The price of
+   `info` is that we can only accuse the server of losing messages we have a receipt (an ack) for.
+   If the server accepted a message, the ack got lost on the way back and the server then lost the
+   message, the history looks exactly like a publish that never arrived.
 4. **Order comes from the system's sequence numbers, never from clocks.** JetStream stamps each
    stored message with a stream sequence, and that number alone decides order and gaps.
    Timestamps are for humans reading the timeline. They answer exactly one question: did the
@@ -159,6 +162,13 @@ An `info` publish may or may not appear in the stream, and neither case is an an
 publish error is recorded as `info` (see the field rules), so only the first half of `phantom` can
 fire until definite failures are classified.
 
+**Verdicts.** A run is *clean* (no anomalies), *failed* (at least one anomaly) or *invalid*. A run
+is invalid when a fault scenario's history holds no evidence that the fault fired. Like a test
+strip whose control line never shows, it tested nothing, so it can't count as clean. A run is also
+invalid when the final read isn't exactly 1..N, because the ordered-consumer contract (principle 5)
+only holds for a contiguous stream. Every verdict also reports how many publishes ended as `info`,
+so a clean verdict with a large blind spot is visibly weak.
+
 Each anomaly carries the history indexes of the ops involved. It also carries any `client-error`
 and nemesis events that fall inside the window, so the output points at evidence instead of just
 summarising it.
@@ -236,8 +246,8 @@ driftlab/
 ## Milestones
 
 - **2026-09-25 (done):** the repo, this document, go.mod and .gitattributes, pushed.
-- **Weekend 1 (the checker, no NATS at all):** the history reader, `Check`, and table-driven tests
-  over hand-written histories. The fixtures are one clean history, one per anomaly kind, plus
+- **Weekend 1 (the checker, no NATS at all):** the history reader, `Check`, the verdict rules, and
+  table-driven tests over hand-written histories. The fixtures are one clean history, one per anomaly kind, plus
   `info` publishes that are present and absent (both must pass). Exit: `driftlab check` flags
   every bad fixture and passes every good one. That is calibration step (a).
 - **Weekend 2 (the driver and calibration):** the natsgo driver (both APIs, both versions), the
