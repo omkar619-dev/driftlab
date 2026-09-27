@@ -116,13 +116,14 @@ A history is one JSON object per line. The first line is a `meta` record, so eve
 exactly what produced it.
 
 ```jsonl
-{"type":"meta","driver":"natsgo","client":"github.com/nats-io/nats.go@v1.53.1","api":"legacy","server":"nats:2.14.7","scenario":"slow-short","params":{"n":100,"pending_msgs":20,"stall":"2s"},"driftlab":"<git sha>"}
+{"type":"meta","driver":"natsgo","client":"github.com/nats-io/nats.go@v1.53.1","api":"legacy","server":"nats:2.14.7","scenario":"slow-short","faults":["stall"],"params":{"n":100,"pending_msgs":20,"stall":"2s"},"driftlab":"<git sha>"}
 {"index":0,"time_ns":0,"process":"producer","type":"invoke","f":"publish","value":1}
 {"index":1,"time_ns":410000,"process":"producer","type":"ok","f":"publish","value":1,"stream_seq":1}
 {"index":2,"time_ns":502000000,"process":"consumer","type":"ok","f":"deliver","value":1,"stream_seq":1}
-{"index":3,"time_ns":502100000,"process":"nemesis","type":"info","f":"stall-start","detail":{"duration":"2s"}}
+{"index":3,"time_ns":502100000,"process":"nemesis","type":"invoke","f":"stall","detail":{"duration":"2s"}}
 {"index":4,"time_ns":611000000,"process":"consumer","type":"info","f":"client-error","error":"nats: slow consumer, messages dropped"}
-{"index":5,"time_ns":9000000000,"process":"final-read","type":"ok","f":"read","value":1,"stream_seq":1}
+{"index":5,"time_ns":2502300000,"process":"nemesis","type":"ok","f":"stall"}
+{"index":6,"time_ns":9000000000,"process":"final-read","type":"ok","f":"read","value":1,"stream_seq":1}
 ```
 
 Field rules:
@@ -137,6 +138,11 @@ Field rules:
 - `process` is one of `producer`, `consumer`, `nemesis` or `final-read`. Fault events live in the
   same history as everything else, so each anomaly can be lined up against the fault that caused
   it.
+- `faults` appears only on the meta line and lists the faults the scenario sets out to inject. The
+  nemesis records each fault as an operation, with `f` naming it: `invoke` when it starts and `ok`
+  once it has fully happened. Faults are declared up front instead of inferred from the nemesis's
+  own events, because a driver bug that never starts a fault would log nothing, and a rule inferred
+  from the log would then demand nothing.
 - `time_ns` is monotonic time since the driver started, not wall-clock time. That follows from
   principle 4. Once one run has several processes, the harness will stamp receive times instead.
 - Unknown fields are ignored, so the format can grow.
@@ -163,11 +169,13 @@ publish error is recorded as `info` (see the field rules), so only the first hal
 fire until definite failures are classified.
 
 **Verdicts.** A run is *clean* (no anomalies), *failed* (at least one anomaly) or *invalid*. A run
-is invalid when a fault scenario's history holds no evidence that the fault fired. Like a test
-strip whose control line never shows, it tested nothing, so it can't count as clean. A run is also
-invalid when the final read isn't exactly 1..N, because the ordered-consumer contract (principle 5)
-only holds for a contiguous stream. Every verdict also reports how many publishes ended as `info`,
-so a clean verdict with a large blind spot is visibly weak.
+is invalid when a declared fault has no nemesis `ok`, meaning there's no evidence the fault fired.
+Like a test strip whose control line never shows, it tested nothing, so it can't count as clean. A
+run is also invalid when it has no final read, or when the final read isn't exactly 1..N, because
+the ordered-consumer contract (principle 5) only holds for a contiguous stream. Invalid outranks
+failed: an invalid run's anomalies are still listed, but they aren't findings until the run is
+repeated validly. Every verdict also reports how many publishes ended as `info`, so a clean verdict
+with a large blind spot is visibly weak.
 
 Each anomaly carries the history indexes of the ops involved. It also carries any `client-error`
 and nemesis events that fall inside the window, so the output points at evidence instead of just

@@ -1,11 +1,21 @@
 // Package checker judges a parsed history against the guarantees in
-// DESIGN.md. It never touches the network: evidence in, anomalies out.
+// DESIGN.md. It never touches the network: evidence in, verdict out.
 package checker
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/omkar619-dev/driftlab/internal/history"
+)
+
+// Verdict is a run's overall outcome.
+type Verdict string
+
+const (
+	Clean   Verdict = "clean"
+	Failed  Verdict = "failed"
+	Invalid Verdict = "invalid"
 )
 
 // Kind names an anomaly. The names come from Jepsen's Kafka workload.
@@ -25,12 +35,79 @@ type Anomaly struct {
 	Msg     string
 }
 
-// Check judges h against the ordered-consumer contract: each consumer must
-// receive stream sequences 1, 2, 3, ... with no gaps, repeats or
-// reordering. That contract only holds for a contiguous stream (DESIGN.md
+// Result is everything the checker concluded about one history. Reasons
+// says why a run is invalid; Unknown counts publishes that ended as info.
+type Result struct {
+	Verdict   Verdict
+	Anomalies []Anomaly
+	Reasons   []string
+	Publishes int
+	Unknown   int
+}
+
+// Check judges h: invalid if the run can't count as evidence, failed if it
+// broke a promise, clean otherwise. The ordered-consumer contract only
+// holds for a contiguous stream, which the final read must show (DESIGN.md
 // principle 5).
-func Check(h *history.History) []Anomaly {
-	return checkOrdered(h.Ops)
+func Check(h *history.History) Result {
+	r := Result{Anomalies: checkOrdered(h.Ops)}
+	r.Reasons = append(checkFinalRead(h.Ops), checkFaults(h)...)
+	for _, op := range h.Ops {
+		if op.F != history.Publish {
+			continue
+		}
+		switch op.Type {
+		case history.Invoke:
+			r.Publishes++
+		case history.Info:
+			r.Unknown++
+		}
+	}
+	switch {
+	case len(r.Reasons) > 0:
+		r.Verdict = Invalid
+	case len(r.Anomalies) > 0:
+		r.Verdict = Failed
+	default:
+		r.Verdict = Clean
+	}
+	return r
+}
+
+func checkFinalRead(ops []history.Op) []string {
+	seqs := map[uint64]bool{}
+	var last uint64
+	for _, op := range ops {
+		if op.F == history.Read {
+			seqs[op.StreamSeq] = true
+			last = max(last, op.StreamSeq)
+		}
+	}
+	if len(seqs) == 0 {
+		return []string{"no final read, so the stream's contents are unknown"}
+	}
+	missing := last - uint64(len(seqs))
+	if missing == 0 {
+		return nil
+	}
+	first := uint64(1)
+	for seqs[first] {
+		first++
+	}
+	return []string{fmt.Sprintf("final read is not contiguous: %d of %d stream sequences missing, starting at %d", missing, last, first)}
+}
+
+func checkFaults(h *history.History) []string {
+	var reasons []string
+	for _, fault := range h.Meta.Faults {
+		fired := slices.ContainsFunc(h.Ops, func(op history.Op) bool {
+			return op.Process == history.Nemesis && op.F == fault && op.Type == history.OK
+		})
+		if !fired {
+			reasons = append(reasons, fmt.Sprintf("declared fault %q never completed", fault))
+		}
+	}
+	return reasons
 }
 
 type consumer struct {

@@ -30,15 +30,21 @@ const (
 	Read    = "read"
 )
 
+// Nemesis is the process that records faults. Each fault is an operation:
+// an invoke when it starts, and an ok once it has fully happened.
+const Nemesis = "nemesis"
+
 const metaType = "meta"
 
-// Meta is a history's first line: what produced the run.
+// Meta is a history's first line: what produced the run. Faults lists the
+// faults the scenario set out to inject, whether or not they happened.
 type Meta struct {
 	Driver   string          `json:"driver"`
 	Client   string          `json:"client"`
 	API      string          `json:"api"`
 	Server   string          `json:"server"`
 	Scenario string          `json:"scenario"`
+	Faults   []string        `json:"faults"`
 	Params   json.RawMessage `json:"params"`
 	Driftlab string          `json:"driftlab"`
 }
