@@ -1,0 +1,9 @@
+{"type":"meta","driver":"fixture","client":"hand-written","scenario":"silent-consumer"}
+{"index":0,"process":"producer","type":"invoke","f":"publish","value":1}
+{"index":1,"process":"producer","type":"ok","f":"publish","value":1,"stream_seq":1}
+{"index":2,"process":"producer","type":"invoke","f":"publish","value":2}
+{"index":3,"process":"producer","type":"ok","f":"publish","value":2,"stream_seq":2}
+{"index":4,"process":"consumer","type":"invoke","f":"subscribe"}
+{"index":5,"process":"consumer","type":"ok","f":"subscribe"}
+{"index":6,"process":"final-read","type":"ok","f":"read","value":1,"stream_seq":1}
+{"index":7,"process":"final-read","type":"ok","f":"read","value":2,"stream_seq":2}

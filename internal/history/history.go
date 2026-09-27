@@ -25,9 +25,10 @@ const (
 // Operations the checker understands. Drivers also record others, such as
 // nemesis events and client errors, which the checker keeps as evidence.
 const (
-	Publish = "publish"
-	Deliver = "deliver"
-	Read    = "read"
+	Publish   = "publish"
+	Deliver   = "deliver"
+	Read      = "read"
+	Subscribe = "subscribe"
 )
 
 // Nemesis is the process that records faults. Each fault is an operation:

@@ -1,0 +1,15 @@
+{"type":"meta","driver":"fixture","client":"hand-written","scenario":"phantom"}
+{"index":0,"process":"producer","type":"invoke","f":"publish","value":1}
+{"index":1,"process":"producer","type":"ok","f":"publish","value":1,"stream_seq":1}
+{"index":2,"process":"producer","type":"invoke","f":"publish","value":2}
+{"index":3,"process":"producer","type":"fail","f":"publish","value":2,"error":"nats: no responders available for request"}
+{"index":4,"process":"producer","type":"invoke","f":"publish","value":3}
+{"index":5,"process":"producer","type":"ok","f":"publish","value":3,"stream_seq":3}
+{"index":6,"process":"consumer","type":"ok","f":"deliver","value":1,"stream_seq":1}
+{"index":7,"process":"consumer","type":"ok","f":"deliver","value":2,"stream_seq":2}
+{"index":8,"process":"consumer","type":"ok","f":"deliver","value":3,"stream_seq":3}
+{"index":9,"process":"consumer","type":"ok","f":"deliver","value":7,"stream_seq":4}
+{"index":10,"process":"final-read","type":"ok","f":"read","value":1,"stream_seq":1}
+{"index":11,"process":"final-read","type":"ok","f":"read","value":2,"stream_seq":2}
+{"index":12,"process":"final-read","type":"ok","f":"read","value":3,"stream_seq":3}
+{"index":13,"process":"final-read","type":"ok","f":"read","value":7,"stream_seq":4}

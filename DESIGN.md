@@ -46,8 +46,9 @@ Every decision below follows from one of these.
    message, the history looks exactly like a publish that never arrived.
 4. **Order comes from the system's sequence numbers, never from clocks.** JetStream stamps each
    stored message with a stream sequence, and that number alone decides order and gaps.
-   Timestamps are for humans reading the timeline. They answer exactly one question: did the
-   consumer catch up within the grace window after the fault ended?
+   Timestamps are for humans reading the timeline; no verdict depends on them. Even liveness is
+   judged by position: the driver waits a grace window after the last fault before it starts the
+   final read, and a consumer that hasn't caught up by then has stalled.
 5. **Remove every legitimate reason for a gap.** Use one subject, no retention limits and no
    deletes. Stream sequences are then exactly 1..N, and the ordered-consumer contract collapses to
    one line: *the delivered stream sequences must be 1, 2, …, N.* Any deviation is a bug, and the
@@ -143,6 +144,8 @@ Field rules:
   once it has fully happened. Faults are declared up front instead of inferred from the nemesis's
   own events, because a driver bug that never starts a fault would log nothing, and a rule inferred
   from the log would then demand nothing.
+- A consumer records `subscribe` (an `invoke`, then an `ok`) when it starts. Without it, a consumer
+  that received nothing would leave no trace at all, and the checker would judge it clean.
 - `time_ns` is monotonic time since the driver started, not wall-clock time. That follows from
   principle 4. Once one run has several processes, the harness will stamp receive times instead.
 - Unknown fields are ignored, so the format can grow.
@@ -152,8 +155,8 @@ That read is the ground truth for what the stream contains.
 
 ## Checker (v0)
 
-The checker is a pure function, `Check(history) -> []Anomaly`, with no network access. Its only
-use of time is the liveness window.
+The checker is a pure function, `Check(history) -> Result`, with no network access and no clocks.
+Even liveness is judged by position in the history (principle 4).
 
 | Anomaly | Definition | Usually whose bug |
 |---|---|---|
@@ -161,7 +164,7 @@ use of time is the liveness window.
 | `poll-skip` | the consumer jumps from stream_seq a to some b > a+1; the skipped range is then classified as *delivered late* or *never delivered* | client |
 | `nonmonotonic-poll` | the consumer delivers b after a, with b < a | client |
 | `duplicate` | one consumer receives the same stream_seq twice | client |
-| `stall` | at the end of the grace window after the last fault, the consumer still hasn't reached the final read's last sequence | client (liveness) |
+| `stall` | when the final read begins, the consumer hasn't yet received the stream's last sequence. Consumers are known from their deliveries and their `subscribe` operations, so one that received nothing is still judged | client (liveness) |
 | `phantom` | a value seen by the consumer or the final read that no producer ever invoked, or whose publish was recorded as `fail` | client or server |
 
 An `info` publish may or may not appear in the stream, and neither case is an anomaly. In v0 every
@@ -171,8 +174,10 @@ fire until definite failures are classified.
 **Verdicts.** A run is *clean* (no anomalies), *failed* (at least one anomaly) or *invalid*. A run
 is invalid when a declared fault has no nemesis `ok`, meaning there's no evidence the fault fired.
 Like a test strip whose control line never shows, it tested nothing, so it can't count as clean. A
-run is also invalid when it has no final read, or when the final read isn't exactly 1..N, because
-the ordered-consumer contract (principle 5) only holds for a contiguous stream. Invalid outranks
+run is also invalid when it has no final read, or when the final read has a hole that no acked
+publish explains, because the ordered-consumer contract (principle 5) only holds for a contiguous
+stream. A hole that an acked publish does explain is a lost write, a real finding against the
+server, so it makes the run failed instead. Invalid outranks
 failed: an invalid run's anomalies are still listed, but they aren't findings until the run is
 repeated validly. Every verdict also reports how many publishes ended as `info`, so a clean verdict
 with a large blind spot is visibly weak.
