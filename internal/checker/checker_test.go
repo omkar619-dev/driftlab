@@ -34,6 +34,9 @@ func TestCheckFixtures(t *testing.T) {
 		{"duplicate.jsonl", []string{
 			"duplicate consumer ops=[9 10]: stream_seq 2 delivered again",
 		}},
+		{"first-skip.jsonl", []string{
+			"poll-skip consumer ops=[6]: expected stream_seq 1, got 2: 1 skipped, 0 delivered late, 1 never delivered",
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.file, func(t *testing.T) {
