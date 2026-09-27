@@ -49,6 +49,19 @@ type Result struct {
 	Unknown   int
 }
 
+// Lines renders r the way the command line prints it: the verdict, then
+// why the run is invalid, then each anomaly.
+func (r Result) Lines() []string {
+	out := []string{fmt.Sprintf("verdict %s, %d of %d publishes unknown", r.Verdict, r.Unknown, r.Publishes)}
+	for _, reason := range r.Reasons {
+		out = append(out, "invalid: "+reason)
+	}
+	for _, a := range r.Anomalies {
+		out = append(out, fmt.Sprintf("%s %s ops=%v: %s", a.Kind, a.Process, a.Ops, a.Msg))
+	}
+	return out
+}
+
 // Check judges h: invalid if the run can't count as evidence, failed if it
 // broke a promise, clean otherwise. The ordered-consumer contract only
 // holds for a contiguous stream, so a hole in the final read that no acked

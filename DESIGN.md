@@ -225,6 +225,13 @@ nats.go v1.53.1 and v1.54.0 together. That one rule decides the layout.
 - **In v1, every Kafka client gets its own driver module**, so their dependency trees can never
   collide.
 
+## Command line
+
+`driftlab check <history.jsonl>` prints the verdict, the invalid reasons and the anomalies, one per
+line. The exit code is the verdict for scripts: 0 clean, 1 failed, 2 invalid, and 3 when the
+command couldn't run (bad usage, or a file it can't open or parse). An invalid run exits non-zero
+on purpose, so a script can never mistake a broken experiment for a pass.
+
 ## Repo layout (v0)
 
 ```
@@ -259,7 +266,7 @@ driftlab/
 ## Milestones
 
 - **2026-09-25 (done):** the repo, this document, go.mod and .gitattributes, pushed.
-- **Weekend 1 (the checker, no NATS at all):** the history reader, `Check`, the verdict rules, and
+- **Weekend 1 (done 2026-09-27; the checker, no NATS at all):** the history reader, `Check`, the verdict rules, and
   table-driven tests over hand-written histories. The fixtures are one clean history, one per anomaly kind, plus
   `info` publishes that are present and absent (both must pass). Exit: `driftlab check` flags
   every bad fixture and passes every good one. That is calibration step (a).

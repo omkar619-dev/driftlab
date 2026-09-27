@@ -1,7 +1,6 @@
 package checker
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -9,17 +8,6 @@ import (
 
 	"github.com/omkar619-dev/driftlab/internal/history"
 )
-
-func summarize(r Result) []string {
-	out := []string{fmt.Sprintf("verdict %s, %d of %d publishes unknown", r.Verdict, r.Unknown, r.Publishes)}
-	for _, reason := range r.Reasons {
-		out = append(out, "invalid: "+reason)
-	}
-	for _, a := range r.Anomalies {
-		out = append(out, fmt.Sprintf("%s %s ops=%v: %s", a.Kind, a.Process, a.Ops, a.Msg))
-	}
-	return out
-}
 
 func TestCheckFixtures(t *testing.T) {
 	tests := []struct {
@@ -95,7 +83,7 @@ func TestCheckFixtures(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
-			got := summarize(Check(h))
+			got := Check(h).Lines()
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("result:\n  got  %q\n  want %q", got, tt.want)
 			}
