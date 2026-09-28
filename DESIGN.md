@@ -89,10 +89,12 @@ consumers and redelivery, and a second machine.
 
 Each scenario mirrors the reproduction in the issue. It publishes N=100 messages, starts the
 ordered consumer, stalls its first callback while the pending limit is 20 messages, then releases
-it. It then publishes one tail message, waits a grace window and does the final read.
+it. It then publishes one tail message, gives the consumer up to a grace window (10 seconds by
+default) to catch up, stops it, and does the final read.
 
 | Scenario | Stall | Why it exists |
 |---|---|---|
+| `publish-only` | none, and no consumer | proves the driver and the final read on their own |
 | `control` | none | proves the harness and environment are clean |
 | `slow-short` | 2s, shorter than the 5s ordered-consumer heartbeat | the path in the issue: no reset ever fires |
 | `slow-long` | 8s, longer than the heartbeat | the heartbeat reset fires, but it resumes from a sequence that has already been advanced past messages that were never delivered |
