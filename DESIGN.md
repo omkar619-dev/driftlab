@@ -52,7 +52,8 @@ Every decision below follows from one of these.
 5. **Remove every legitimate reason for a gap.** Use one subject, no retention limits and no
    deletes. Stream sequences are then exactly 1..N, and the ordered-consumer contract collapses to
    one line: *the delivered stream sequences must be 1, 2, …, N.* Any deviation is a bug, and the
-   checker only has to classify it.
+   checker only has to classify it. The driver enforces this: every run gets a fresh stream that
+   denies deletes and purges, so the server itself refuses to make a hole.
 6. **Calibrate before you measure.** A checker that has never reported a violation is untested.
    Before any "finding" means anything, the checker must (a) flag hand-written bad histories,
    (b) catch a real, known bug, and (c) pass the fix for that bug.
@@ -150,8 +151,9 @@ Field rules:
   principle 4. Once one run has several processes, the harness will stamp receive times instead.
 - Unknown fields are ignored, so the format can grow.
 
-**Final read:** after the scenario ends, a fresh connection reads the whole stream from sequence 1.
-That read is the ground truth for what the stream contains.
+**Final read:** after the scenario ends, the driver reads every stream sequence back by number,
+without a consumer, so the ground truth doesn't depend on the machinery under test. That read is
+the ground truth for what the stream contains.
 
 ## Checker (v0)
 
