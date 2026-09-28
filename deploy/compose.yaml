@@ -1,0 +1,18 @@
+# One NATS server with JetStream, for driftlab runs on newpc. The image tag is
+# pinned because every history records which server produced it.
+name: driftlab
+
+services:
+  nats:
+    image: nats:2.14.7
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    # Localhost only: the driver runs on this machine, and Docker-published
+    # ports bypass ufw.
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+
+volumes:
+  nats-data:
