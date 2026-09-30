@@ -66,6 +66,9 @@ func run(c config, out io.Writer) error {
 	if !ok {
 		return fmt.Errorf("unknown scenario %q", c.scenario)
 	}
+	if c.n < 1 {
+		return errors.New("-n must be at least 1")
+	}
 	rec := newRecorder(out)
 
 	// nats.go reports some problems in the background instead of returning
@@ -82,7 +85,7 @@ func run(c config, out io.Writer) error {
 	}
 	nc, err := nats.Connect(c.url, nats.ErrorHandler(onError))
 	if err != nil {
-		return err
+		return fmt.Errorf("connecting to %s: %w (is the server up? docker compose -f deploy/compose.yaml up -d)", c.url, err)
 	}
 	defer nc.Close()
 	js, err := jetstream.New(nc)
@@ -96,13 +99,13 @@ func run(c config, out io.Writer) error {
 	}
 
 	rec.writeMeta(newMeta(nc.ConnectedServerVersion(), c, sc))
-	var last uint64
-	for v := uint64(1); v <= c.n; v++ {
-		last = max(last, publish(ctx, js, rec, v))
-	}
 	if sc.consumer {
-		if err := consume(ctx, nc, js, rec, c, sc, last); err != nil {
+		if err := consume(ctx, nc, js, rec, c, sc); err != nil {
 			return err
+		}
+	} else {
+		for v := uint64(1); v <= c.n; v++ {
+			publish(ctx, js, rec, v)
 		}
 	}
 	return finalRead(ctx, stream, rec)
@@ -140,10 +143,14 @@ func publish(ctx context.Context, js jetstream.JetStream, rec *recorder, v uint6
 }
 
 // consume runs the legacy push ordered consumer, the API that KV and Object
-// Store watchers use. Once it has caught up on the backlog, one more
-// message is published behind it. It stops as soon as it has seen
-// everything, or when the grace window runs out.
-func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, sc scenario, last uint64) error {
+// Store watchers use. Only the first message is published before it
+// subscribes. The rest follow once that first message has arrived, which is
+// where a stall scenario's callback blocks, so the flood always lands after
+// the trap is armed. Shrinking the tray first matters: it only turns away
+// new arrivals, so a backlog that arrived earlier would never overflow it.
+// One more message follows once the consumer has caught up, and it stops
+// when it has seen everything or the grace window runs out.
+func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, sc scenario) error {
 	legacy, err := nc.JetStream()
 	if err != nil {
 		return err
@@ -173,6 +180,7 @@ func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *re
 		}
 	}
 
+	last := publish(ctx, js, rec, 1)
 	rec.op(op{Process: "consumer", Type: "invoke", F: "subscribe"})
 	sub, err := legacy.Subscribe(subject, handler, nats.OrderedConsumer())
 	if err != nil {
@@ -180,30 +188,30 @@ func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *re
 		return err
 	}
 	rec.op(op{Process: "consumer", Type: "ok", F: "subscribe"})
+	waitFor(&reached, last, c.grace)
 
+	// The 2107 trigger: a tiny pending tray, and a blocked callback while the
+	// flood arrives behind it.
 	if sc.stall > 0 {
-		if err := stall(sub, rec, c.pending, sc.stall, gate); err != nil {
+		rec.op(op{Process: "nemesis", Type: "invoke", F: "overflow"})
+		if err := sub.SetPendingLimits(c.pending, 8*1024*1024); err != nil {
 			return err
 		}
+		rec.op(op{Process: "nemesis", Type: "invoke", F: "stall"})
 	}
+	for v := uint64(2); v <= c.n; v++ {
+		last = max(last, publish(ctx, js, rec, v))
+	}
+	if sc.stall > 0 {
+		time.Sleep(sc.stall)
+		close(gate)
+		rec.op(op{Process: "nemesis", Type: "ok", F: "stall"})
+	}
+
 	waitFor(&reached, last, c.grace)
 	last = max(last, publish(ctx, js, rec, c.n+1))
 	waitFor(&reached, last, c.grace)
 	return sub.Unsubscribe()
-}
-
-// stall is the 2107 trigger: a tiny pending tray, and a first callback that
-// blocks while the backlog floods in behind it.
-func stall(sub *nats.Subscription, rec *recorder, pending int, d time.Duration, gate chan struct{}) error {
-	rec.op(op{Process: "nemesis", Type: "invoke", F: "overflow"})
-	if err := sub.SetPendingLimits(pending, 8*1024*1024); err != nil {
-		return err
-	}
-	rec.op(op{Process: "nemesis", Type: "invoke", F: "stall"})
-	time.Sleep(d)
-	close(gate)
-	rec.op(op{Process: "nemesis", Type: "ok", F: "stall"})
-	return nil
 }
 
 // waitFor polls until the consumer has reached target or grace runs out.

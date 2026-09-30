@@ -87,10 +87,19 @@ consumers and redelivery, and a second machine.
 
 ## Scenarios
 
-Each scenario mirrors the reproduction in the issue. It publishes N=100 messages, starts the
-ordered consumer, stalls its first callback while the pending limit is 20 messages, then releases
-it. It then publishes one tail message, gives the consumer up to a grace window (10 seconds by
-default) to catch up, stops it, and does the final read.
+Each scenario follows the reproduction in the issue, with one change. It publishes one message,
+starts the ordered consumer and waits for that message to arrive, which is where a stall
+scenario's first callback blocks. Only then does it shrink the pending tray to 20 messages and
+publish the other 99, so the flood always arrives after the trap is armed. It then releases the
+stall, publishes one tail message, gives the consumer up to a grace window (10 seconds by default)
+to catch up, stops it, and does the final read.
+
+The change is a finding from the first runs. The issue publishes the whole backlog before the
+consumer starts, and so did driftlab at first. But shrinking the tray only turns away new
+arrivals, so whether it overflows depends on how much of the backlog has already landed, and that
+is a race. The fixed client's first stall runs came back invalid: its tray never overflowed,
+because the backlog had most likely already landed in it. Control and stall scenarios now publish
+in the same order, so they differ only by the fault.
 
 | Scenario | Stall | Why it exists |
 |---|---|---|
