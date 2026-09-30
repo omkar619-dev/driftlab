@@ -102,6 +102,12 @@ default) to catch up, stops it, and does the final read.
 `slow-long` matters because a fix that only covers the short path passes `slow-short` and still
 fails here.
 
+A stall scenario declares two faults. `stall` is the blocked callback. `overflow` is what the stall
+is meant to cause: the client's pending tray fills up and nats.go drops messages, which it reports
+as a slow consumer error. The driver marks `overflow` as done only when that error arrives, so a
+run whose tray never overflowed is invalid rather than clean, because the 2107 trigger never fired.
+(The `jetstream` API has no drop path, so its stall scenarios will declare only `stall`.)
+
 ## Calibration matrix (the v0 exit criterion)
 
 | Scenario | legacy @ v1.53.1 | legacy @ v1.54.0 | jetstream @ v1.53.1 | jetstream @ v1.54.0 |
@@ -120,14 +126,16 @@ A history is one JSON object per line. The first line is a `meta` record, so eve
 exactly what produced it.
 
 ```jsonl
-{"type":"meta","driver":"natsgo","client":"github.com/nats-io/nats.go@v1.53.1","api":"legacy","server":"nats:2.14.7","scenario":"slow-short","faults":["stall"],"params":{"n":100,"pending_msgs":20,"stall":"2s"},"driftlab":"<git sha>"}
+{"type":"meta","driver":"natsgo","client":"github.com/nats-io/nats.go@v1.53.1","api":"legacy","server":"nats-server 2.14.7","scenario":"slow-short","faults":["stall","overflow"],"params":{"n":100,"pending_msgs":20,"stall":"2s"},"driftlab":"<git sha>"}
 {"index":0,"time_ns":0,"process":"producer","type":"invoke","f":"publish","value":1}
 {"index":1,"time_ns":410000,"process":"producer","type":"ok","f":"publish","value":1,"stream_seq":1}
 {"index":2,"time_ns":502000000,"process":"consumer","type":"ok","f":"deliver","value":1,"stream_seq":1}
-{"index":3,"time_ns":502100000,"process":"nemesis","type":"invoke","f":"stall","detail":{"duration":"2s"}}
-{"index":4,"time_ns":611000000,"process":"consumer","type":"info","f":"client-error","error":"nats: slow consumer, messages dropped"}
-{"index":5,"time_ns":2502300000,"process":"nemesis","type":"ok","f":"stall"}
-{"index":6,"time_ns":9000000000,"process":"final-read","type":"ok","f":"read","value":1,"stream_seq":1}
+{"index":3,"time_ns":502050000,"process":"nemesis","type":"invoke","f":"overflow"}
+{"index":4,"time_ns":502100000,"process":"nemesis","type":"invoke","f":"stall"}
+{"index":5,"time_ns":611000000,"process":"consumer","type":"info","f":"client-error","error":"nats: slow consumer, messages dropped"}
+{"index":6,"time_ns":611100000,"process":"nemesis","type":"ok","f":"overflow"}
+{"index":7,"time_ns":2502300000,"process":"nemesis","type":"ok","f":"stall"}
+{"index":8,"time_ns":9000000000,"process":"final-read","type":"ok","f":"read","value":1,"stream_seq":1}
 ```
 
 Field rules:

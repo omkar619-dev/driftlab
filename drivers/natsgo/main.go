@@ -25,18 +25,34 @@ const (
 	subject    = "driftlab"
 )
 
+// scenario describes one experiment. A zero stall means no fault is
+// injected.
+type scenario struct {
+	consumer bool
+	stall    time.Duration
+}
+
+var scenarios = map[string]scenario{
+	"publish-only": {},
+	"control":      {consumer: true},
+	"slow-short":   {consumer: true, stall: 2 * time.Second},
+	"slow-long":    {consumer: true, stall: 8 * time.Second},
+}
+
 type config struct {
 	url      string
 	scenario string
 	n        uint64
+	pending  int
 	grace    time.Duration
 }
 
 func main() {
 	var c config
 	flag.StringVar(&c.url, "url", nats.DefaultURL, "NATS server to run against")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only or control")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, slow-short or slow-long")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish before the consumer starts")
+	flag.IntVar(&c.pending, "pending", 20, "the client's pending message limit during a stall")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the consumer gets to catch up before the final read")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
@@ -46,10 +62,25 @@ func main() {
 }
 
 func run(c config, out io.Writer) error {
-	if c.scenario != "publish-only" && c.scenario != "control" {
+	sc, ok := scenarios[c.scenario]
+	if !ok {
 		return fmt.Errorf("unknown scenario %q", c.scenario)
 	}
-	nc, err := nats.Connect(c.url)
+	rec := newRecorder(out)
+
+	// nats.go reports some problems in the background instead of returning
+	// them. A slow consumer error is also the proof that the overflow fault
+	// happened: the client's pending tray filled up and it dropped messages.
+	var overflowed sync.Once
+	onError := func(_ *nats.Conn, _ *nats.Subscription, err error) {
+		rec.op(op{Process: "consumer", Type: "info", F: "client-error", Error: err.Error()})
+		if errors.Is(err, nats.ErrSlowConsumer) {
+			overflowed.Do(func() {
+				rec.op(op{Process: "nemesis", Type: "ok", F: "overflow"})
+			})
+		}
+	}
+	nc, err := nats.Connect(c.url, nats.ErrorHandler(onError))
 	if err != nil {
 		return err
 	}
@@ -64,18 +95,13 @@ func run(c config, out io.Writer) error {
 		return err
 	}
 
-	rec := newRecorder(out)
-	api := ""
-	if c.scenario != "publish-only" {
-		api = "legacy"
-	}
-	rec.writeMeta(nc.ConnectedServerVersion(), c.scenario, api)
+	rec.writeMeta(newMeta(nc.ConnectedServerVersion(), c, sc))
 	var last uint64
 	for v := uint64(1); v <= c.n; v++ {
 		last = max(last, publish(ctx, js, rec, v))
 	}
-	if c.scenario == "control" {
-		if err := consume(ctx, nc, js, rec, c, last); err != nil {
+	if sc.consumer {
+		if err := consume(ctx, nc, js, rec, c, sc, last); err != nil {
 			return err
 		}
 	}
@@ -117,13 +143,15 @@ func publish(ctx context.Context, js jetstream.JetStream, rec *recorder, v uint6
 // Store watchers use. Once it has caught up on the backlog, one more
 // message is published behind it. It stops as soon as it has seen
 // everything, or when the grace window runs out.
-func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, last uint64) error {
+func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, sc scenario, last uint64) error {
 	legacy, err := nc.JetStream()
 	if err != nil {
 		return err
 	}
 	var reached atomic.Uint64
 	var highest uint64 // only the callback touches this; nats.go calls it on one goroutine
+	gate := make(chan struct{})
+	var stalled sync.Once
 	handler := func(m *nats.Msg) {
 		md, err := m.Metadata()
 		if err != nil {
@@ -140,6 +168,9 @@ func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *re
 			highest = md.Sequence.Stream
 			reached.Store(highest)
 		}
+		if sc.stall > 0 {
+			stalled.Do(func() { <-gate })
+		}
 	}
 
 	rec.op(op{Process: "consumer", Type: "invoke", F: "subscribe"})
@@ -150,10 +181,29 @@ func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *re
 	}
 	rec.op(op{Process: "consumer", Type: "ok", F: "subscribe"})
 
+	if sc.stall > 0 {
+		if err := stall(sub, rec, c.pending, sc.stall, gate); err != nil {
+			return err
+		}
+	}
 	waitFor(&reached, last, c.grace)
 	last = max(last, publish(ctx, js, rec, c.n+1))
 	waitFor(&reached, last, c.grace)
 	return sub.Unsubscribe()
+}
+
+// stall is the 2107 trigger: a tiny pending tray, and a first callback that
+// blocks while the backlog floods in behind it.
+func stall(sub *nats.Subscription, rec *recorder, pending int, d time.Duration, gate chan struct{}) error {
+	rec.op(op{Process: "nemesis", Type: "invoke", F: "overflow"})
+	if err := sub.SetPendingLimits(pending, 8*1024*1024); err != nil {
+		return err
+	}
+	rec.op(op{Process: "nemesis", Type: "invoke", F: "stall"})
+	time.Sleep(d)
+	close(gate)
+	rec.op(op{Process: "nemesis", Type: "ok", F: "stall"})
+	return nil
 }
 
 // waitFor polls until the consumer has reached target or grace runs out.
@@ -200,13 +250,46 @@ type op struct {
 }
 
 type metaLine struct {
-	Type     string `json:"type"`
-	Driver   string `json:"driver"`
-	Client   string `json:"client"`
-	API      string `json:"api,omitempty"`
-	Server   string `json:"server"`
-	Scenario string `json:"scenario"`
-	Driftlab string `json:"driftlab"`
+	Type     string   `json:"type"`
+	Driver   string   `json:"driver"`
+	Client   string   `json:"client"`
+	API      string   `json:"api,omitempty"`
+	Server   string   `json:"server"`
+	Scenario string   `json:"scenario"`
+	Faults   []string `json:"faults,omitempty"`
+	Params   params   `json:"params"`
+	Driftlab string   `json:"driftlab"`
+}
+
+type params struct {
+	N           uint64 `json:"n"`
+	PendingMsgs int    `json:"pending_msgs,omitempty"`
+	Stall       string `json:"stall,omitempty"`
+}
+
+// newMeta describes the run. A stall scenario declares two faults: the
+// stall itself, and the overflow it is meant to cause. If the overflow
+// never happens, the checker calls the run invalid instead of clean.
+func newMeta(server string, c config, sc scenario) metaLine {
+	client, rev := provenance()
+	m := metaLine{
+		Type:     "meta",
+		Driver:   "natsgo",
+		Client:   client,
+		Server:   "nats-server " + server,
+		Scenario: c.scenario,
+		Params:   params{N: c.n},
+		Driftlab: rev,
+	}
+	if sc.consumer {
+		m.API = "legacy"
+	}
+	if sc.stall > 0 {
+		m.Faults = []string{"stall", "overflow"}
+		m.Params.PendingMsgs = c.pending
+		m.Params.Stall = sc.stall.String()
+	}
+	return m
 }
 
 // recorder writes the history. Its mutex guards every other field, because
@@ -223,19 +306,10 @@ func newRecorder(w io.Writer) *recorder {
 	return &recorder{enc: json.NewEncoder(w), start: time.Now()}
 }
 
-func (r *recorder) writeMeta(server, scenario, api string) {
-	client, rev := provenance()
+func (r *recorder) writeMeta(m metaLine) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.err = r.enc.Encode(metaLine{
-		Type:     "meta",
-		Driver:   "natsgo",
-		Client:   client,
-		API:      api,
-		Server:   "nats-server " + server,
-		Scenario: scenario,
-		Driftlab: rev,
-	})
+	r.err = r.enc.Encode(m)
 }
 
 // op writes one operation. After the first write error it writes nothing
