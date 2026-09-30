@@ -318,6 +318,14 @@ driftlab/
 - **Orchestration.** How much of a `driftlab run` command do we need? *Comes up:* at the end of
   weekend 2. The matrix is 12 runs (3 scenarios × 2 APIs × 2 versions). That's fine by hand once,
   and worth a script by the second time.
+- **Recovery time.** The stall rule only asks whether the consumer caught up before the final
+  read, so it depends on the grace window. In the first valid v1.54.0 slow-short run, the fixed
+  legacy ordered consumer lost nothing, but it recovered one pending tray per heartbeat: 20
+  messages every 5 seconds, so about 20 seconds to recover from a 2-second stall. Each refetch
+  overflowed the tray again, and its last message arrived a few milliseconds before the final
+  read. Should the checker report time-to-recovery as a measurement, alongside the verdict?
+  *Comes up:* now. Measure it across tray and backlog sizes, with the default tray, and against
+  the `jetstream` API in step 9 before calling it a finding.
 - **Durable consumers.** With acks, duplicates become legal, but only when they're marked as
   redeliveries. That's a different contract, so it probably needs a separate checker mode.
   *Comes up:* in v2, with redelivery semantics.
