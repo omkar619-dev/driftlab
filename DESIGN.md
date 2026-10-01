@@ -207,9 +207,11 @@ with a large blind spot is visibly weak.
 the last fault ended, to receive every stream sequence that had been acked by then, or reports
 that it never did. The measurement is printed alongside the verdict and never feeds into it
 (principle 4). It exists because of the first valid v1.54.0 runs. The fixed legacy consumer lost
-nothing, but with a 20-message tray it recovered one tray per 5-second heartbeat, because each
-refetch overflowed the tray again. A 2-second stall cost about 15 seconds of recovery, and the
-run's clean verdict cleared the grace window by milliseconds.
+nothing, but it recovered in 5-second steps, one per heartbeat, because each refetch overflowed
+the tray again. Each step carried at least one tray of messages, and sometimes several, because
+the callback keeps draining the tray while the refetch arrives. With 100 messages and a 2-second
+stall, recovery took 3 seconds with a 40-message tray, 13 with 20, and 23 with 10. One 20-message
+run took 15 seconds, and its clean verdict cleared the grace window by milliseconds.
 
 Each anomaly carries the history indexes of the ops involved. It also carries any `client-error`
 and nemesis events that fall inside the window, so the output points at evidence instead of just
