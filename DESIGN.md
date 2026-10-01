@@ -115,7 +115,9 @@ A stall scenario declares two faults. `stall` is the blocked callback. `overflow
 is meant to cause: the client's pending tray fills up and nats.go drops messages, which it reports
 as a slow consumer error. The driver marks `overflow` as done only when that error arrives, so a
 run whose tray never overflowed is invalid rather than clean, because the 2107 trigger never fired.
-(The `jetstream` API has no drop path, so its stall scenarios will declare only `stall`.)
+The `jetstream` API has no drop path. It pulls messages in batches of at most `PullMaxMessages`
+(its tray, set to the same size) and asks for more only when there is room, so its stall
+scenarios declare only `stall`. The driver picks the API with `-api legacy` or `-api jetstream`.
 
 ## Calibration matrix (the v0 exit criterion)
 
