@@ -49,6 +49,12 @@ func TestCheckFixtures(t *testing.T) {
 		}},
 		{"fault-with-evidence.jsonl", []string{
 			"verdict clean, 1 of 4 publishes unknown",
+			"recovery consumer: caught up 0s after the faults ended",
+		}},
+		{"fault-then-skip.jsonl", []string{
+			"verdict failed, 0 of 3 publishes unknown",
+			"poll-skip consumer ops=[6 9]: expected stream_seq 2, got 3: 1 skipped, 0 delivered late, 1 never delivered",
+			"recovery consumer: never caught up after the faults ended",
 		}},
 		{"lost-write.jsonl", []string{
 			"verdict failed, 0 of 3 publishes unknown",

@@ -203,6 +203,14 @@ failed: an invalid run's anomalies are still listed, but they aren't findings un
 repeated validly. Every verdict also reports how many publishes ended as `info`, so a clean verdict
 with a large blind spot is visibly weak.
 
+**Recovery.** When a run has faults, the checker also measures how long each consumer took, after
+the last fault ended, to receive every stream sequence that had been acked by then, or reports
+that it never did. The measurement is printed alongside the verdict and never feeds into it
+(principle 4). It exists because of the first valid v1.54.0 runs. The fixed legacy consumer lost
+nothing, but with a 20-message tray it recovered one tray per 5-second heartbeat, because each
+refetch overflowed the tray again. A 2-second stall cost about 15 seconds of recovery, and the
+run's clean verdict cleared the grace window by milliseconds.
+
 Each anomaly carries the history indexes of the ops involved. It also carries any `client-error`
 and nemesis events that fall inside the window, so the output points at evidence instead of just
 summarising it.
@@ -318,14 +326,6 @@ driftlab/
 - **Orchestration.** How much of a `driftlab run` command do we need? *Comes up:* at the end of
   weekend 2. The matrix is 12 runs (3 scenarios × 2 APIs × 2 versions). That's fine by hand once,
   and worth a script by the second time.
-- **Recovery time.** The stall rule only asks whether the consumer caught up before the final
-  read, so it depends on the grace window. In the first valid v1.54.0 slow-short run, the fixed
-  legacy ordered consumer lost nothing, but it recovered one pending tray per heartbeat: 20
-  messages every 5 seconds, so about 20 seconds to recover from a 2-second stall. Each refetch
-  overflowed the tray again, and its last message arrived a few milliseconds before the final
-  read. Should the checker report time-to-recovery as a measurement, alongside the verdict?
-  *Comes up:* now. Measure it across tray and backlog sizes, with the default tray, and against
-  the `jetstream` API in step 9 before calling it a finding.
 - **Durable consumers.** With acks, duplicates become legal, but only when they're marked as
   redeliveries. That's a different contract, so it probably needs a separate checker mode.
   *Comes up:* in v2, with redelivery semantics.

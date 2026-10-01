@@ -5,6 +5,7 @@ package checker
 import (
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/omkar619-dev/driftlab/internal/history"
 )
@@ -39,18 +40,28 @@ type Anomaly struct {
 	Msg     string
 }
 
+// Recovery is how long one consumer took, after the last fault ended, to
+// receive every stream sequence that had been acked by then. It is a
+// measurement, and it never affects the verdict (DESIGN.md principle 4).
+type Recovery struct {
+	Process string
+	Caught  bool
+	After   time.Duration
+}
+
 // Result is everything the checker concluded about one history. Reasons
 // says why a run is invalid; Unknown counts publishes that ended as info.
 type Result struct {
-	Verdict   Verdict
-	Anomalies []Anomaly
-	Reasons   []string
-	Publishes int
-	Unknown   int
+	Verdict    Verdict
+	Anomalies  []Anomaly
+	Reasons    []string
+	Publishes  int
+	Unknown    int
+	Recoveries []Recovery
 }
 
 // Lines renders r the way the command line prints it: the verdict, then
-// why the run is invalid, then each anomaly.
+// why the run is invalid, then each anomaly, then each recovery.
 func (r Result) Lines() []string {
 	out := []string{fmt.Sprintf("verdict %s, %d of %d publishes unknown", r.Verdict, r.Unknown, r.Publishes)}
 	for _, reason := range r.Reasons {
@@ -58,6 +69,13 @@ func (r Result) Lines() []string {
 	}
 	for _, a := range r.Anomalies {
 		out = append(out, fmt.Sprintf("%s %s ops=%v: %s", a.Kind, a.Process, a.Ops, a.Msg))
+	}
+	for _, rc := range r.Recoveries {
+		if rc.Caught {
+			out = append(out, fmt.Sprintf("recovery %s: caught up %s after the faults ended", rc.Process, rc.After.Round(time.Millisecond)))
+		} else {
+			out = append(out, fmt.Sprintf("recovery %s: never caught up after the faults ended", rc.Process))
+		}
 	}
 	return out
 }
@@ -75,6 +93,7 @@ func Check(h *history.History) Result {
 	}
 	r.Anomalies = append(r.Anomalies, checkPhantoms(h.Ops)...)
 	r.Reasons = append(checkFinalRead(h.Ops, final), checkFaults(h)...)
+	r.Recoveries = measureRecovery(h.Ops)
 	for _, op := range h.Ops {
 		if op.F != history.Publish {
 			continue
@@ -320,6 +339,54 @@ func checkPhantoms(ops []history.Op) []Anomaly {
 		}
 		at[op.Value] = len(out)
 		out = append(out, Anomaly{Kind: Phantom, Process: op.Process, Ops: []int{op.Index}, Msg: msg})
+	}
+	return out
+}
+
+func measureRecovery(ops []history.Op) []Recovery {
+	end := -1
+	for i, op := range ops {
+		if op.Process == history.Nemesis && op.Type == history.OK {
+			end = i
+		}
+	}
+	if end < 0 {
+		return nil
+	}
+	var target uint64
+	for _, op := range ops[:end] {
+		if op.F == history.Publish && op.Type == history.OK {
+			target = max(target, op.StreamSeq)
+		}
+	}
+	if target == 0 {
+		return nil
+	}
+
+	// For each consumer: its position in out, and which stream sequences up
+	// to target it has received so far.
+	var out []Recovery
+	pos := map[string]int{}
+	seen := map[string]map[uint64]bool{}
+	for _, op := range ops {
+		if op.F != history.Deliver {
+			continue
+		}
+		i, ok := pos[op.Process]
+		if !ok {
+			i = len(out)
+			pos[op.Process] = i
+			seen[op.Process] = map[uint64]bool{}
+			out = append(out, Recovery{Process: op.Process})
+		}
+		if out[i].Caught || op.StreamSeq > target {
+			continue
+		}
+		seen[op.Process][op.StreamSeq] = true
+		if uint64(len(seen[op.Process])) == target {
+			out[i].Caught = true
+			out[i].After = max(0, op.Time-ops[end].Time)
+		}
 	}
 	return out
 }
