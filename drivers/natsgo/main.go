@@ -156,8 +156,11 @@ func publish(ctx context.Context, js jetstream.JetStream, rec *recorder, v uint6
 // the consumer has caught up, and it stops when it has seen everything or
 // the grace window runs out.
 func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, sc scenario) error {
+	// reached is the highest stream sequence delivered so far. Only atomic
+	// operations touch it: waitFor reads it from this goroutine, and onMsg
+	// can run on more than one goroutine, because the jetstream consumer
+	// starts a new subscription every time it resets.
 	var reached atomic.Uint64
-	var highest uint64 // only onMsg touches this; both APIs call it on one goroutine
 	gate := make(chan struct{})
 	var stalled sync.Once
 	onErr := func(err error) {
@@ -170,10 +173,7 @@ func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *re
 			return
 		}
 		rec.op(op{Process: "consumer", Type: "ok", F: "deliver", Value: v, StreamSeq: seq})
-		if seq > highest {
-			highest = seq
-			reached.Store(highest)
-		}
+		raise(&reached, seq)
 		if sc.stall > 0 {
 			stalled.Do(func() { <-gate })
 		}
@@ -288,6 +288,18 @@ func waitFor(reached *atomic.Uint64, target uint64, grace time.Duration) {
 	deadline := time.Now().Add(grace)
 	for reached.Load() < target && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// raise sets n to v unless n already holds a larger value. It is safe on
+// any number of goroutines: if another one changes n between the Load and
+// the CompareAndSwap, the swap fails and the loop reads n again.
+func raise(n *atomic.Uint64, v uint64) {
+	for {
+		cur := n.Load()
+		if v <= cur || n.CompareAndSwap(cur, v) {
+			return
+		}
 	}
 }
 
