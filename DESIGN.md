@@ -1,6 +1,8 @@
 # driftlab: design (v0)
 
-> Status: draft, last updated 2026-09-26. v0 = the checker + one system (NATS JetStream, Go client).
+> Status: last updated 2026-10-06. v0 = the checker + one system (NATS JetStream, Go client).
+> Weekends 1 and 2 are done, and the calibration matrix reproduces. Weekend 3 (network and server
+> faults) is next.
 
 ## What driftlab is
 
@@ -121,15 +123,28 @@ scenarios declare only `stall`. The driver picks the API with `-api legacy` or `
 
 ## Calibration matrix (the v0 exit criterion)
 
+The expected verdicts come from the issue and the fix, and driftlab must reproduce them from
+black-box observation alone. It does. These are the results of the first full run, on 2026-10-06
+at commit `f1a2136`, with each consumer's recovery time after the stall ended:
+
 | Scenario | legacy @ v1.53.1 | legacy @ v1.54.0 | jetstream @ v1.53.1 | jetstream @ v1.54.0 |
 |---|---|---|---|---|
 | control | clean | clean | clean | clean |
-| slow-short | **poll-skip** (the issue's repro loses 80 of 100) | clean | clean | clean |
-| slow-long | **poll-skip** expected | clean expected | clean | clean |
+| slow-short | **failed**: poll-skip, 21–100 never delivered; never caught up | clean; caught up in 18 s | clean; 3 ms | clean; 3 ms |
+| slow-long | **failed**: poll-skip, 21–100 never delivered; never caught up | clean; caught up in 10 s | clean; 3 ms | clean; 3 ms |
 
-The expected values come from the issue and the fix, and driftlab must reproduce them from
-black-box observation alone. If `legacy @ v1.54.0` fails `slow-long`, that is a real finding. It
-goes to the nats.go maintainers with the history file attached.
+- Both failures match the issue exactly: the consumer delivers 1 to 20, jumps to 101, and the 80
+  messages in between never arrive.
+- `legacy @ v1.54.0` passes `slow-long` too, so the fix also covers the heartbeat path.
+- The `jetstream` API is clean even on v1.53.1. It pulls only what fits in its tray, so it never
+  drops a message, and 2107 needs a dropped message to happen.
+
+`scripts/matrix.sh` reproduces the table. Run it on the machine that hosts nats-server: it builds
+the checker and both driver versions from the current commit, runs all 12 combinations, and marks
+any verdict the table doesn't predict. It passes `-grace 60s` instead of the default 10 seconds.
+The fixed legacy consumer's recovery varies from run to run (13, 15 and 18 seconds so far, with
+identical settings), so under the default window its clean verdict came down to luck. A consumer
+that catches up early ends the wait early, so only a stuck one waits out the full window.
 
 ## History format (the wire contract)
 
@@ -213,7 +228,10 @@ nothing, but it recovered in 5-second steps, one per heartbeat, because each ref
 the tray again. Each step carried at least one tray of messages, and sometimes several, because
 the callback keeps draining the tray while the refetch arrives. With 100 messages and a 2-second
 stall, recovery took 3 seconds with a 40-message tray, 13 with 20, and 23 with 10. One 20-message
-run took 15 seconds, and its clean verdict cleared the grace window by milliseconds.
+run took 15 seconds, and its clean verdict cleared the grace window by milliseconds. The
+`jetstream` API recovers without steps. With the same stall it caught up in 3 milliseconds. With
+1,000 messages and a 20-message tray, the legacy consumer took 23.061 seconds to catch up, and
+`jetstream` took 34 milliseconds.
 
 Each anomaly carries the history indexes of the ops involved. It also carries any `client-error`
 and nemesis events that fall inside the window, so the output points at evidence instead of just
@@ -280,8 +298,10 @@ driftlab/
 │   └── natsgo/
 │       ├── go.mod
 │       └── v1.53.1.mod
-└── deploy/
-    └── compose.yaml
+├── deploy/
+│   └── compose.yaml
+└── scripts/
+    └── matrix.sh
 ```
 
 | Path | What it is |
@@ -295,6 +315,7 @@ driftlab/
 | `drivers/natsgo/go.mod` | pins nats.go v1.54.0 (the fixed release) |
 | `drivers/natsgo/v1.53.1.mod` | pins nats.go v1.53.1 (the last buggy release), used via `-modfile` |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
+| `scripts/matrix.sh` | runs the 12-run calibration matrix and checks every verdict against the table |
 
 ## Milestones
 
@@ -303,15 +324,18 @@ driftlab/
   table-driven tests over hand-written histories. The fixtures are one clean history, one per anomaly kind, plus
   `info` publishes that are present and absent (both must pass). Exit: `driftlab check` flags
   every bad fixture and passes every good one. That is calibration step (a).
-- **Weekend 2 (the driver and calibration):** the natsgo driver (both APIs, both versions), the
-  compose file and the matrix above. Exit: the matrix reproduces. That is calibration steps (b)
-  and (c).
+- **Weekend 2 (done 2026-10-06; the driver and calibration):** the natsgo driver (both APIs, both
+  versions), the compose file and the matrix above. Exit: the matrix reproduces, which it did on
+  the first full run of `scripts/matrix.sh`. That is calibration steps (b) and (c).
 - **Weekend 3 (network and server faults):** toxiproxy between the driver and nats-server, for
   connection cuts and latency above the heartbeat interval. Docker pause, kill and restart of
   nats-server. Run the same matrix again. This is the first point where driftlab can find
   something nobody has reported yet.
 
 ## Beyond v0 (one line each, so v0 stays small)
+
+Each version ends with something public, a finding or a published results table, before the next
+one starts.
 
 - **v1:** the Go Kafka client matrix (franz-go, sarama, kafka-go, confluent-kafka-go) against one
   broker, with consumer-group rebalances and leader elections. Then Redpanda and Redis Streams.
@@ -327,9 +351,11 @@ driftlab/
   at a time. Should `deliver` events grow a batch form, the way Jepsen models polls? Kafka offsets
   also start at 0, which breaks the history package's convention that 0 means "absent".
   *Comes up:* in v1, when the first Kafka driver is written.
-- **Orchestration.** How much of a `driftlab run` command do we need? *Comes up:* at the end of
-  weekend 2. The matrix is 12 runs (3 scenarios × 2 APIs × 2 versions). That's fine by hand once,
-  and worth a script by the second time.
+- **Orchestration (decided 2026-10-06).** A shell script, `scripts/matrix.sh`, runs the v0
+  matrix. Weekend 3 shouldn't need more either: the plan is for each driver to inject its own
+  faults and record them in its history, so a run stays "run the driver, then judge the history".
+  A Go `driftlab run` command comes at the start of v1, when several client libraries make the
+  matrix too big for a script.
 - **Durable consumers.** With acks, duplicates become legal, but only when they're marked as
   redeliveries. That's a different contract, so it probably needs a separate checker mode.
   *Comes up:* in v2, with redelivery semantics.
