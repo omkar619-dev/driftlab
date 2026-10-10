@@ -1,5 +1,6 @@
-# One NATS server with JetStream, for driftlab runs on newpc. The image tag is
-# pinned because every history records which server produced it.
+# One NATS server with JetStream, plus toxiproxy in front of it, for driftlab
+# runs on newpc. Image tags are pinned because every history records which
+# server produced it.
 name: driftlab
 
 services:
@@ -14,5 +15,16 @@ services:
     volumes:
       - nats-data:/data
 
+  # The bad-line box for weekend 3. A consumer that connects to port 4223
+  # reaches NATS through toxiproxy, which can slow or cut that connection,
+  # while the producer keeps its direct line on 4222. Port 8474 is
+  # toxiproxy's HTTP API: the driver uses it to cause the faults, and the
+  # proxy itself is created at run time through it.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    ports:
+      - "127.0.0.1:4223:4223"
+      - "127.0.0.1:8474:8474"
+
 volumes:
-  nats-data:
+  nats-data: 
