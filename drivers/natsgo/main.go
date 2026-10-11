@@ -3,12 +3,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -23,35 +25,49 @@ import (
 const (
 	streamName = "DRIFTLAB"
 	subject    = "driftlab"
+
+	// The consumer's line through toxiproxy (deploy/compose.yaml): it
+	// listens on 4223 inside the toxiproxy container and leads to the nats
+	// service.
+	proxyName     = "helper-line"
+	proxyListen   = "0.0.0.0:4223"
+	proxyUpstream = "nats:4222"
 )
 
 // scenario describes one experiment. A zero stall means no fault is
-// injected.
+// injected. With proxy set, the consumer reaches NATS through toxiproxy
+// instead of directly.
 type scenario struct {
 	consumer bool
+	proxy    bool
 	stall    time.Duration
 }
 
 var scenarios = map[string]scenario{
-	"publish-only": {},
-	"control":      {consumer: true},
-	"slow-short":   {consumer: true, stall: 2 * time.Second},
-	"slow-long":    {consumer: true, stall: 8 * time.Second},
+	"publish-only":  {},
+	"control":       {consumer: true},
+	"proxy-control": {consumer: true, proxy: true},
+	"slow-short":    {consumer: true, stall: 2 * time.Second},
+	"slow-long":     {consumer: true, stall: 8 * time.Second},
 }
 
 type config struct {
-	url      string
-	scenario string
-	api      string
-	n        uint64
-	pending  int
-	grace    time.Duration
+	url       string
+	helperURL string
+	toxiproxy string
+	scenario  string
+	api       string
+	n         uint64
+	pending   int
+	grace     time.Duration
 }
 
 func main() {
 	var c config
 	flag.StringVar(&c.url, "url", nats.DefaultURL, "NATS server to run against")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, slow-short or slow-long")
+	flag.StringVar(&c.helperURL, "helper-url", "nats://127.0.0.1:4223", "where the consumer connects in proxy scenarios: toxiproxy's helper-line")
+	flag.StringVar(&c.toxiproxy, "toxiproxy", "http://127.0.0.1:8474", "toxiproxy's HTTP API, used by proxy scenarios")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, proxy-control, slow-short or slow-long")
 	flag.StringVar(&c.api, "api", "legacy", "consumer API: legacy (push) or jetstream (pull)")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish")
 	flag.IntVar(&c.pending, "pending", 20, "the consumer's tray size during a stall, in messages")
@@ -76,19 +92,10 @@ func run(c config, out io.Writer) error {
 	}
 	rec := newRecorder(out)
 
-	// nats.go reports some problems in the background instead of returning
-	// them. A slow consumer error is also the proof that the overflow fault
-	// happened: the client's pending tray filled up and it dropped messages.
-	var overflowed sync.Once
-	onError := func(_ *nats.Conn, _ *nats.Subscription, err error) {
-		rec.op(op{Process: "consumer", Type: "info", F: "client-error", Error: err.Error()})
-		if errors.Is(err, nats.ErrSlowConsumer) {
-			overflowed.Do(func() {
-				rec.op(op{Process: "nemesis", Type: "ok", F: "overflow"})
-			})
-		}
-	}
-	nc, err := nats.Connect(c.url, nats.ErrorHandler(onError))
+	// The producer's line. It creates the stream, publishes and does the
+	// final read, and it never goes through toxiproxy, so its acks keep
+	// coming whatever happens to the consumer's line.
+	nc, err := nats.Connect(c.url)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w (is the server up? docker compose -f deploy/compose.yaml up -d)", c.url, err)
 	}
@@ -103,9 +110,19 @@ func run(c config, out io.Writer) error {
 		return err
 	}
 
+	// The consumer's line is a connection of its own, so a fault can hit it
+	// alone.
+	var hc *nats.Conn
+	if sc.consumer {
+		if hc, err = connectHelper(c, sc, rec); err != nil {
+			return err
+		}
+		defer hc.Close()
+	}
+
 	rec.writeMeta(newMeta(nc.ConnectedServerVersion(), c, sc))
 	if sc.consumer {
-		if err := consume(ctx, nc, js, rec, c, sc); err != nil {
+		if err := consume(ctx, hc, js, rec, c, sc); err != nil {
 			return err
 		}
 	} else {
@@ -114,6 +131,38 @@ func run(c config, out io.Writer) error {
 		}
 	}
 	return finalRead(ctx, stream, rec)
+}
+
+// connectHelper opens the consumer's connection. In a proxy scenario it
+// first sets up a clean helper-line in toxiproxy, then connects through it.
+//
+// nats.go reports some problems in the background instead of returning
+// them, so the connection gets an error handler that records them. A slow
+// consumer error is also the proof that the overflow fault happened: the
+// client's pending tray filled up and it dropped messages.
+func connectHelper(c config, sc scenario, rec *recorder) (*nats.Conn, error) {
+	url := c.url
+	if sc.proxy {
+		tp := toxiproxy{api: c.toxiproxy}
+		if err := tp.setUp(); err != nil {
+			return nil, err
+		}
+		url = c.helperURL
+	}
+	var overflowed sync.Once
+	onError := func(_ *nats.Conn, _ *nats.Subscription, err error) {
+		rec.op(op{Process: "consumer", Type: "info", F: "client-error", Error: err.Error()})
+		if errors.Is(err, nats.ErrSlowConsumer) {
+			overflowed.Do(func() {
+				rec.op(op{Process: "nemesis", Type: "ok", F: "overflow"})
+			})
+		}
+	}
+	hc, err := nats.Connect(url, nats.ErrorHandler(onError))
+	if err != nil {
+		return nil, fmt.Errorf("connecting the consumer to %s: %w", url, err)
+	}
+	return hc, nil
 }
 
 // freshStream replaces any stream left over from an earlier run, so every
@@ -147,15 +196,16 @@ func publish(ctx context.Context, js jetstream.JetStream, rec *recorder, v uint6
 	return ack.Sequence
 }
 
-// consume runs an ordered consumer through the scenario. Only the first
-// message is published before it subscribes. The rest follow once that
-// first message has arrived, which is where a stall scenario's callback
-// blocks, so the flood always lands after the trap is armed. Shrinking the
-// tray first matters: it only turns away new arrivals, so a backlog that
-// arrived earlier would never overflow it. One more message follows once
-// the consumer has caught up, and it stops when it has seen everything or
-// the grace window runs out.
-func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, sc scenario) error {
+// consume runs an ordered consumer through the scenario. The consumer reads
+// on hc, its own connection; the producer publishes through js, on the
+// other one. Only the first message is published before it subscribes. The
+// rest follow once that first message has arrived, which is where a stall
+// scenario's callback blocks, so the flood always lands after the trap is
+// armed. Shrinking the tray first matters: it only turns away new arrivals,
+// so a backlog that arrived earlier would never overflow it. One more
+// message follows once the consumer has caught up, and it stops when it has
+// seen everything or the grace window runs out.
+func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, sc scenario) error {
 	// reached is the highest stream sequence delivered so far. Only atomic
 	// operations touch it: waitFor reads it from this goroutine, and onMsg
 	// can run on more than one goroutine, because the jetstream consumer
@@ -184,9 +234,9 @@ func consume(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, rec *re
 	var rd reader
 	var err error
 	if c.api == "jetstream" {
-		rd, err = subscribeJetStream(ctx, js, c, sc, onMsg, onErr)
+		rd, err = subscribeJetStream(ctx, hc, c, sc, onMsg, onErr)
 	} else {
-		rd, err = subscribeLegacy(nc, c, onMsg, onErr)
+		rd, err = subscribeLegacy(hc, c, onMsg, onErr)
 	}
 	if err != nil {
 		rec.op(op{Process: "consumer", Type: "info", F: "subscribe", Error: err.Error()})
@@ -232,8 +282,8 @@ type reader struct {
 // subscribeLegacy uses the legacy push ordered consumer, the API that KV
 // and Object Store watchers use. The server pushes messages at it, and
 // whatever doesn't fit its pending tray is dropped.
-func subscribeLegacy(nc *nats.Conn, c config, onMsg func([]byte, uint64), onErr func(error)) (reader, error) {
-	legacy, err := nc.JetStream()
+func subscribeLegacy(hc *nats.Conn, c config, onMsg func([]byte, uint64), onErr func(error)) (reader, error) {
+	legacy, err := hc.JetStream()
 	if err != nil {
 		return reader{}, err
 	}
@@ -258,8 +308,12 @@ func subscribeLegacy(nc *nats.Conn, c config, onMsg func([]byte, uint64), onErr 
 // package. It pulls messages in batches of at most PullMaxMessages, asking
 // for more only when there is room, so its tray can never overflow and
 // there is nothing to shrink.
-func subscribeJetStream(ctx context.Context, js jetstream.JetStream, c config, sc scenario, onMsg func([]byte, uint64), onErr func(error)) (reader, error) {
-	cons, err := js.OrderedConsumer(ctx, streamName, jetstream.OrderedConsumerConfig{})
+func subscribeJetStream(ctx context.Context, hc *nats.Conn, c config, sc scenario, onMsg func([]byte, uint64), onErr func(error)) (reader, error) {
+	hjs, err := jetstream.New(hc)
+	if err != nil {
+		return reader{}, err
+	}
+	cons, err := hjs.OrderedConsumer(ctx, streamName, jetstream.OrderedConsumerConfig{})
 	if err != nil {
 		return reader{}, err
 	}
@@ -354,11 +408,13 @@ type params struct {
 	N           uint64 `json:"n"`
 	PendingMsgs int    `json:"pending_msgs,omitempty"`
 	Stall       string `json:"stall,omitempty"`
+	Via         string `json:"via,omitempty"`
 }
 
 // newMeta describes the run. A stall scenario declares the stall, and for
 // the legacy API also the overflow it is meant to cause. If a declared
 // fault never happens, the checker calls the run invalid instead of clean.
+// A proxy scenario says its consumer's line ran through toxiproxy.
 func newMeta(server string, c config, sc scenario) metaLine {
 	client, rev := provenance()
 	m := metaLine{
@@ -372,6 +428,9 @@ func newMeta(server string, c config, sc scenario) metaLine {
 	}
 	if sc.consumer {
 		m.API = c.api
+	}
+	if sc.proxy {
+		m.Params.Via = "toxiproxy"
 	}
 	if sc.stall > 0 {
 		m.Faults = []string{"stall"}
@@ -450,4 +509,54 @@ func provenance() (client, rev string) {
 		rev += "-dirty"
 	}
 	return client, rev
+}
+
+// toxiproxyClient talks to toxiproxy's HTTP API. The timeout stops a box
+// that hangs from hanging the whole run.
+var toxiproxyClient = &http.Client{Timeout: 10 * time.Second}
+
+// toxiproxy drives the bad-line box through its HTTP API.
+type toxiproxy struct {
+	api string
+}
+
+// setUp gives the consumer a clean line. It creates helper-line if it
+// doesn't exist yet, then enables it and removes any toxic an earlier run
+// left behind.
+func (t toxiproxy) setUp() error {
+	proxies := []map[string]any{{
+		"name":     proxyName,
+		"listen":   proxyListen,
+		"upstream": proxyUpstream,
+		"enabled":  true,
+	}}
+	if err := t.call(http.MethodPost, "/populate", proxies); err != nil {
+		return err
+	}
+	return t.call(http.MethodPost, "/reset", nil)
+}
+
+// call sends one request to the API and fails unless the answer is 2xx.
+func (t toxiproxy) call(method, path string, body any) error {
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			return err
+		}
+	}
+	req, err := http.NewRequest(method, t.api+path, &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := toxiproxyClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("toxiproxy %s %s: %w (is it up? docker compose -f deploy/compose.yaml up -d)", method, path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		msg, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("toxiproxy %s %s: %s: %s", method, path, resp.Status, bytes.TrimSpace(msg))
+	}
+	return nil
 }
