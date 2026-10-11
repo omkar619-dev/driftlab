@@ -110,7 +110,8 @@ in the same order, so they differ only by the fault.
 | `proxy-control` | none, but the consumer goes through toxiproxy | the control for weekend 3's network faults: the proxy on its own must change nothing |
 | `slow-short` | 2s, shorter than the 5s ordered-consumer heartbeat | the path in the issue: no reset ever fires |
 | `slow-long` | 8s, longer than the heartbeat | the heartbeat reset fires, but it resumes from a sequence that has already been advanced past messages that were never delivered |
-
+| `net-slow` | none; the consumer's line runs 25s late for 30s, from halfway through the flood | longer than the 20s it can take either ordered consumer to decide its line is dead, so it resets while old messages are still in flight |
+| `net-cut` | none; the consumer's line is cut for 8s, from halfway through the flood | the connection drops with messages in flight, and the consumer has to resume from exactly the right place after reconnecting |
 `slow-long` matters because a fix that only covers the short path passes `slow-short` and still
 fails here.
 
@@ -128,6 +129,15 @@ keep their acks. The consumer has a connection of its own. In a proxy scenario i
 nats-server through toxiproxy (`deploy/compose.yaml`): the driver creates the `helper-line` proxy
 through toxiproxy's HTTP API at the start of the run, clears any fault an earlier run left behind,
 and records `"via": "toxiproxy"` in the meta line.
+
+The network scenarios break that line halfway through the flood, after the first half has been
+published, and heal it after a hold. `net-cut` disables `helper-line` for 8 seconds: toxiproxy
+drops the consumer's connection and refuses new ones, and nats.go retries every 2 seconds. The cut
+only counts as done if the consumer's client really was disconnected when the line healed.
+`net-slow` makes everything the server sends the consumer arrive 25 seconds late, for 30 seconds.
+Both ordered consumers reset after 10 seconds without a message or heartbeat, and the legacy one
+only checks every 10 seconds, so a line that stays quiet for over 20 seconds trips that reset in
+both, while the old messages are still on their way.
 
 ## Calibration matrix (the v0 exit criterion)
 
@@ -192,6 +202,9 @@ Field rules:
   from the log would then demand nothing.
 - A consumer records `subscribe` (an `invoke`, then an `ok`) when it starts. Without it, a consumer
   that received nothing would leave no trace at all, and the checker would judge it clean.
+- The consumer also records `disconnect` (an `info`, with the error) when its connection drops,
+  and `reconnect` when it comes back. They show when the client noticed a network fault; the
+  checker ignores them.
 - `time_ns` is monotonic time since the driver started, not wall-clock time. That follows from
   principle 4. Once one run has several processes, the harness will stamp receive times instead.
 - Unknown fields are ignored, so the format can grow.

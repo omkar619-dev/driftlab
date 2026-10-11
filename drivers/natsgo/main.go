@@ -34,13 +34,22 @@ const (
 	proxyUpstream = "nats:4222"
 )
 
-// scenario describes one experiment. A zero stall means no fault is
-// injected. With proxy set, the consumer reaches NATS through toxiproxy
-// instead of directly.
+// slowLatency is how late everything reaches the consumer in net-slow. Both
+// ordered consumers reset after 10 seconds without a message or heartbeat,
+// and the legacy one only checks every 10 seconds, so a line that stays
+// quiet for longer than 20 seconds trips that reset in both.
+const slowLatency = 25 * time.Second
+
+// scenario describes one experiment. A zero stall and an empty net mean no
+// fault is injected. With proxy set, the consumer reaches NATS through
+// toxiproxy instead of directly. net names a fault on that line, "slow" or
+// "cut", which starts halfway through the flood and lasts for hold.
 type scenario struct {
 	consumer bool
 	proxy    bool
 	stall    time.Duration
+	net      string
+	hold     time.Duration
 }
 
 var scenarios = map[string]scenario{
@@ -49,6 +58,8 @@ var scenarios = map[string]scenario{
 	"proxy-control": {consumer: true, proxy: true},
 	"slow-short":    {consumer: true, stall: 2 * time.Second},
 	"slow-long":     {consumer: true, stall: 8 * time.Second},
+	"net-slow":      {consumer: true, proxy: true, net: "slow", hold: 30 * time.Second},
+	"net-cut":       {consumer: true, proxy: true, net: "cut", hold: 8 * time.Second},
 }
 
 type config struct {
@@ -67,7 +78,7 @@ func main() {
 	flag.StringVar(&c.url, "url", nats.DefaultURL, "NATS server to run against")
 	flag.StringVar(&c.helperURL, "helper-url", "nats://127.0.0.1:4223", "where the consumer connects in proxy scenarios: toxiproxy's helper-line")
 	flag.StringVar(&c.toxiproxy, "toxiproxy", "http://127.0.0.1:8474", "toxiproxy's HTTP API, used by proxy scenarios")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, proxy-control, slow-short or slow-long")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, proxy-control, slow-short, slow-long, net-slow or net-cut")
 	flag.StringVar(&c.api, "api", "legacy", "consumer API: legacy (push) or jetstream (pull)")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish")
 	flag.IntVar(&c.pending, "pending", 20, "the consumer's tray size during a stall, in messages")
@@ -139,7 +150,8 @@ func run(c config, out io.Writer) error {
 // nats.go reports some problems in the background instead of returning
 // them, so the connection gets an error handler that records them. A slow
 // consumer error is also the proof that the overflow fault happened: the
-// client's pending tray filled up and it dropped messages.
+// client's pending tray filled up and it dropped messages. The connection
+// also records when it drops and when it comes back.
 func connectHelper(c config, sc scenario, rec *recorder) (*nats.Conn, error) {
 	url := c.url
 	if sc.proxy {
@@ -158,7 +170,20 @@ func connectHelper(c config, sc scenario, rec *recorder) (*nats.Conn, error) {
 			})
 		}
 	}
-	hc, err := nats.Connect(url, nats.ErrorHandler(onError))
+	onDisconnect := func(_ *nats.Conn, err error) {
+		// Close reports a nil error; only a dropped connection is news.
+		if err != nil {
+			rec.op(op{Process: "consumer", Type: "info", F: "disconnect", Error: err.Error()})
+		}
+	}
+	onReconnect := func(_ *nats.Conn) {
+		rec.op(op{Process: "consumer", Type: "info", F: "reconnect"})
+	}
+	hc, err := nats.Connect(url,
+		nats.ErrorHandler(onError),
+		nats.DisconnectErrHandler(onDisconnect),
+		nats.ReconnectHandler(onReconnect),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("connecting the consumer to %s: %w", url, err)
 	}
@@ -202,9 +227,11 @@ func publish(ctx context.Context, js jetstream.JetStream, rec *recorder, v uint6
 // rest follow once that first message has arrived, which is where a stall
 // scenario's callback blocks, so the flood always lands after the trap is
 // armed. Shrinking the tray first matters: it only turns away new arrivals,
-// so a backlog that arrived earlier would never overflow it. One more
-// message follows once the consumer has caught up, and it stops when it has
-// seen everything or the grace window runs out.
+// so a backlog that arrived earlier would never overflow it. A network
+// fault starts halfway through the flood, so it hits a consumer that is
+// busy receiving. One more message follows once the consumer has caught
+// up, and it stops when it has seen everything or the grace window runs
+// out.
 func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, sc scenario) error {
 	// reached is the highest stream sequence delivered so far. Only atomic
 	// operations touch it: waitFor reads it from this goroutine, and onMsg
@@ -256,7 +283,15 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 		}
 		rec.op(op{Process: "nemesis", Type: "invoke", F: "stall"})
 	}
+	tp := toxiproxy{api: c.toxiproxy}
+	netStarted := false
 	for v := uint64(2); v <= c.n; v++ {
+		if sc.net != "" && v == c.n/2+1 {
+			if err := startNetFault(tp, rec, sc); err != nil {
+				return err
+			}
+			netStarted = true
+		}
 		last = max(last, publish(ctx, js, rec, v))
 	}
 	if sc.stall > 0 {
@@ -264,11 +299,44 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 		close(gate)
 		rec.op(op{Process: "nemesis", Type: "ok", F: "stall"})
 	}
+	if netStarted {
+		time.Sleep(sc.hold)
+		if err := endNetFault(tp, rec, sc, hc); err != nil {
+			return err
+		}
+	}
 
 	waitFor(&reached, last, c.grace)
 	last = max(last, publish(ctx, js, rec, c.n+1))
 	waitFor(&reached, last, c.grace)
 	return rd.stop()
+}
+
+// startNetFault breaks the consumer's line in the middle of the flood:
+// "slow" makes everything the server sends the consumer arrive slowLatency
+// late, and "cut" drops the connection and refuses new ones.
+func startNetFault(tp toxiproxy, rec *recorder, sc scenario) error {
+	rec.op(op{Process: "nemesis", Type: "invoke", F: sc.net})
+	if sc.net == "slow" {
+		return tp.slow(slowLatency)
+	}
+	return tp.cut()
+}
+
+// endNetFault heals the line. A slow line is done once toxiproxy has taken
+// the toxic back. A cut only counts if the consumer's client really lost its
+// connection: if it never noticed, the fault never happened, and the run is
+// invalid rather than clean.
+func endNetFault(tp toxiproxy, rec *recorder, sc scenario, hc *nats.Conn) error {
+	lost := !hc.IsConnected()
+	if err := tp.heal(); err != nil {
+		return err
+	}
+	if sc.net == "cut" && !lost {
+		return nil
+	}
+	rec.op(op{Process: "nemesis", Type: "ok", F: sc.net})
+	return nil
 }
 
 // reader is a running consumer: how to stop it, and how to shrink its
@@ -409,10 +477,13 @@ type params struct {
 	PendingMsgs int    `json:"pending_msgs,omitempty"`
 	Stall       string `json:"stall,omitempty"`
 	Via         string `json:"via,omitempty"`
+	Hold        string `json:"hold,omitempty"`
+	Latency     string `json:"latency,omitempty"`
 }
 
 // newMeta describes the run. A stall scenario declares the stall, and for
-// the legacy API also the overflow it is meant to cause. If a declared
+// the legacy API also the overflow it is meant to cause. A network scenario
+// declares its fault, slow or cut, and how long it lasts. If a declared
 // fault never happens, the checker calls the run invalid instead of clean.
 // A proxy scenario says its consumer's line ran through toxiproxy.
 func newMeta(server string, c config, sc scenario) metaLine {
@@ -439,6 +510,13 @@ func newMeta(server string, c config, sc scenario) metaLine {
 		}
 		m.Params.PendingMsgs = c.pending
 		m.Params.Stall = sc.stall.String()
+	}
+	if sc.net != "" {
+		m.Faults = []string{sc.net}
+		m.Params.Hold = sc.hold.String()
+		if sc.net == "slow" {
+			m.Params.Latency = slowLatency.String()
+		}
 	}
 	return m
 }
@@ -521,8 +599,7 @@ type toxiproxy struct {
 }
 
 // setUp gives the consumer a clean line. It creates helper-line if it
-// doesn't exist yet, then enables it and removes any toxic an earlier run
-// left behind.
+// doesn't exist yet, then heals it.
 func (t toxiproxy) setUp() error {
 	proxies := []map[string]any{{
 		"name":     proxyName,
@@ -533,6 +610,28 @@ func (t toxiproxy) setUp() error {
 	if err := t.call(http.MethodPost, "/populate", proxies); err != nil {
 		return err
 	}
+	return t.heal()
+}
+
+// slow makes everything the server sends the consumer arrive latency late.
+func (t toxiproxy) slow(latency time.Duration) error {
+	return t.call(http.MethodPost, "/proxies/"+proxyName+"/toxics", map[string]any{
+		"name":       "slow",
+		"type":       "latency",
+		"stream":     "downstream",
+		"attributes": map[string]any{"latency": latency.Milliseconds()},
+	})
+}
+
+// cut disables helper-line: toxiproxy drops the consumer's connection and
+// refuses new ones until the line is healed.
+func (t toxiproxy) cut() error {
+	return t.call(http.MethodPost, "/proxies/"+proxyName, map[string]any{"enabled": false})
+}
+
+// heal enables helper-line again and removes every toxic, including any an
+// earlier run left behind.
+func (t toxiproxy) heal() error {
 	return t.call(http.MethodPost, "/reset", nil)
 }
 
