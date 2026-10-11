@@ -71,6 +71,7 @@ type config struct {
 	n         uint64
 	pending   int
 	grace     time.Duration
+	hold      time.Duration
 }
 
 func main() {
@@ -83,6 +84,7 @@ func main() {
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish")
 	flag.IntVar(&c.pending, "pending", 20, "the consumer's tray size during a stall, in messages")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the consumer gets to catch up before the final read")
+	flag.DurationVar(&c.hold, "hold", 0, "how long a network fault lasts; 0 keeps the scenario's own")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "natsdriver:", err)
@@ -100,6 +102,10 @@ func run(c config, out io.Writer) error {
 	}
 	if c.n < 1 {
 		return errors.New("-n must be at least 1")
+	}
+		// -hold overrides how long a network fault lasts, to find thresholds.
+	if c.hold > 0 {
+		sc.hold = c.hold
 	}
 	rec := newRecorder(out)
 
