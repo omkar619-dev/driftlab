@@ -107,6 +107,7 @@ in the same order, so they differ only by the fault.
 |---|---|---|
 | `publish-only` | none, and no consumer | proves the driver and the final read on their own |
 | `control` | none | proves the harness and environment are clean |
+| `proxy-control` | none, but the consumer goes through toxiproxy | the control for weekend 3's network faults: the proxy on its own must change nothing |
 | `slow-short` | 2s, shorter than the 5s ordered-consumer heartbeat | the path in the issue: no reset ever fires |
 | `slow-long` | 8s, longer than the heartbeat | the heartbeat reset fires, but it resumes from a sequence that has already been advanced past messages that were never delivered |
 
@@ -120,6 +121,13 @@ run whose tray never overflowed is invalid rather than clean, because the 2107 t
 The `jetstream` API has no drop path. It pulls messages in batches of at most `PullMaxMessages`
 (its tray, set to the same size) and asks for more only when there is room, so its stall
 scenarios declare only `stall`. The driver picks the API with `-api legacy` or `-api jetstream`.
+
+Weekend 3 breaks the consumer's connection on purpose, so the driver now uses two. The producer,
+the stream setup and the final read share a direct connection that no fault touches, so publishes
+keep their acks. The consumer has a connection of its own. In a proxy scenario it reaches
+nats-server through toxiproxy (`deploy/compose.yaml`): the driver creates the `helper-line` proxy
+through toxiproxy's HTTP API at the start of the run, clears any fault an earlier run left behind,
+and records `"via": "toxiproxy"` in the meta line.
 
 ## Calibration matrix (the v0 exit criterion)
 
@@ -139,12 +147,13 @@ at commit `f1a2136`, with each consumer's recovery time after the stall ended:
 - The `jetstream` API is clean even on v1.53.1. It pulls only what fits in its tray, so it never
   drops a message, and 2107 needs a dropped message to happen.
 
-`scripts/matrix.sh` reproduces the table. Run it on the machine that hosts nats-server: it builds
-the checker and both driver versions from the current commit, runs all 12 combinations, and marks
-any verdict the table doesn't predict. It passes `-grace 60s` instead of the default 10 seconds.
-The fixed legacy consumer's recovery varies from run to run (13, 15 and 18 seconds so far, with
-identical settings), so under the default window its clean verdict came down to luck. A consumer
-that catches up early ends the wait early, so only a stuck one waits out the full window.
+`scripts/matrix.sh` reproduces the table, and also runs `proxy-control`, which should be clean
+everywhere. Run it on the machine that hosts nats-server and toxiproxy: it builds the checker and
+both driver versions from the current commit, runs every combination, and marks any verdict the
+table doesn't predict. It passes `-grace 60s` instead of the default 10 seconds. The fixed legacy
+consumer's recovery varies from run to run (between 10 and 18 seconds so far, with identical
+settings), so under the default window its clean verdict came down to luck. A consumer that
+catches up early ends the wait early, so only a stuck one waits out the full window.
 
 ## History format (the wire contract)
 
