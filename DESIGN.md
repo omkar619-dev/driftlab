@@ -110,7 +110,7 @@ in the same order, so they differ only by the fault.
 | `proxy-control` | none, but the consumer goes through toxiproxy | the control for weekend 3's network faults: the proxy on its own must change nothing |
 | `slow-short` | 2s, shorter than the 5s ordered-consumer heartbeat | the path in the issue: no reset ever fires |
 | `slow-long` | 8s, longer than the heartbeat | the heartbeat reset fires, but it resumes from a sequence that has already been advanced past messages that were never delivered |
-| `net-slow` | none; the consumer's line runs 25s late for 30s, from halfway through the flood | longer than the 20s it can take either ordered consumer to decide its line is dead, so it resets while old messages are still in flight |
+| `net-slow` | none; the consumer's line runs 25s late for 30s, from halfway through the flood | longer than the 20s the legacy consumer can take to decide its line is dead, so it resets while old messages are still in flight; the `jetstream` one waits 30s, so it has to ride the delay out without resetting |
 | `net-cut` | none; the consumer's line is cut for 8s, from halfway through the flood | the connection drops with messages in flight, and the consumer has to resume from exactly the right place after reconnecting |
 `slow-long` matters because a fix that only covers the short path passes `slow-short` and still
 fails here.
@@ -135,9 +135,13 @@ published, and heal it after a hold. `net-cut` disables `helper-line` for 8 seco
 drops the consumer's connection and refuses new ones, and nats.go retries every 2 seconds. The cut
 only counts as done if the consumer's client really was disconnected when the line healed.
 `net-slow` makes everything the server sends the consumer arrive 25 seconds late, for 30 seconds.
-Both ordered consumers reset after 10 seconds without a message or heartbeat, and the legacy one
-only checks every 10 seconds, so a line that stays quiet for over 20 seconds trips that reset in
-both, while the old messages are still on their way.
+The legacy ordered consumer checks for activity every 10 seconds and resets after a whole interval
+with no message or heartbeat, so a line that stays quiet for over 20 seconds always trips it, while
+the old messages are still on their way. The `jetstream` one resets after two missed heartbeats,
+and its heartbeat is 15 seconds: the package works out a 5-second default for ordered consumers
+but never passes it on to the pull subscription, which falls back to half of the 30-second pull
+expiry. Its pull requests show it, asking for `"idle_heartbeat":15000000000`. So it waits 30
+seconds, rides this delay out without resetting, and takes the late messages as they arrive.
 
 ## Calibration matrix (the v0 exit criterion)
 

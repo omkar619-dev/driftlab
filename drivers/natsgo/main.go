@@ -34,10 +34,12 @@ const (
 	proxyUpstream = "nats:4222"
 )
 
-// slowLatency is how late everything reaches the consumer in net-slow. Both
-// ordered consumers reset after 10 seconds without a message or heartbeat,
-// and the legacy one only checks every 10 seconds, so a line that stays
-// quiet for longer than 20 seconds trips that reset in both.
+// slowLatency is how late everything reaches the consumer in net-slow. The
+// legacy ordered consumer checks for activity every 10 seconds and resets
+// after a whole check interval with no message or heartbeat, so a line that
+// stays quiet for longer than 20 seconds always trips it. The jetstream one
+// resets only after 30 seconds of silence (see DESIGN.md), so it rides this
+// delay out.
 const slowLatency = 25 * time.Second
 
 // scenario describes one experiment. A zero stall and an empty net mean no
