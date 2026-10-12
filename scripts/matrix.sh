@@ -20,7 +20,7 @@ mkdir -p "$out"
 
 versions=(v1.53.1 v1.54.0)
 apis=(legacy jetstream)
-scenarios=(control proxy-control slow-short slow-long net-slow net-cut)
+scenarios=(control proxy-control slow-short slow-long net-slow net-cut server-pause server-kill)
 
 # The fixed legacy consumer takes 10 to 18 seconds to catch up after a stall
 # with a 20-message tray (DESIGN.md, Recovery). Under the default 10-second

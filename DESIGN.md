@@ -112,6 +112,9 @@ in the same order, so they differ only by the fault.
 | `slow-long` | 8s, longer than the heartbeat | the heartbeat reset fires, but it resumes from a sequence that has already been advanced past messages that were never delivered |
 | `net-slow` | none; the consumer's line runs 25s late for 30s, from halfway through the flood | longer than the 20s the legacy consumer can take to decide its line is dead, so it resets while old messages are still in flight; the `jetstream` one waits 30s, so it has to ride the delay out without resetting |
 | `net-cut` | none; the consumer's line is cut for 8s, from halfway through the flood | the connection drops with messages in flight, and the consumer has to resume from exactly the right place after reconnecting |
+| `server-pause` | none; nats-server is frozen for 35s, from halfway through the flood | every connection stays open but nothing answers, for longer than either consumer waits before resetting |
+| `server-kill` | none; nats-server is killed halfway through the flood and started again after 5s | both connections drop, and the restart deletes both consumers' server-side state, which they have to rebuild |
+
 `slow-long` matters because a fix that only covers the short path passes `slow-short` and still
 fails here.
 
@@ -124,8 +127,8 @@ The `jetstream` API has no drop path. It pulls messages in batches of at most `P
 scenarios declare only `stall`. The driver picks the API with `-api legacy` or `-api jetstream`.
 
 Weekend 3 breaks the consumer's connection on purpose, so the driver now uses two. The producer,
-the stream setup and the final read share a direct connection that no fault touches, so publishes
-keep their acks. The consumer has a connection of its own. In a proxy scenario it reaches
+the stream setup and the final read share a direct connection that no network fault touches, so
+publishes keep their acks. The consumer has a connection of its own. In a proxy scenario it reaches
 nats-server through toxiproxy (`deploy/compose.yaml`): the driver creates the `helper-line` proxy
 through toxiproxy's HTTP API at the start of the run, clears any fault an earlier run left behind,
 and records `"via": "toxiproxy"` in the meta line.
@@ -142,6 +145,22 @@ and its heartbeat is 15 seconds: the package works out a 5-second default for or
 but never passes it on to the pull subscription, which falls back to half of the 30-second pull
 expiry. Its pull requests show it, asking for `"idle_heartbeat":15000000000`. So it waits 30
 seconds, rides this delay out without resetting, and takes the late messages as they arrive.
+
+The server scenarios hit nats-server itself, halfway through the flood, so both connections lose
+it at once. `server-pause` freezes its container for 35 seconds with `docker pause`: every
+connection stays open, but nothing answers. That is longer than either consumer waits before
+deciding its line is dead, up to 20 seconds for the legacy one and 30 for the `jetstream` one, so
+both try to reset against a server that can't reply. `server-kill` kills the container with
+`docker kill`, keeps it down for 5 seconds and starts it again. Both ordered consumers keep their
+server-side consumer in memory only, so a restart deletes it however short the outage, and each
+has to notice and build a new one. The producer keeps publishing through either fault, and a
+publish whose ack doesn't arrive within the 5-second timeout is recorded as `info`, because it may
+still land once the server is back (principle 3). The final read settles which ones did. The fault
+starts at once and ends on its own timer, and it counts as done only when docker shows it took
+hold: a paused container, or one that exited with code 137 (killed) and came back as a server with
+a new ID, since nats-server picks a fresh one every time it starts. The driver runs docker itself,
+so it has to run on the machine that hosts the container (`-container`, `driftlab-nats-1` by
+default).
 
 ## Calibration matrix (the v0 exit criterion)
 

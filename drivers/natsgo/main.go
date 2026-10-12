@@ -12,8 +12,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,15 +44,18 @@ const (
 // delay out.
 const slowLatency = 25 * time.Second
 
-// scenario describes one experiment. A zero stall and an empty net mean no
-// fault is injected. With proxy set, the consumer reaches NATS through
-// toxiproxy instead of directly. net names a fault on that line, "slow" or
-// "cut", which starts halfway through the flood and lasts for hold.
+// scenario describes one experiment. A zero stall and empty net and server
+// fields mean no fault is injected. With proxy set, the consumer reaches
+// NATS through toxiproxy instead of directly. net names a fault on that
+// line, "slow" or "cut", and server names one that hits nats-server itself,
+// "pause" or "kill". Either starts halfway through the flood and lasts for
+// hold.
 type scenario struct {
 	consumer bool
 	proxy    bool
 	stall    time.Duration
 	net      string
+	server   string
 	hold     time.Duration
 }
 
@@ -62,12 +67,15 @@ var scenarios = map[string]scenario{
 	"slow-long":     {consumer: true, stall: 8 * time.Second},
 	"net-slow":      {consumer: true, proxy: true, net: "slow", hold: 30 * time.Second},
 	"net-cut":       {consumer: true, proxy: true, net: "cut", hold: 8 * time.Second},
+	"server-pause":  {consumer: true, server: "pause", hold: 35 * time.Second},
+	"server-kill":   {consumer: true, server: "kill", hold: 5 * time.Second},
 }
 
 type config struct {
 	url       string
 	helperURL string
 	toxiproxy string
+	container string
 	scenario  string
 	api       string
 	n         uint64
@@ -81,12 +89,13 @@ func main() {
 	flag.StringVar(&c.url, "url", nats.DefaultURL, "NATS server to run against")
 	flag.StringVar(&c.helperURL, "helper-url", "nats://127.0.0.1:4223", "where the consumer connects in proxy scenarios: toxiproxy's helper-line")
 	flag.StringVar(&c.toxiproxy, "toxiproxy", "http://127.0.0.1:8474", "toxiproxy's HTTP API, used by proxy scenarios")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, proxy-control, slow-short, slow-long, net-slow or net-cut")
+	flag.StringVar(&c.container, "container", "driftlab-nats-1", "nats-server's docker container, which server scenarios pause or kill")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, proxy-control, slow-short, slow-long, net-slow, net-cut, server-pause or server-kill")
 	flag.StringVar(&c.api, "api", "legacy", "consumer API: legacy (push) or jetstream (pull)")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish")
 	flag.IntVar(&c.pending, "pending", 20, "the consumer's tray size during a stall, in messages")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the consumer gets to catch up before the final read")
-	flag.DurationVar(&c.hold, "hold", 0, "how long a network fault lasts; 0 keeps the scenario's own")
+	flag.DurationVar(&c.hold, "hold", 0, "how long a network or server fault lasts; 0 keeps the scenario's own")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "natsdriver:", err)
@@ -105,15 +114,17 @@ func run(c config, out io.Writer) error {
 	if c.n < 1 {
 		return errors.New("-n must be at least 1")
 	}
-	// -hold overrides how long a network fault lasts, to find thresholds.
+	// -hold overrides how long a network or server fault lasts, to find
+	// thresholds.
 	if c.hold > 0 {
 		sc.hold = c.hold
 	}
 	rec := newRecorder(out)
 
 	// The producer's line. It creates the stream, publishes and does the
-	// final read, and it never goes through toxiproxy, so its acks keep
-	// coming whatever happens to the consumer's line.
+	// final read. It never goes through toxiproxy, so its acks keep coming
+	// whatever happens to the consumer's line, but a server fault stops
+	// them too.
 	nc, err := nats.Connect(c.url)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w (is the server up? docker compose -f deploy/compose.yaml up -d)", c.url, err)
@@ -235,11 +246,11 @@ func publish(ctx context.Context, js jetstream.JetStream, rec *recorder, v uint6
 // rest follow once that first message has arrived, which is where a stall
 // scenario's callback blocks, so the flood always lands after the trap is
 // armed. Shrinking the tray first matters: it only turns away new arrivals,
-// so a backlog that arrived earlier would never overflow it. A network
-// fault starts halfway through the flood, so it hits a consumer that is
-// busy receiving. One more message follows once the consumer has caught
-// up, and it stops when it has seen everything or the grace window runs
-// out.
+// so a backlog that arrived earlier would never overflow it. A network or
+// server fault starts halfway through the flood, so it hits a consumer
+// that is busy receiving. One more message follows once the consumer has
+// caught up, and it stops when it has seen everything or the grace window
+// runs out.
 func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, sc scenario) error {
 	// reached is the highest stream sequence delivered so far. Only atomic
 	// operations touch it: waitFor reads it from this goroutine, and onMsg
@@ -293,12 +304,24 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 	}
 	tp := toxiproxy{api: c.toxiproxy}
 	netStarted := false
+	var serverDone chan error
 	for v := uint64(2); v <= c.n; v++ {
 		if sc.net != "" && v == c.n/2+1 {
 			if err := startNetFault(tp, rec, sc); err != nil {
 				return err
 			}
 			netStarted = true
+		}
+		// A server fault starts right away, but it ends on its own timer,
+		// because the publishes below keep waiting on a server that can't
+		// answer.
+		if sc.server != "" && v == c.n/2+1 {
+			finish, err := startServerFault(ctx, js, rec, c, sc)
+			if err != nil {
+				return err
+			}
+			serverDone = make(chan error, 1)
+			go func() { serverDone <- finish() }()
 		}
 		last = max(last, publish(ctx, js, rec, v))
 	}
@@ -310,6 +333,11 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 	if netStarted {
 		time.Sleep(sc.hold)
 		if err := endNetFault(tp, rec, sc, hc); err != nil {
+			return err
+		}
+	}
+	if serverDone != nil {
+		if err := <-serverDone; err != nil {
 			return err
 		}
 	}
@@ -345,6 +373,91 @@ func endNetFault(tp toxiproxy, rec *recorder, sc scenario, hc *nats.Conn) error 
 	}
 	rec.op(op{Process: "nemesis", Type: "ok", F: sc.net})
 	return nil
+}
+
+// startServerFault freezes or kills nats-server right away, so the rest of
+// the flood really meets a server that can't answer, and returns finish,
+// which brings it back after sc.hold. finish runs on its own goroutine,
+// because the producer keeps publishing meanwhile and each of those
+// publishes waits for an ack. The fault only counts as done if docker
+// shows it really happened: a paused container, or one that exited with
+// code 137, which means it was killed, and came back as a server with a
+// new ID, because nats-server picks a fresh one every time it starts.
+func startServerFault(ctx context.Context, js jetstream.JetStream, rec *recorder, c config, sc scenario) (func() error, error) {
+	rec.op(op{Process: "nemesis", Type: "invoke", F: sc.server})
+	if sc.server == "pause" {
+		if _, err := docker("pause", c.container); err != nil {
+			return nil, err
+		}
+		paused, checkErr := docker("inspect", "-f", "{{.State.Paused}}", c.container)
+		return func() error {
+			time.Sleep(sc.hold)
+			// Unpause whatever the check said, so a run never leaves the
+			// server frozen.
+			if _, err := docker("unpause", c.container); err != nil {
+				return err
+			}
+			if checkErr != nil {
+				return checkErr
+			}
+			if paused == "true" {
+				rec.op(op{Process: "nemesis", Type: "ok", F: sc.server})
+			}
+			return nil
+		}, nil
+	}
+
+	before := js.Conn().ConnectedServerId()
+	if _, err := docker("kill", c.container); err != nil {
+		return nil, err
+	}
+	code, waitErr := docker("wait", c.container)
+	return func() error {
+		time.Sleep(sc.hold)
+		if _, err := docker("start", c.container); err != nil {
+			return err
+		}
+		if waitErr != nil {
+			return waitErr
+		}
+		if err := waitForJetStream(ctx, js, time.Minute); err != nil {
+			return err
+		}
+		if code == "137" && js.Conn().ConnectedServerId() != before {
+			rec.op(op{Process: "nemesis", Type: "ok", F: sc.server})
+		}
+		return nil
+	}, nil
+}
+
+// waitForJetStream asks for the stream's info until the restarted server
+// answers, and gives up after limit.
+func waitForJetStream(ctx context.Context, js jetstream.JetStream, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for {
+		askCtx, cancel := context.WithTimeout(ctx, time.Second)
+		_, err := js.Stream(askCtx, streamName)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("JetStream didn't come back within %s: %w", limit, err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// docker runs one docker command and returns what it printed. It gives up
+// after 30 seconds, so a docker daemon that hangs can't hang the run.
+func docker(args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, bytes.TrimSpace(out))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // reader is a running consumer: how to stop it, and how to shrink its
@@ -490,10 +603,11 @@ type params struct {
 }
 
 // newMeta describes the run. A stall scenario declares the stall, and for
-// the legacy API also the overflow it is meant to cause. A network scenario
-// declares its fault, slow or cut, and how long it lasts. If a declared
-// fault never happens, the checker calls the run invalid instead of clean.
-// A proxy scenario says its consumer's line ran through toxiproxy.
+// the legacy API also the overflow it is meant to cause. A network or
+// server scenario declares its fault (slow, cut, pause or kill) and how
+// long it lasts. If a declared fault never happens, the checker calls the
+// run invalid instead of clean. A proxy scenario says its consumer's line
+// ran through toxiproxy.
 func newMeta(server string, c config, sc scenario) metaLine {
 	client, rev := provenance()
 	m := metaLine{
@@ -525,6 +639,10 @@ func newMeta(server string, c config, sc scenario) metaLine {
 		if sc.net == "slow" {
 			m.Params.Latency = slowLatency.String()
 		}
+	}
+	if sc.server != "" {
+		m.Faults = []string{sc.server}
+		m.Params.Hold = sc.hold.String()
 	}
 	return m
 }
