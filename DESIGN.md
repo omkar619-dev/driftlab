@@ -1,8 +1,9 @@
-# driftlab: design (v0)
+# driftlab: design
 
 > Status: last updated 2026-10-13. v0 is done: the checker, and one system (NATS JetStream, Go
 > client) under stall, network and server faults. The calibration matrix reproduces, and weekend 3
-> produced two upstream reports (see Weekend 3 results). Next is v1, the Go Kafka clients.
+> produced two upstream reports (see Weekend 3 results). v1, the Go Kafka clients, has started: the
+> three-broker cluster runs, and v1 design records the decisions its code will follow.
 
 ## What driftlab is
 
@@ -229,6 +230,77 @@ versions within a few hundred milliseconds of each other:
   /data/jetstream/$G/streams: no such file or directory`), right after the previous run had
   deleted the stream. It didn't come back in 300 publish-only runs, so it is parked as seen once.
 
+## v1 design: the Go Kafka clients
+
+Decided on 2026-10-13, before any v1 code was written. The sections after this one describe what
+the code does today, and change when the code does.
+
+v1 runs the same experiment against Kafka's Go clients, starting with franz-go. The cluster is
+three Kafka 4.3.1 nodes, each both a broker and a KRaft controller (`deploy/kafka.yaml`). Every
+partition has a copy on all three, and an `acks=all` write needs two of them
+(`min.insync.replicas=2`). Explored by hand, the cluster replaced a killed partition leader within
+about 9 seconds (the brokers' session timeout), kept accepting `acks=all` writes with one broker
+down, and didn't hand leadership back right away when the killed broker returned.
+
+**Positions.** NATS gives a stored message one number, its stream sequence, counted from 1. Kafka
+gives it two: a partition, and an offset within that partition, both counted from 0. So 0 can't
+mean "absent" for them, the way it does for `value` and `stream_seq`. Kafka histories carry two
+new fields, `partition` and `offset`, which the history package decodes into pointers, so a
+missing field and a real 0 stay different: a driver that forgets one gets a parse error instead
+of a fake first message. Writing offset+1 was rejected because the history would disagree with
+Kafka's own tools, and so was -1 for "absent", because a Go field nobody filled in is 0 and would
+read as a real position. NATS histories keep `stream_seq`, so every v0 history still parses and
+gets the same verdict. The checker applies the v0 rules once per partition.
+
+**Batches.** A Kafka consumer polls, and each poll returns a batch, possibly from several
+partitions. Jepsen records a poll as one operation. driftlab keeps one `deliver` line per message,
+because the checker's rules are about messages, and a search for one value still finds every
+sighting of it. Each line carries the time its poll returned and a `poll` number, counted per
+consumer, so the batch boundaries survive: Jepsen uses them to tell a skip inside one poll from a
+skip between polls. The checker ignores `poll` until a finding needs it.
+
+**Final read.** NATS lets the driver read a stream back message by message, without a consumer.
+Kafka has no such call: every read is a fetch. So the final read uses a fresh client, separate from
+the producer, with no consumer group and no committed offsets, that reads every partition from
+offset 0 to its end. The hole rule still checks that reader: offsets must run 0, 1, 2 and so on in
+every partition, and a hole no ack explains makes the run invalid. A hole an ack does explain is
+reported as a lost write, and an acked message the reader skipped would look exactly the same. So
+before a lost write goes upstream, a second witness reads the topic again: Kafka's own Java console
+consumer, which shares no code with the Go client. Every run writes to a topic of its own, so the
+evidence stays in the cluster until it is torn down. Kafka offsets have no legitimate holes only
+while nothing uses transactions, whose markers take up offsets (principle 5). That changes in v2.
+
+**Two new anomalies, and a rename.** Both new ones are Jepsen's names, with Jepsen's meanings:
+
+| Anomaly | Definition | Usually whose bug |
+|---|---|---|
+| `duplicate` | one value stored at more than one position, which an idempotent producer exists to prevent | client (producer) or server |
+| `inconsistent-offsets` | two observations disagree about which value sits at a position: an ack and a read, or two reads | client or server |
+
+v0 used `duplicate` for a consumer receiving the same stream sequence twice, which Jepsen counts
+as a `nonmonotonic-poll`. This document promises Jepsen's meanings, so v0's anomaly is being
+renamed `duplicate-delivery`. Old histories keep their verdicts; only the label changes.
+
+**Calibration.** In https://github.com/twmb/franz-go/issues/1217, an idempotent produce timed out
+and the client treated it as never written, letting the caller cancel it, although the broker had
+appended it. The next batch reused its sequence numbers, so the broker took it for a retry and
+acked it without writing it. The fix shipped in v1.20.7, so v1.20.6 must fail and v1.20.7 must
+pass, the same shape as the 2107 pair. The history should show a lost write plus an inconsistent
+offset, because the ack names a position that holds a different message.
+
+**Orchestration.** Still a script. v1 starts with v0's shape, one client library in two versions,
+and the faults stay inside each driver. A Go `driftlab run` comes with v3, whose fault schedules
+have to be generated, re-run and shrunk.
+
+**Consumer groups.** A group member that takes over a partition starts from the group's committed
+offset, so messages the previous owner received but hadn't committed arrive again. That is
+at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
+nonmonotonic polls when its consumers subscribe through a group. It is the durable-consumer
+question from the open questions, arriving early. Until it's settled, consumers are assigned
+partitions directly, with no group. That should promise what the NATS ordered consumer promises,
+every offset once and in order, so the v0 rules apply; each client's docs get quoted when its
+driver is written (principle 1).
+
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -380,7 +452,7 @@ scripts: 0 clean, 1 failed, 2 invalid, and 3 when the command couldn't run (bad 
 can't open or parse). An invalid run exits non-zero on purpose, so a script can never mistake a
 broken experiment for a pass.
 
-## Repo layout (v0)
+## Repo layout
 
 ```
 driftlab/
@@ -397,7 +469,8 @@ driftlab/
 │       ├── v1.53.1.mod
 │       └── repro2180/
 ├── deploy/
-│   └── compose.yaml
+│   ├── compose.yaml
+│   └── kafka.yaml
 └── scripts/
     └── matrix.sh
 ```
@@ -414,6 +487,7 @@ driftlab/
 | `drivers/natsgo/v1.53.1.mod` | pins nats.go v1.53.1 (the last buggy release), used via `-modfile` |
 | `drivers/natsgo/repro2180/` | a standalone reproducer for nats.go issue 2180, which needs only nats-server |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
+| `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 
 ## Milestones
@@ -430,15 +504,20 @@ driftlab/
   a slow line and a cut line, docker pause and kill for the server, the lag measurement, and the
   32-run matrix. It found the first things nobody had reported: nats.go issues 2180 and 2181 (see
   Weekend 3 results).
+- **v1 (started 2026-10-13; the Go Kafka clients):** the three-broker cluster in
+  `deploy/kafka.yaml`, explored by hand, and the decisions in v1 design. First exit: the
+  calibration pair reproduces, with franz-go v1.20.6 failing and v1.20.7 passing. The version
+  ends with the published table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 
 Each version ends with something public, a finding or a published results table, before the next
 one starts.
 
-- **v1:** the Go Kafka client matrix (franz-go, sarama, kafka-go, confluent-kafka-go) against one
-  broker, with consumer-group rebalances and leader elections. Then Redpanda and Redis Streams.
-  The output is a published table of client × documented guarantee × verdict under each fault.
+- **v1:** the Go Kafka client matrix (franz-go, sarama, kafka-go, confluent-kafka-go) against a
+  three-broker cluster, with consumer-group rebalances and leader elections (see v1 design). Then
+  Redpanda and Redis Streams. The output is a published table of client × documented guarantee ×
+  verdict under each fault.
 - **v2:** backpressure, exactly-once claims, redelivery semantics, time-to-recovery.
 - **v3:** seeded fault schedules, shrinking a failing schedule down to a minimal one, and a CI mode
   so maintainers can run it nightly.
@@ -446,14 +525,15 @@ one starts.
 
 ## Open questions (decided when we reach them)
 
-- **Batch deliveries.** Kafka consumers poll in batches, while push callbacks deliver one message
-  at a time. Should `deliver` events grow a batch form, the way Jepsen models polls? Kafka offsets
-  also start at 0, which breaks the history package's convention that 0 means "absent".
-  *Comes up:* in v1, when the first Kafka driver is written.
-- **Orchestration (decided 2026-10-06).** A shell script, `scripts/matrix.sh`, runs the v0
-  matrix. Weekend 3 didn't need more: each driver injects its own faults and records them in its
-  history, so a run stayed "run the driver, then judge the history". A Go `driftlab run` command
-  comes at the start of v1, when several client libraries make the matrix too big for a script.
-- **Durable consumers.** With acks, duplicates become legal, but only when they're marked as
-  redeliveries. That's a different contract, so it probably needs a separate checker mode.
-  *Comes up:* in v2, with redelivery semantics.
+- **Batch deliveries (decided 2026-10-13).** One `deliver` line per message, with a `poll`
+  number, and Kafka positions in new `partition` and `offset` fields. See v1 design.
+- **Orchestration (decided 2026-10-06, revised 2026-10-13).** A shell script, `scripts/matrix.sh`,
+  runs the v0 matrix. Weekend 3 didn't need more: each driver injects its own faults and records
+  them in its history, so a run stayed "run the driver, then judge the history". v1 starts the
+  same way, with one client library in two versions, so a Go `driftlab run` command now comes
+  with v3, when fault schedules have to be generated, re-run and shrunk.
+- **Durable consumers.** With acks, receiving a message twice becomes legal, but only as a
+  redelivery. NATS marks its redeliveries; Kafka doesn't, so the checker will have to work them
+  out from a group's assignments and committed offsets. That's a different contract, so it
+  probably needs a separate checker mode. *Comes up:* in v1, earlier than planned, because a
+  Kafka consumer group redelivers after a rebalance (see v1 design).
