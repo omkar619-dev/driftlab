@@ -20,16 +20,19 @@ const (
 )
 
 // Kind names an anomaly. Where Jepsen's Kafka workload has a name for one,
-// we use it.
+// we use it, with Jepsen's meaning; the rest are driftlab's own. Jepsen
+// counts a repeated delivery as a nonmonotonic poll, but receiving a
+// message twice and receiving one out of order are different failures,
+// so DuplicateDelivery reports the first on its own.
 type Kind string
 
 const (
-	PollSkip         Kind = "poll-skip"
-	NonmonotonicPoll Kind = "nonmonotonic-poll"
-	Duplicate        Kind = "duplicate"
-	Stall            Kind = "stall"
-	LostWrite        Kind = "lost-write"
-	Phantom          Kind = "phantom"
+	PollSkip          Kind = "poll-skip"
+	NonmonotonicPoll  Kind = "nonmonotonic-poll"
+	DuplicateDelivery Kind = "duplicate-delivery"
+	Stall             Kind = "stall"
+	LostWrite         Kind = "lost-write"
+	Phantom           Kind = "phantom"
 )
 
 // Anomaly is one broken promise, with the history indexes that prove it.
@@ -227,7 +230,7 @@ func checkOrdered(ops []history.Op) []Anomaly {
 		s := op.StreamSeq
 		if first, ok := c.seen[s]; ok {
 			out = append(out, Anomaly{
-				Kind:    Duplicate,
+				Kind:    DuplicateDelivery,
 				Process: op.Process,
 				Ops:     []int{first, op.Index},
 				Msg:     fmt.Sprintf("stream_seq %d delivered again", s),

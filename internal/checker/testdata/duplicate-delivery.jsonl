@@ -1,4 +1,4 @@
-{"type":"meta","driver":"fixture","client":"hand-written","scenario":"duplicate"}
+{"type":"meta","driver":"fixture","client":"hand-written","scenario":"duplicate-delivery"}
 {"index":0,"process":"producer","type":"invoke","f":"publish","value":1}
 {"index":1,"process":"producer","type":"ok","f":"publish","value":1,"stream_seq":1}
 {"index":2,"process":"producer","type":"invoke","f":"publish","value":2}

@@ -26,9 +26,9 @@ func TestCheckFixtures(t *testing.T) {
 			"poll-skip consumer ops=[8 9]: expected stream_seq 2, got 3: 1 skipped, 1 delivered late, 0 never delivered",
 			"nonmonotonic-poll consumer ops=[9 10]: stream_seq 2 delivered after 3",
 		}},
-		{"duplicate.jsonl", []string{
+		{"duplicate-delivery.jsonl", []string{
 			"verdict failed, 0 of 4 publishes unknown",
-			"duplicate consumer ops=[9 10]: stream_seq 2 delivered again",
+			"duplicate-delivery consumer ops=[9 10]: stream_seq 2 delivered again",
 		}},
 		{"first-skip.jsonl", []string{
 			"verdict failed, 0 of 3 publishes unknown",

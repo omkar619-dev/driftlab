@@ -24,9 +24,10 @@ driftlab's lane is **the client library you actually import**. It runs the same 
 different client APIs and versions, and one checker judges all of them.
 
 What is *not* new, stated up front: the anomaly vocabulary (lost-write, poll-skip,
-nonmonotonic-poll, duplicate) comes from Jepsen's Kafka workload
-(https://jepsen-io.github.io/jepsen/jepsen.tests.kafka.html). We reuse those names on purpose, so
-anyone who knows Jepsen can read driftlab output without a glossary.
+nonmonotonic-poll) comes from Jepsen's Kafka workload
+(https://jepsen-io.github.io/jepsen/jepsen.tests.kafka.html). We reuse those names with Jepsen's
+meanings on purpose, so anyone who knows Jepsen can read driftlab output without a glossary. The
+other names (stall, phantom, duplicate-delivery) are driftlab's own.
 
 ## First principles
 
@@ -278,8 +279,8 @@ while nothing uses transactions, whose markers take up offsets (principle 5). Th
 | `inconsistent-offsets` | two observations disagree about which value sits at a position: an ack and a read, or two reads | client or server |
 
 v0 used `duplicate` for a consumer receiving the same stream sequence twice, which Jepsen counts
-as a `nonmonotonic-poll`. This document promises Jepsen's meanings, so v0's anomaly is being
-renamed `duplicate-delivery`. Old histories keep their verdicts; only the label changes.
+as a `nonmonotonic-poll`. This document promises Jepsen's meanings, so v0's anomaly is now
+`duplicate-delivery`. Old histories keep their verdicts; only the label changed.
 
 **Calibration.** In https://github.com/twmb/franz-go/issues/1217, an idempotent produce timed out
 and the client treated it as never written, letting the caller cancel it, although the broker had
@@ -359,7 +360,7 @@ Even liveness is judged by position in the history (principle 4).
 | `lost-write` | an `ok` publish whose value is missing from the final read | server (durability) |
 | `poll-skip` | the consumer jumps from stream_seq a to some b > a+1; the skipped range is then classified as *delivered late* or *never delivered* | client |
 | `nonmonotonic-poll` | the consumer delivers b after a, with b < a | client |
-| `duplicate` | one consumer receives the same stream_seq twice | client |
+| `duplicate-delivery` | one consumer receives the same stream_seq twice | client |
 | `stall` | when the final read begins, the consumer hasn't yet received the stream's last sequence. Consumers are known from their deliveries and their `subscribe` operations, so one that received nothing is still judged | client (liveness) |
 | `phantom` | a value seen by the consumer or the final read that no producer ever invoked, or whose publish was recorded as `fail` | client or server |
 
