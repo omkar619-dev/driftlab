@@ -1,8 +1,8 @@
 # driftlab: design (v0)
 
-> Status: last updated 2026-10-06. v0 = the checker + one system (NATS JetStream, Go client).
-> Weekends 1 and 2 are done, and the calibration matrix reproduces. Weekend 3 (network and server
-> faults) is next.
+> Status: last updated 2026-10-13. v0 is done: the checker, and one system (NATS JetStream, Go
+> client) under stall, network and server faults. The calibration matrix reproduces, and weekend 3
+> produced two upstream reports (see Weekend 3 results). Next is v1, the Go Kafka clients.
 
 ## What driftlab is
 
@@ -81,8 +81,9 @@ reporter used, at its latest patch.
 - `v1.53.1` is the last release that has the 2107 bug.
 - `v1.54.0` contains the fix, https://github.com/nats-io/nats.go/pull/2137 (merged 2026-09-18).
 
-**Faults in v0 are client-side only.** The consumer's callback stalls while a low pending limit is
-set, which is exactly the 2107 trigger. Network and server faults come in weekend 3.
+**Faults.** The calibration fault is client-side: the consumer's callback stalls while a low pending
+limit is set, which is exactly the 2107 trigger. Weekend 3 added network faults, through toxiproxy,
+and server faults, through docker.
 
 **Non-goals for v0:** multi-node clusters, Kafka/Redpanda/Redis, exactly-once, durable acked
 consumers and redelivery, and a second machine.
@@ -180,13 +181,53 @@ at commit `f1a2136`, with each consumer's recovery time after the stall ended:
 - The `jetstream` API is clean even on v1.53.1. It pulls only what fits in its tray, so it never
   drops a message, and 2107 needs a dropped message to happen.
 
-`scripts/matrix.sh` reproduces the table, and also runs `proxy-control`, which should be clean
-everywhere. Run it on the machine that hosts nats-server and toxiproxy: it builds the checker and
-both driver versions from the current commit, runs every combination, and marks any verdict the
-table doesn't predict. It passes `-grace 60s` instead of the default 10 seconds. The fixed legacy
-consumer's recovery varies from run to run (between 10 and 18 seconds so far, with identical
-settings), so under the default window its clean verdict came down to luck. A consumer that
-catches up early ends the wait early, so only a stuck one waits out the full window.
+`scripts/matrix.sh` reproduces the table, and also runs `proxy-control` and the four network and
+server scenarios, which should be clean everywhere, so a full run is 32 runs. Run it on the machine
+that hosts nats-server and toxiproxy: it builds the checker and both driver versions from the
+current commit, runs every combination, prints each run's verdict, recovery and lag, and marks any
+verdict the table doesn't predict. It passes `-grace 60s` instead of the default 10 seconds. The
+fixed legacy consumer's recovery varies from run to run (between 8 and 18 seconds so far, with
+identical settings), so under the default window its clean verdict came down to luck. A consumer
+that catches up early ends the wait early, so only a stuck one waits out the full window.
+
+## Weekend 3 results (network and server faults)
+
+The full matrix ran on 2026-10-13 at commit `35fd84e`, and all 32 verdicts came out as the table
+above predicts: only the two stalled runs of the legacy API on v1.53.1 failed. Every network and
+server run was clean, so nothing was lost, duplicated or reordered, and race-detector builds of the
+driver stayed silent through the same faults. What the faults exposed is liveness: how long a
+consumer that loses nothing can stay silent. The lag of each fault scenario, with the two nats.go
+versions within a few hundred milliseconds of each other:
+
+| Scenario | legacy | jetstream |
+|---|---|---|
+| `net-slow` | 30.0 s | 25.0 s |
+| `net-cut` | 20.0 s | 8.2–8.4 s |
+| `server-pause` | 1 ms | 1 ms |
+| `server-kill` | 13.8 s | 1–3 ms |
+
+- **After a disconnect longer than about 5 seconds, the legacy consumer goes silent.** The server
+  deletes its ephemeral consumer after the default 5-second inactive threshold (the stream's
+  consumer count drops from 1 to 0), the client doesn't rebuild it when it reconnects, and it only
+  notices at its next 10-second activity check. With the line cut right after subscribing,
+  delivery came back 1.1 s after a 3 s cut, 0.03 s after 4 s, 14.0 s after 6 s and 12.0 s after
+  8 s. A server restart causes the same silence however short it is, because the consumer lives in
+  memory only (`server-kill`). KV watchers in both APIs are built on this consumer:
+  `drivers/natsgo/repro2180`, a standalone reproducer that needs only nats-server, measured 10.00 s
+  of silence after an 8 s cut for the push ordered consumer and for both KV watchers, against
+  0.17 s for the `jetstream` ordered consumer. Reported as
+  https://github.com/nats-io/nats.go/issues/2180.
+- **The `jetstream` consumer's silence alarm takes 30 seconds, not 10.** The package works out a
+  5-second heartbeat for ordered consumers but never passes it on (see the network paragraph
+  above). So `net-slow`'s 25 seconds of silence never raised `ErrNoHeartbeat`, and
+  `server-pause`'s 35 seconds raised it at 30.04 s. Reported as
+  https://github.com/nats-io/nats.go/issues/2181.
+- **`info` really does mean unknown.** All seven publishes that timed out during `server-pause`,
+  and the one during `server-kill`, still landed in the stream once the server was back. Recording
+  them as `fail` would have turned each one into a phantom (principle 3).
+- **One stream create failed, once,** with `could not create storage directory` (`mkdir
+  /data/jetstream/$G/streams: no such file or directory`), right after the previous run had
+  deleted the stream. It didn't come back in 300 publish-only runs, so it is parked as seen once.
 
 ## History format (the wire contract)
 
@@ -226,8 +267,8 @@ Field rules:
 - A consumer records `subscribe` (an `invoke`, then an `ok`) when it starts. Without it, a consumer
   that received nothing would leave no trace at all, and the checker would judge it clean.
 - The consumer also records `disconnect` (an `info`, with the error) when its connection drops,
-  and `reconnect` when it comes back. They show when the client noticed a network fault; the
-  checker ignores them.
+  and `reconnect` when it comes back. They show when the client noticed a network or server
+  fault; the checker ignores them.
 - `time_ns` is monotonic time since the driver started, not wall-clock time. That follows from
   principle 4. Once one run has several processes, the harness will stamp receive times instead.
 - Unknown fields are ignored, so the format can grow.
@@ -288,9 +329,9 @@ poll-skip anomalies already cover. Like recovery, lag never affects the verdict.
 `deaf-after-fault` fixture shows why it exists: in the same history recovery reads 0s and lag reads
 13.801s, because the only message acked before the fault ended had already arrived.
 
-Each anomaly carries the history indexes of the ops involved. It also carries any `client-error`
-and nemesis events that fall inside the window, so the output points at evidence instead of just
-summarising it.
+Each anomaly carries the history indexes of the ops involved, so the output points at evidence
+instead of just summarising it. Attaching the `client-error` and nemesis events that fall inside an
+anomaly's window is planned, not built.
 
 ## Architecture
 
@@ -333,10 +374,11 @@ nats.go v1.53.1 and v1.54.0 together. That one rule decides the layout.
 
 ## Command line
 
-`driftlab check <history.jsonl>` prints the verdict, the invalid reasons and the anomalies, one per
-line. The exit code is the verdict for scripts: 0 clean, 1 failed, 2 invalid, and 3 when the
-command couldn't run (bad usage, or a file it can't open or parse). An invalid run exits non-zero
-on purpose, so a script can never mistake a broken experiment for a pass.
+`driftlab check <history.jsonl>` prints the verdict, the invalid reasons, the anomalies and, in a
+run with faults, each consumer's recovery and lag, one per line. The exit code is the verdict for
+scripts: 0 clean, 1 failed, 2 invalid, and 3 when the command couldn't run (bad usage, or a file it
+can't open or parse). An invalid run exits non-zero on purpose, so a script can never mistake a
+broken experiment for a pass.
 
 ## Repo layout (v0)
 
@@ -352,7 +394,8 @@ driftlab/
 ├── drivers/
 │   └── natsgo/
 │       ├── go.mod
-│       └── v1.53.1.mod
+│       ├── v1.53.1.mod
+│       └── repro2180/
 ├── deploy/
 │   └── compose.yaml
 └── scripts/
@@ -365,12 +408,13 @@ driftlab/
 | `cmd/driftlab/` | the CLI: `driftlab check <history.jsonl>` |
 | `internal/history/` | the Op type and the JSONL reader |
 | `internal/checker/` | `Check()` and its anomaly kinds |
-| `internal/checker/testdata/` | hand-written histories: one clean, one per anomaly kind |
+| `internal/checker/testdata/` | hand-written histories: one clean, one per anomaly kind, and more for the verdict rules and the measurements |
 | `drivers/natsgo/` | a separate module that talks to NATS and writes a history to stdout |
 | `drivers/natsgo/go.mod` | pins nats.go v1.54.0 (the fixed release) |
 | `drivers/natsgo/v1.53.1.mod` | pins nats.go v1.53.1 (the last buggy release), used via `-modfile` |
+| `drivers/natsgo/repro2180/` | a standalone reproducer for nats.go issue 2180, which needs only nats-server |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
-| `scripts/matrix.sh` | runs the 12-run calibration matrix and checks every verdict against the table |
+| `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 
 ## Milestones
 
@@ -382,10 +426,10 @@ driftlab/
 - **Weekend 2 (done 2026-10-06; the driver and calibration):** the natsgo driver (both APIs, both
   versions), the compose file and the matrix above. Exit: the matrix reproduces, which it did on
   the first full run of `scripts/matrix.sh`. That is calibration steps (b) and (c).
-- **Weekend 3 (network and server faults):** toxiproxy between the driver and nats-server, for
-  connection cuts and latency above the heartbeat interval. Docker pause, kill and restart of
-  nats-server. Run the same matrix again. This is the first point where driftlab can find
-  something nobody has reported yet.
+- **Weekend 3 (done 2026-10-13; network and server faults):** toxiproxy on the consumer's line for
+  a slow line and a cut line, docker pause and kill for the server, the lag measurement, and the
+  32-run matrix. It found the first things nobody had reported: nats.go issues 2180 and 2181 (see
+  Weekend 3 results).
 
 ## Beyond v0 (one line each, so v0 stays small)
 
@@ -407,10 +451,9 @@ one starts.
   also start at 0, which breaks the history package's convention that 0 means "absent".
   *Comes up:* in v1, when the first Kafka driver is written.
 - **Orchestration (decided 2026-10-06).** A shell script, `scripts/matrix.sh`, runs the v0
-  matrix. Weekend 3 shouldn't need more either: the plan is for each driver to inject its own
-  faults and record them in its history, so a run stays "run the driver, then judge the history".
-  A Go `driftlab run` command comes at the start of v1, when several client libraries make the
-  matrix too big for a script.
+  matrix. Weekend 3 didn't need more: each driver injects its own faults and records them in its
+  history, so a run stayed "run the driver, then judge the history". A Go `driftlab run` command
+  comes at the start of v1, when several client libraries make the matrix too big for a script.
 - **Durable consumers.** With acks, duplicates become legal, but only when they're marked as
   redeliveries. That's a different contract, so it probably needs a separate checker mode.
   *Comes up:* in v2, with redelivery semantics.
