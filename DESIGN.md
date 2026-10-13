@@ -329,6 +329,10 @@ Field rules:
   makes every message identifiable end to end, independently of the server.
 - `stream_seq` is the server's sequence. It appears on `ok` publishes (taken from the PubAck), on
   every delivery (taken from the message metadata) and on final-read records.
+  - `partition` and `offset` take the place of `stream_seq` in a Kafka history, and always come as a
+  pair. Both count from 0, so 0 is a real position here, unlike in `value` and `stream_seq`, and
+  an `ok` publish, delivery or final-read record that has neither a pair nor a `stream_seq` is
+  rejected rather than read as 0. A history uses one numbering or the other, never both.
 - `process` is one of `producer`, `consumer`, `nemesis` or `final-read`. Fault events live in the
   same history as everything else, so each anomaly can be lined up against the fault that caused
   it.
