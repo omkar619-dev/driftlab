@@ -278,6 +278,16 @@ run took 15 seconds, and its clean verdict cleared the grace window by milliseco
 1,000 messages and a 20-message tray, the legacy consumer took 23.061 seconds to catch up, and
 `jetstream` took 34 milliseconds.
 
+**Lag.** Recovery only counts messages acked before the last fault ended, so it can't see a
+consumer that is slow with messages acked after that. The checker therefore also reports, for each
+consumer in a run with faults, the longest any acked message waited between its ack and the
+consumer's first delivery of it. That is what a user of the consumer feels, how stale its view of
+the stream got, wherever the faults fell. A publish that ended as `info` has no ack time, so it
+doesn't count, and neither does a message the consumer never received, which the stall and
+poll-skip anomalies already cover. Like recovery, lag never affects the verdict. The
+`deaf-after-fault` fixture shows why it exists: in the same history recovery reads 0s and lag reads
+13.801s, because the only message acked before the fault ended had already arrived.
+
 Each anomaly carries the history indexes of the ops involved. It also carries any `client-error`
 and nemesis events that fall inside the window, so the output points at evidence instead of just
 summarising it.

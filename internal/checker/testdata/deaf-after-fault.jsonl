@@ -1,0 +1,19 @@
+{"type":"meta","driver":"fixture","client":"hand-written","scenario":"deaf-after-fault","faults":["kill"]}
+{"index":0,"time_ns":0,"process":"producer","type":"invoke","f":"publish","value":1}
+{"index":1,"time_ns":1000000,"process":"producer","type":"ok","f":"publish","value":1,"stream_seq":1}
+{"index":2,"time_ns":2000000,"process":"consumer","type":"ok","f":"deliver","value":1,"stream_seq":1}
+{"index":3,"time_ns":3000000,"process":"nemesis","type":"invoke","f":"kill"}
+{"index":4,"time_ns":4000000,"process":"producer","type":"invoke","f":"publish","value":2}
+{"index":5,"time_ns":5004000000,"process":"producer","type":"info","f":"publish","value":2,"error":"nats: timeout"}
+{"index":6,"time_ns":5005000000,"process":"producer","type":"invoke","f":"publish","value":3}
+{"index":7,"time_ns":6100000000,"process":"nemesis","type":"ok","f":"kill"}
+{"index":8,"time_ns":6200000000,"process":"producer","type":"ok","f":"publish","value":3,"stream_seq":3}
+{"index":9,"time_ns":20000000000,"process":"consumer","type":"ok","f":"deliver","value":2,"stream_seq":2}
+{"index":10,"time_ns":20001000000,"process":"consumer","type":"ok","f":"deliver","value":3,"stream_seq":3}
+{"index":11,"time_ns":20002000000,"process":"producer","type":"invoke","f":"publish","value":4}
+{"index":12,"time_ns":20003000000,"process":"consumer","type":"ok","f":"deliver","value":4,"stream_seq":4}
+{"index":13,"time_ns":20004000000,"process":"producer","type":"ok","f":"publish","value":4,"stream_seq":4}
+{"index":14,"time_ns":20100000000,"process":"final-read","type":"ok","f":"read","value":1,"stream_seq":1}
+{"index":15,"time_ns":20101000000,"process":"final-read","type":"ok","f":"read","value":2,"stream_seq":2}
+{"index":16,"time_ns":20102000000,"process":"final-read","type":"ok","f":"read","value":3,"stream_seq":3}
+{"index":17,"time_ns":20103000000,"process":"final-read","type":"ok","f":"read","value":4,"stream_seq":4}

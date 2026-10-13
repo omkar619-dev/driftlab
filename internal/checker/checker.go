@@ -49,6 +49,19 @@ type Recovery struct {
 	After   time.Duration
 }
 
+// Lag is the longest one consumer made an acked message wait: the time from
+// the publish's ack to the consumer's first delivery of that message. It
+// measures what a user of the consumer feels, how stale its view of the
+// stream got, wherever the faults fell. A publish that ended as info has no
+// ack time, so it doesn't count, and neither does a message the consumer
+// never received: the stall and poll-skip anomalies cover those. Like
+// Recovery, it is a measurement and never affects the verdict.
+type Lag struct {
+	Process string
+	Value   uint64
+	Wait    time.Duration
+}
+
 // Result is everything the checker concluded about one history. Reasons
 // says why a run is invalid; Unknown counts publishes that ended as info.
 type Result struct {
@@ -58,10 +71,11 @@ type Result struct {
 	Publishes  int
 	Unknown    int
 	Recoveries []Recovery
+	Lags       []Lag
 }
 
 // Lines renders r the way the command line prints it: the verdict, then
-// why the run is invalid, then each anomaly, then each recovery.
+// why the run is invalid, then each anomaly, then each recovery and lag.
 func (r Result) Lines() []string {
 	out := []string{fmt.Sprintf("verdict %s, %d of %d publishes unknown", r.Verdict, r.Unknown, r.Publishes)}
 	for _, reason := range r.Reasons {
@@ -76,6 +90,9 @@ func (r Result) Lines() []string {
 		} else {
 			out = append(out, fmt.Sprintf("recovery %s: never caught up after the faults ended", rc.Process))
 		}
+	}
+	for _, l := range r.Lags {
+		out = append(out, fmt.Sprintf("lag %s: the longest wait from an ack to its delivery was %s (value %d)", l.Process, l.Wait.Round(time.Millisecond), l.Value))
 	}
 	return out
 }
@@ -94,6 +111,7 @@ func Check(h *history.History) Result {
 	r.Anomalies = append(r.Anomalies, checkPhantoms(h.Ops)...)
 	r.Reasons = append(checkFinalRead(h.Ops, final), checkFaults(h)...)
 	r.Recoveries = measureRecovery(h.Ops)
+	r.Lags = measureLag(h.Ops)
 	for _, op := range h.Ops {
 		if op.F != history.Publish {
 			continue
@@ -387,6 +405,51 @@ func measureRecovery(ops []history.Op) []Recovery {
 			out[i].Caught = true
 			out[i].After = max(0, op.Time-ops[end].Time)
 		}
+	}
+	return out
+}
+
+// measureLag finds, for each consumer, the acked message that waited longest
+// between its ack and the consumer's first delivery of it. Like
+// measureRecovery, it only reports on runs where a fault happened.
+func measureLag(ops []history.Op) []Lag {
+	faulted := slices.ContainsFunc(ops, func(op history.Op) bool {
+		return op.Process == history.Nemesis && op.Type == history.OK
+	})
+	if !faulted {
+		return nil
+	}
+	acked := map[uint64]time.Duration{} // stream_seq -> when its ack arrived
+	for _, op := range ops {
+		if op.F == history.Publish && op.Type == history.OK {
+			acked[op.StreamSeq] = op.Time
+		}
+	}
+
+	var out []Lag
+	pos := map[string]int{}
+	seen := map[string]map[uint64]bool{}
+	for _, op := range ops {
+		if op.F != history.Deliver {
+			continue
+		}
+		at, ok := acked[op.StreamSeq]
+		if !ok || seen[op.Process][op.StreamSeq] {
+			continue
+		}
+		// A consumer can receive a message just before its ack gets back to
+		// the producer, so a negative wait counts as none.
+		wait := max(0, op.Time-at)
+		i, known := pos[op.Process]
+		if !known {
+			i = len(out)
+			pos[op.Process] = i
+			seen[op.Process] = map[uint64]bool{}
+			out = append(out, Lag{Process: op.Process, Value: op.Value, Wait: wait})
+		} else if wait > out[i].Wait {
+			out[i].Value, out[i].Wait = op.Value, wait
+		}
+		seen[op.Process][op.StreamSeq] = true
 	}
 	return out
 }

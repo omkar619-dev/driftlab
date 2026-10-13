@@ -51,7 +51,7 @@ verdicts=(clean failed invalid "couldn't run")
 
 runs=0
 misses=0
-printf '%-8s %-9s %-13s %-8s %-12s %s\n' version api scenario expected got recovery
+printf '%-8s %-9s %-13s %-8s %-12s %-18s %s\n' version api scenario expected got recovery lag
 for version in "${versions[@]}"; do
 	for api in "${apis[@]}"; do
 		for scenario in "${scenarios[@]}"; do
@@ -71,13 +71,20 @@ for version in "${versions[@]}"; do
 			recovery=${line#*: }
 			recovery=${recovery% after the faults ended}
 
+			# Keep the duration from "lag consumer: the longest wait from an ack
+			# to its delivery was 13.801s (value 3)". Like recovery, lag is only
+			# measured in runs with faults.
+			line=$(grep '^lag' "$out/$name.txt" 2>/dev/null)
+			lag=${line#*was }
+			lag=${lag%% *}
+
 			want=$(expected "$version" "$api" "$scenario")
 			note=""
 			if [ "$got" != "$want" ]; then
 				note="  <- not as expected"
 				misses=$((misses + 1))
 			fi
-			printf '%-8s %-9s %-13s %-8s %-12s %s%s\n' "$version" "$api" "$scenario" "$want" "$got" "${recovery:--}" "$note"
+			printf '%-8s %-9s %-13s %-8s %-12s %-18s %s%s\n' "$version" "$api" "$scenario" "$want" "$got" "${recovery:--}" "${lag:--}" "$note"
 		done
 	done
 done
