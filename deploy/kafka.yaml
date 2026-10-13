@@ -1,0 +1,80 @@
+# Three Kafka brokers for driftlab v1, the Go Kafka clients, on newpc. They
+# live in their own file and project, so the NATS runs never share the
+# machine with three JVMs, and the Kafka runs never share it with NATS
+# (DESIGN.md principle 8). The image is pinned to the newest stable release,
+# because every history records which broker produced it.
+#
+# Each container is both a broker and a KRaft controller ("combined" mode,
+# as in Kafka's own example docker/examples/docker-compose-files/cluster/
+# combined/plaintext). The three of them elect a controller among
+# themselves, so there is no ZooKeeper. A broker's data lives inside its
+# container: it survives docker kill and docker start, and `docker compose
+# down` throws it away, which gives a fresh cluster.
+name: driftlab-kafka
+
+# Settings every broker shares. Each service below merges them in with
+# `<<: *kafka-env` and adds its own id and addresses.
+x-kafka-env: &kafka-env
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  # INTERNAL is how the brokers talk to each other inside Docker's network,
+  # and EXTERNAL is how a driver on this machine reaches them.
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+  CLUSTER_ID: 2pXb5ODVSEePErfxFFc6hg
+  # Durable by default: every partition has a copy on all three brokers, and
+  # an acks=all write needs two of them before it counts.
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 2
+  # Runs create their topics explicitly, so a typo can't quietly make a new one.
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  # A new consumer group starts its first rebalance at once instead of after 3s.
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+  # About 2 GB for all three, so they fit next to everything else on newpc.
+  KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+
+services:
+  kafka-1:
+    image: apache/kafka:4.3.1
+    hostname: kafka-1
+    container_name: kafka-1
+    # Localhost only: the driver runs on this machine, and Docker-published
+    # ports bypass ufw.
+    ports:
+      - "127.0.0.1:29092:29092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: INTERNAL://:19092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:19092,EXTERNAL://127.0.0.1:29092
+
+  kafka-2:
+    image: apache/kafka:4.3.1
+    hostname: kafka-2
+    container_name: kafka-2
+    ports:
+      - "127.0.0.1:39092:39092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: INTERNAL://:19092,CONTROLLER://:9093,EXTERNAL://:39092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:19092,EXTERNAL://127.0.0.1:39092
+
+  kafka-3:
+    image: apache/kafka:4.3.1
+    hostname: kafka-3
+    container_name: kafka-3
+    ports:
+      - "127.0.0.1:49092:49092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: INTERNAL://:19092,CONTROLLER://:9093,EXTERNAL://:49092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:19092,EXTERNAL://127.0.0.1:49092
