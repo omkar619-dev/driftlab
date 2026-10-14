@@ -24,10 +24,15 @@ driftlab's lane is **the client library you actually import**. It runs the same 
 different client APIs and versions, and one checker judges all of them.
 
 What is *not* new, stated up front: the anomaly vocabulary (lost-write, poll-skip,
-nonmonotonic-poll) comes from Jepsen's Kafka workload
-(https://jepsen-io.github.io/jepsen/jepsen.tests.kafka.html). We reuse those names with Jepsen's
-meanings on purpose, so anyone who knows Jepsen can read driftlab output without a glossary. The
-other names (stall, phantom, duplicate-delivery) are driftlab's own.
+nonmonotonic-poll, duplicate, inconsistent-offsets) comes from Jepsen's Kafka workload
+(https://jepsen-io.github.io/jepsen/jepsen.tests.kafka.html). We reuse those names for the same
+failures on purpose, so anyone who knows Jepsen can read driftlab output without a glossary. The
+other names (stall, phantom, duplicate-delivery) are driftlab's own. `lost-write` is judged
+differently. Jepsen infers it from reads: an acked message that nobody read, although someone
+read a later offset; an acked message nobody read at all is `unseen`. driftlab checks each acked
+message against a final read of the whole log instead, so it can tell a message the log lost
+(a lost write) from one the log kept but a consumer never got (a stall or a poll-skip), and it
+also catches a message that a consumer received before the log lost it.
 
 ## First principles
 
@@ -354,7 +359,7 @@ Field rules:
 without a consumer, so the ground truth doesn't depend on the machinery under test. That read is
 the ground truth for what the stream contains.
 
-## Checker (v0)
+## Checker
 
 The checker is a pure function, `Check(history) -> Result`, with no network access and no clocks.
 Even liveness is judged by position in the history (principle 4).
@@ -367,6 +372,8 @@ Even liveness is judged by position in the history (principle 4).
 | `duplicate-delivery` | one consumer receives the same stream_seq twice | client |
 | `stall` | when the final read begins, the consumer hasn't yet received the stream's last sequence. Consumers are known from their deliveries and their `subscribe` operations, so one that received nothing is still judged | client (liveness) |
 | `phantom` | a value seen by the consumer or the final read that no producer ever invoked, or whose publish was recorded as `fail` | client or server |
+| `duplicate` | one value at more than one position in the final read: one write stored twice | client (producer) or server |
+| `inconsistent-offsets` | an ack or a delivery places a value at a position where the final read found a different one | client or server |
 
 In a Kafka history every rule applies within each partition, with offsets, which count from 0, in
 place of stream sequences. A consumer has to reach the end of every partition the final read

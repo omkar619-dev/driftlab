@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/omkar619-dev/driftlab/internal/history"
@@ -20,20 +21,22 @@ const (
 	Invalid Verdict = "invalid"
 )
 
-// Kind names an anomaly. Where Jepsen's Kafka workload has a name for one,
-// we use it, with Jepsen's meaning; the rest are driftlab's own. Jepsen
-// counts a repeated delivery as a nonmonotonic poll, but receiving a
-// message twice and receiving one out of order are different failures,
-// so DuplicateDelivery reports the first on its own.
+// Kind names an anomaly. Where Jepsen's Kafka workload has a name for a
+// failure, we use that name; the rest are driftlab's own. Jepsen counts a
+// repeated delivery as a nonmonotonic poll, but receiving a message twice
+// and receiving one out of order are different failures, so
+// DuplicateDelivery reports the first on its own.
 type Kind string
 
 const (
-	PollSkip          Kind = "poll-skip"
-	NonmonotonicPoll  Kind = "nonmonotonic-poll"
-	DuplicateDelivery Kind = "duplicate-delivery"
-	Stall             Kind = "stall"
-	LostWrite         Kind = "lost-write"
-	Phantom           Kind = "phantom"
+	PollSkip            Kind = "poll-skip"
+	NonmonotonicPoll    Kind = "nonmonotonic-poll"
+	DuplicateDelivery   Kind = "duplicate-delivery"
+	Stall               Kind = "stall"
+	LostWrite           Kind = "lost-write"
+	Phantom             Kind = "phantom"
+	Duplicate           Kind = "duplicate"
+	InconsistentOffsets Kind = "inconsistent-offsets"
 )
 
 // Anomaly is one broken promise, with the history indexes that prove it.
@@ -113,6 +116,8 @@ func Check(h *history.History) Result {
 	if final != nil {
 		r.Anomalies = append(r.Anomalies, checkStalls(h.Ops, final, n)...)
 		r.Anomalies = append(r.Anomalies, checkLostWrites(h.Ops, final, n)...)
+		r.Anomalies = append(r.Anomalies, checkInconsistentOffsets(h.Ops, final, n)...)
+		r.Anomalies = append(r.Anomalies, checkDuplicates(h.Ops, final, n)...)
 	}
 	r.Anomalies = append(r.Anomalies, checkPhantoms(h.Ops)...)
 	r.Reasons = append(checkFinalRead(h.Ops, final, n), checkFaults(h)...)
@@ -383,6 +388,10 @@ func checkStalls(ops []history.Op, final *finalRead, n numbering) []Anomaly {
 	return out
 }
 
+// checkLostWrites reports acked publishes whose values are missing from the
+// final read. Jepsen infers lost writes from what consumers read instead, so
+// it can't see a message that a consumer received before the log lost it.
+// Checking against the final read can.
 func checkLostWrites(ops []history.Op, final *finalRead, n numbering) []Anomaly {
 	var out []Anomaly
 	for _, op := range ops {
@@ -395,6 +404,79 @@ func checkLostWrites(ops []history.Op, final *finalRead, n numbering) []Anomaly 
 			Process: op.Process,
 			Ops:     []int{op.Index},
 			Msg:     fmt.Sprintf("value %d was acked at %s but is missing from the final read", op.Value, n.at(p)),
+		})
+	}
+	return out
+}
+
+// checkInconsistentOffsets reports acks and deliveries that place a value at
+// a position where the final read found a different one. The final read is
+// the ground truth, so the claim that disagrees with it is the one reported.
+func checkInconsistentOffsets(ops []history.Op, final *finalRead, n numbering) []Anomaly {
+	var out []Anomaly
+	for _, op := range ops {
+		acked := op.F == history.Publish && op.Type == history.OK
+		if !acked && op.F != history.Deliver {
+			continue
+		}
+		p, _ := op.Pos()
+		i, ok := final.at[p]
+		if !ok || ops[i].Value == op.Value {
+			continue
+		}
+		verb := "acked at"
+		if !acked {
+			verb = "delivered from"
+		}
+		out = append(out, Anomaly{
+			Kind:    InconsistentOffsets,
+			Process: op.Process,
+			Ops:     []int{op.Index, i},
+			Msg:     fmt.Sprintf("value %d was %s %s, but the final read has value %d there", op.Value, verb, n.at(p), ops[i].Value),
+		})
+	}
+	return out
+}
+
+// checkDuplicates reports values that the final read found at more than one
+// position. Every value is published once, so a second copy means one write
+// was stored twice, which is what an idempotent producer exists to prevent.
+// It walks the shelves in order, partition by partition, so each position
+// counts once and the report comes out the same every run.
+func checkDuplicates(ops []history.Op, final *finalRead, n numbering) []Anomaly {
+	where := map[uint64][]history.Pos{} // value -> every position it was found at
+	var order []uint64                  // values in the order they were first found
+	for _, part := range final.partitions() {
+		for q := n.first(); q <= final.tails[part].offset; q++ {
+			p := history.Pos{Partition: part, Offset: q}
+			i, ok := final.at[p]
+			if !ok {
+				continue
+			}
+			v := ops[i].Value
+			if len(where[v]) == 0 {
+				order = append(order, v)
+			}
+			where[v] = append(where[v], p)
+		}
+	}
+	var out []Anomaly
+	for _, v := range order {
+		ps := where[v]
+		if len(ps) < 2 {
+			continue
+		}
+		var idxs []int
+		var names []string
+		for _, p := range ps {
+			idxs = append(idxs, final.at[p])
+			names = append(names, n.at(p))
+		}
+		out = append(out, Anomaly{
+			Kind:    Duplicate,
+			Process: ops[idxs[0]].Process,
+			Ops:     idxs,
+			Msg:     fmt.Sprintf("value %d is stored at %d positions: %s", v, len(ps), strings.Join(names, ", ")),
 		})
 	}
 	return out

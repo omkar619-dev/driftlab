@@ -104,6 +104,19 @@ func TestCheckFixtures(t *testing.T) {
 			"recovery consumer: caught up 2.5s after the faults ended",
 			"lag consumer: the longest wait from an ack to its delivery was 11.497s (value 2)",
 		}},
+		{"kafka-1217.jsonl", []string{
+			"verdict failed, 1 of 3 publishes unknown",
+			"lost-write producer ops=[5]: value 3 was acked at partition 0 offset 1 but is missing from the final read",
+			"inconsistent-offsets producer ops=[5 7]: value 3 was acked at partition 0 offset 1, but the final read has value 2 there",
+		}},
+		{"kafka-mislabeled.jsonl", []string{
+			"verdict failed, 0 of 3 publishes unknown",
+			"inconsistent-offsets consumer ops=[7 10]: value 3 was delivered from partition 0 offset 1, but the final read has value 2 there",
+		}},
+		{"kafka-duplicate.jsonl", []string{
+			"verdict failed, 0 of 3 publishes unknown",
+			"duplicate final-read ops=[7 8]: value 2 is stored at 2 positions: partition 0 offset 1, partition 0 offset 2",
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.file, func(t *testing.T) {
