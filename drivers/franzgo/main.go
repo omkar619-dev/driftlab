@@ -33,21 +33,34 @@ import (
 // each of the three brokers in deploy/kafka.yaml.
 const replicas = 3
 
+// scenario describes one experiment. With consumer set, a solo helper reads
+// the topic while it is being written.
+type scenario struct {
+	consumer bool
+}
+
+var scenarios = map[string]scenario{
+	"publish-only": {},
+	"control":      {consumer: true},
+}
+
 type config struct {
 	brokers    string
 	server     string
 	scenario   string
 	n          uint64
 	partitions int
+	grace      time.Duration
 }
 
 func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "publish-only", "publish-only")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only or control")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish")
 	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic")
+	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the helper gets to catch up before the final read")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "franzdriver:", err)
@@ -56,7 +69,8 @@ func main() {
 }
 
 func run(c config, out io.Writer) error {
-	if c.scenario != "publish-only" {
+	sc, ok := scenarios[c.scenario]
+	if !ok {
 		return fmt.Errorf("unknown scenario %q", c.scenario)
 	}
 	if c.n < 1 {
@@ -90,9 +104,22 @@ func run(c config, out io.Writer) error {
 		return err
 	}
 
-	rec.writeMeta(newMeta(c, topic))
+	rec.writeMeta(newMeta(c, sc, topic))
+	var h *helper
+	if sc.consumer {
+		if h, err = startHelper(seeds, rec, topic, partitions); err != nil {
+			return err
+		}
+	}
+	last := map[int32]int64{} // partition -> the highest offset acked so far
 	for v := uint64(1); v <= c.n; v++ {
-		publish(ctx, cl, rec, topic, partitions, v)
+		if p, o, ok := publish(ctx, cl, rec, topic, partitions, v); ok {
+			last[p] = max(last[p], o)
+		}
+	}
+	if h != nil {
+		h.waitFor(last, c.grace)
+		h.stop()
 	}
 	return finalRead(ctx, cl, seeds, rec, topic, partitions)
 }
@@ -156,10 +183,12 @@ func allLed(resp *kmsg.MetadataResponse, partitions int32) bool {
 	return true
 }
 
-// publish records one publish. Value v goes to partition (v-1) mod
-// partitions, so a history can be checked by hand. It waits for the ack
-// before the next one, so every produce request carries a single record.
-func publish(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, partitions int32, v uint64) {
+// publish records one publish and returns where its ack says it was
+// stored, or false when the outcome is unknown. Value v goes to partition
+// (v-1) mod partitions, so a history can be checked by hand. It waits for
+// the ack before the next one, so every produce request carries a single
+// record.
+func publish(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, partitions int32, v uint64) (int32, int64, bool) {
 	rec.op(op{Process: "producer", Type: "invoke", F: "publish", Value: v})
 	r := &kgo.Record{
 		Topic:     topic,
@@ -168,9 +197,107 @@ func publish(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, p
 	}
 	if err := cl.ProduceSync(ctx, r).FirstErr(); err != nil {
 		rec.op(op{Process: "producer", Type: "info", F: "publish", Value: v, Error: err.Error()})
-		return
+		return 0, 0, false
 	}
 	rec.op(op{Process: "producer", Type: "ok", F: "publish", Value: v, Partition: &r.Partition, Offset: &r.Offset})
+	return r.Partition, r.Offset, true
+}
+
+// helper is the solo consumer, the Kafka counterpart of the NATS ordered
+// consumer: a client of its own that reads every partition directly from
+// the start, with no group and no committed offsets.
+type helper struct {
+	cl   *kgo.Client
+	done chan struct{} // closed when the poll loop has finished
+
+	mu      sync.Mutex
+	reached map[int32]int64 // partition -> the highest offset delivered
+}
+
+// startHelper starts the helper. It records subscribe around creating the
+// client, because with its partitions given up front, franz-go starts
+// fetching as soon as the client exists.
+func startHelper(seeds []string, rec *recorder, topic string, partitions int32) (*helper, error) {
+	start := map[int32]kgo.Offset{}
+	for p := int32(0); p < partitions; p++ {
+		start[p] = kgo.NewOffset().AtStart()
+	}
+	rec.op(op{Process: "consumer", Type: "invoke", F: "subscribe"})
+	cl, err := kgo.NewClient(kgo.SeedBrokers(seeds...), kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: start}))
+	if err != nil {
+		return nil, err
+	}
+	rec.op(op{Process: "consumer", Type: "ok", F: "subscribe"})
+	h := &helper{cl: cl, done: make(chan struct{}), reached: map[int32]int64{}}
+	go h.consume(rec)
+	return h, nil
+}
+
+// consume polls until the client is closed. A poll hands over a batch, so
+// each record becomes a deliver line of its own and carries the number of
+// the poll that returned it, counted from 1 over the polls with records.
+// Errors franz-go hands back are recorded as client errors.
+func (h *helper) consume(rec *recorder) {
+	defer close(h.done)
+	var poll uint64
+	for {
+		fs := h.cl.PollFetches(context.Background())
+		if fs.IsClientClosed() {
+			return
+		}
+		for _, fe := range fs.Errors() {
+			rec.op(op{Process: "consumer", Type: "info", F: "client-error", Error: fmt.Sprintf("partition %d: %v", fe.Partition, fe.Err)})
+		}
+		if fs.NumRecords() == 0 {
+			continue
+		}
+		poll++
+		for it := fs.RecordIter(); !it.Done(); {
+			r := it.Next()
+			p, o := r.Partition, r.Offset
+			v, err := strconv.ParseUint(string(r.Value), 10, 64)
+			if err != nil {
+				rec.op(op{Process: "consumer", Type: "info", F: "client-error", Error: fmt.Sprintf("partition %d offset %d holds %q, not a driftlab value", p, o, r.Value)})
+				continue
+			}
+			rec.op(op{Process: "consumer", Type: "ok", F: "deliver", Value: v, Partition: &p, Offset: &o, Poll: poll})
+			h.mu.Lock()
+			if got, ok := h.reached[p]; !ok || o > got {
+				h.reached[p] = o
+			}
+			h.mu.Unlock()
+		}
+	}
+}
+
+// waitFor waits until the helper has delivered, in every partition, the last
+// offset the producer saw acked, or until grace runs out. Like the NATS
+// driver's grace window, it only decides when the final read starts; whether
+// the helper got there is the checker's call.
+func (h *helper) waitFor(last map[int32]int64, grace time.Duration) {
+	deadline := time.Now().Add(grace)
+	for !h.reachedAll(last) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (h *helper) reachedAll(last map[int32]int64) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for p, o := range last {
+		if got, ok := h.reached[p]; !ok || got < o {
+			return false
+		}
+	}
+	return true
+}
+
+// stop closes the helper's client, which ends its poll loop, and waits for
+// the loop to finish, so every delivery it records comes before the final
+// read.
+func (h *helper) stop() {
+	h.cl.Close()
+	<-h.done
 }
 
 // finalRead reads every partition back, from its first offset to its end.
@@ -264,7 +391,8 @@ func endOffsets(ctx context.Context, cl *kgo.Client, topic string, partitions in
 
 // op is one line of the history. Partition and Offset are pointers, so
 // omitempty leaves them out only when they are absent: partition 0 and
-// offset 0 are real positions, and they get written.
+// offset 0 are real positions, and they get written. Poll counts from 1, so
+// 0 means absent there.
 type op struct {
 	Index     int    `json:"index"`
 	TimeNS    int64  `json:"time_ns"`
@@ -274,6 +402,7 @@ type op struct {
 	Value     uint64 `json:"value,omitempty"`
 	Partition *int32 `json:"partition,omitempty"`
 	Offset    *int64 `json:"offset,omitempty"`
+	Poll      uint64 `json:"poll,omitempty"`
 	Error     string `json:"error,omitempty"`
 }
 
@@ -281,6 +410,7 @@ type metaLine struct {
 	Type     string `json:"type"`
 	Driver   string `json:"driver"`
 	Client   string `json:"client"`
+	API      string `json:"api,omitempty"`
 	Server   string `json:"server"`
 	Scenario string `json:"scenario"`
 	Params   params `json:"params"`
@@ -294,10 +424,11 @@ type params struct {
 }
 
 // newMeta describes the run, including the topic, so the evidence can be
-// found in the cluster afterwards.
-func newMeta(c config, topic string) metaLine {
+// found in the cluster afterwards. A run with a helper also says how it
+// consumes: "direct" means partitions assigned by the driver, with no group.
+func newMeta(c config, sc scenario, topic string) metaLine {
 	client, rev := provenance()
-	return metaLine{
+	m := metaLine{
 		Type:     "meta",
 		Driver:   "franzgo",
 		Client:   client,
@@ -306,6 +437,10 @@ func newMeta(c config, topic string) metaLine {
 		Params:   params{N: c.n, Partitions: c.partitions, Topic: topic},
 		Driftlab: rev,
 	}
+	if sc.consumer {
+		m.API = "direct"
+	}
+	return m
 }
 
 // recorder writes the history. Its mutex guards every other field, so a

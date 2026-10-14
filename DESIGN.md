@@ -306,7 +306,9 @@ requests, not franz-go's admin package `kadm`: `kadm` requires franz-go v1.22.1,
 would quietly upgrade the v1.20.6 build. Each run gets a fresh three-partition topic, and value v
 goes to partition (v - 1) mod 3, so a history can be checked by hand. The producer keeps
 franz-go's defaults, which are what users get: acks from every in-sync replica, and idempotent
-writes.
+writes. In `control`, a solo helper reads the topic while it is written: a client of its own that
+consumes every partition directly from the start, with no group, and the meta line says
+`"api":"direct"`.
 
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
@@ -344,10 +346,12 @@ Field rules:
   makes every message identifiable end to end, independently of the server.
 - `stream_seq` is the server's sequence. It appears on `ok` publishes (taken from the PubAck), on
   every delivery (taken from the message metadata) and on final-read records.
-  - `partition` and `offset` take the place of `stream_seq` in a Kafka history, and always come as a
+- `partition` and `offset` take the place of `stream_seq` in a Kafka history, and always come as a
   pair. Both count from 0, so 0 is a real position here, unlike in `value` and `stream_seq`, and
   an `ok` publish, delivery or final-read record that has neither a pair nor a `stream_seq` is
   rejected rather than read as 0. A history uses one numbering or the other, never both.
+- `poll` numbers a Kafka consumer's polls, from 1, on every `deliver` a poll returned, so the
+  batch boundaries survive (see v1 design). The checker ignores it for now.
 - `process` is one of `producer`, `consumer`, `nemesis` or `final-read`. Fault events live in the
   same history as everything else, so each anomaly can be lined up against the fault that caused
   it.
