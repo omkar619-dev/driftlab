@@ -1,9 +1,9 @@
 # driftlab: design
 
-> Status: last updated 2026-10-13. v0 is done: the checker, and one system (NATS JetStream, Go
+> Status: last updated 2026-10-14. v0 is done: the checker, and one system (NATS JetStream, Go
 > client) under stall, network and server faults. The calibration matrix reproduces, and weekend 3
-> produced two upstream reports (see Weekend 3 results). v1, the Go Kafka clients, has started: the
-> three-broker cluster runs, and v1 design records the decisions its code will follow.
+> produced two upstream reports (see Weekend 3 results). v1, the Go Kafka clients, has a working
+> franz-go witness, and its calibration pair reproduces (see v1 calibration results).
 
 ## What driftlab is
 
@@ -310,6 +310,27 @@ record that the broker kept, plus a lost write and an inconsistent offset, a lat
 the canceled one's offset. `deadline-control` is the same run without the freeze and should be
 clean on both versions. `scripts/kafka-calibrate.sh` runs both scenarios three times on each.
 
+**v1 calibration results.** On 2026-10-14, at commit `0c748d9`, against apache/kafka 4.3.1, all 12
+runs of `scripts/kafka-calibrate.sh` came out as expected:
+
+| Scenario | franz-go v1.20.6 | franz-go v1.20.7 |
+|---|---|---|
+| `deadline-control` | clean ×3 | clean ×3 |
+| `followers-pause` | **failed** ×3: lost-write, inconsistent-offsets, phantom | clean ×3 |
+
+- Every v1.20.6 failure has the same fingerprint. Value 51, sent into the freeze, failed with
+  `context deadline exceeded` about 10 seconds later, yet the final read has it at offset 50.
+  Value 52 failed the same way and was never written. Value 53 was acked at offset 50, where 51
+  sits, and is missing from the final read.
+- The fix is visible in the diary. In both versions the broker answers REQUEST_TIMED_OUT about 10
+  seconds after the send. v1.20.6 fails the record at that moment; v1.20.7 holds it until the
+  freeze ends, about 25 seconds after the send, and then acks it at its real offset.
+- The first full run, at `bc23bc1`, came back invalid: all six freeze runs were missing the
+  timeout evidence. The watcher listened for an info-level line that franz-go writes only for a
+  batch that ends in an error, not for a REQUEST_TIMED_OUT it retries. As with v0's first stall
+  runs, the invalid verdict caught a bug in the harness rather than calling the runs clean.
+  Those diaries show the same failures, and are kept.
+
 **Orchestration.** Still a script. v1 starts with v0's shape, one client library in two versions,
 and the faults stay inside each driver. A Go `driftlab run` comes with v3, whose fault schedules
 have to be generated, re-run and shrunk.
@@ -566,9 +587,9 @@ driftlab/
   32-run matrix. It found the first things nobody had reported: nats.go issues 2180 and 2181 (see
   Weekend 3 results).
 - **v1 (started 2026-10-13; the Go Kafka clients):** the three-broker cluster in
-  `deploy/kafka.yaml`, explored by hand, and the decisions in v1 design. First exit: the
-  calibration pair reproduces, with franz-go v1.20.6 failing and v1.20.7 passing. The version
-  ends with the published table.
+  `deploy/kafka.yaml`, explored by hand, and the decisions in v1 design. First exit reached on
+  2026-10-14: the calibration pair reproduces, with franz-go v1.20.6 failing and v1.20.7 passing
+  in all 12 runs (see v1 calibration results). The version ends with the published table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 
