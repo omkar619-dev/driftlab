@@ -11,6 +11,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -34,14 +36,32 @@ import (
 const replicas = 3
 
 // scenario describes one experiment. With consumer set, a solo helper reads
-// the topic while it is being written.
+// the topic while it is being written. A non-zero partitions overrides the
+// -partitions flag. With deadline set, every send gets a context that runs
+// out after it, the way a web request gives up. With pause set, the brokers
+// holding partition 0's other copies are frozen halfway through the flood,
+// for hold.
 type scenario struct {
-	consumer bool
+	consumer   bool
+	partitions int
+	deadline   time.Duration
+	pause      bool
+	hold       time.Duration
 }
 
+// The calibration scenarios use one partition, so every send meets the
+// frozen followers, and a 2-second deadline on every send. In
+// followers-pause the leader stores each record but can't get it copied, so
+// once franz-go's default 10-second produce timeout runs out it answers
+// REQUEST_TIMED_OUT, the ambiguous answer issue 1217 needs. The freeze lasts
+// 25 seconds: longer than one produce timeout, and shorter than the 30
+// seconds after which a leader tries to drop a follower that has stopped
+// fetching. deadline-control is the same run without the freeze.
 var scenarios = map[string]scenario{
-	"publish-only": {},
-	"control":      {consumer: true},
+	"publish-only":     {},
+	"control":          {consumer: true},
+	"deadline-control": {partitions: 1, deadline: 2 * time.Second},
+	"followers-pause":  {partitions: 1, deadline: 2 * time.Second, pause: true, hold: 25 * time.Second},
 }
 
 type config struct {
@@ -51,16 +71,20 @@ type config struct {
 	n          uint64
 	partitions int
 	grace      time.Duration
+	deadline   time.Duration
+	hold       time.Duration
 }
 
 func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only or control")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, deadline-control or followers-pause")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish")
-	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic")
+	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic, unless the scenario sets it")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the helper gets to catch up before the final read")
+	flag.DurationVar(&c.deadline, "deadline", 0, "each send's deadline; 0 keeps the scenario's own")
+	flag.DurationVar(&c.hold, "hold", 0, "how long the followers stay frozen; 0 keeps the scenario's own")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "franzdriver:", err)
@@ -76,10 +100,21 @@ func run(c config, out io.Writer) error {
 	if c.n < 1 {
 		return errors.New("-n must be at least 1")
 	}
-	if c.partitions < 1 {
+	// -deadline and -hold let a run differ from its scenario, to find
+	// thresholds. A scenario that needs one partition keeps it.
+	if sc.partitions == 0 {
+		sc.partitions = c.partitions
+	}
+	if sc.partitions < 1 {
 		return errors.New("-partitions must be at least 1")
 	}
-	partitions := int32(c.partitions)
+	if c.deadline > 0 {
+		sc.deadline = c.deadline
+	}
+	if c.hold > 0 {
+		sc.hold = c.hold
+	}
+	partitions := int32(sc.partitions)
 	rec := newRecorder(out)
 	ctx := context.Background()
 
@@ -87,8 +122,16 @@ func run(c config, out io.Writer) error {
 	// each partition ends. It keeps franz-go's defaults, because they are
 	// what users get: acks from every in-sync replica, and idempotent writes.
 	// The only change is that each record says which partition it goes to.
+	// In a freeze scenario it also gets a logger that watches for the
+	// broker's REQUEST_TIMED_OUT.
 	seeds := strings.Split(c.brokers, ",")
-	cl, err := kgo.NewClient(kgo.SeedBrokers(seeds...), kgo.RecordPartitioner(kgo.ManualPartitioner()))
+	opts := []kgo.Opt{kgo.SeedBrokers(seeds...), kgo.RecordPartitioner(kgo.ManualPartitioner())}
+	if sc.pause {
+		opts = append(opts, kgo.WithLogger(timeoutWatch{seen: sync.OnceFunc(func() {
+			rec.op(op{Process: "nemesis", Type: "ok", F: "timeout"})
+		})}))
+	}
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return err
 	}
@@ -111,10 +154,35 @@ func run(c config, out io.Writer) error {
 			return err
 		}
 	}
+	w := &writer{cl: cl, rec: rec, topic: topic, partitions: partitions, deadline: sc.deadline}
 	last := map[int32]int64{} // partition -> the highest offset acked so far
+	var pauseDone chan error
 	for v := uint64(1); v <= c.n; v++ {
-		if p, o, ok := publish(ctx, cl, rec, topic, partitions, v); ok {
+		// The freeze starts right away, before this value is sent, and ends
+		// on its own timer, because the sends below keep waiting on a leader
+		// that can't get its copies made. From then on, the run waits for
+		// the two halves of the 1217 trigger: the broker answering
+		// REQUEST_TIMED_OUT, and a send coming back after its deadline.
+		if sc.pause && v == c.n/2+1 {
+			finish, err := startPause(ctx, cl, rec, topic, sc.hold)
+			if err != nil {
+				return err
+			}
+			rec.op(op{Process: "nemesis", Type: "invoke", F: "timeout"})
+			rec.op(op{Process: "nemesis", Type: "invoke", F: "deadline"})
+			w.late = sync.OnceFunc(func() {
+				rec.op(op{Process: "nemesis", Type: "ok", F: "deadline"})
+			})
+			pauseDone = make(chan error, 1)
+			go func() { pauseDone <- finish() }()
+		}
+		if p, o, ok := w.publish(ctx, v); ok {
 			last[p] = max(last[p], o)
+		}
+	}
+	if pauseDone != nil {
+		if err := <-pauseDone; err != nil {
+			return err
 		}
 	}
 	if h != nil {
@@ -183,24 +251,174 @@ func allLed(resp *kmsg.MetadataResponse, partitions int32) bool {
 	return true
 }
 
-// publish records one publish and returns where its ack says it was
-// stored, or false when the outcome is unknown. Value v goes to partition
-// (v-1) mod partitions, so a history can be checked by hand. It waits for
-// the ack before the next one, so every produce request carries a single
-// record.
-func publish(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, partitions int32, v uint64) (int32, int64, bool) {
-	rec.op(op{Process: "producer", Type: "invoke", F: "publish", Value: v})
+// writer publishes the run's values. With a deadline, each send gets a
+// context that runs out after it, the way a web request gives up. late, when
+// set, is called whenever a send comes back after its deadline.
+type writer struct {
+	cl         *kgo.Client
+	rec        *recorder
+	topic      string
+	partitions int32
+	deadline   time.Duration
+	late       func()
+}
+
+// publish records one publish and returns where its ack says it was stored,
+// or false when it failed. Value v goes to partition (v-1) mod partitions, so
+// a history can be checked by hand. It waits for the ack before the next
+// one, so every produce request carries a single record.
+//
+// An error is recorded as a fail, not an info. franz-go fails an idempotent
+// record only when it knows the record was not written: once a request has
+// been sent, its Produce docs call the record "not safe to fail". So a value
+// that failed but turns up in the final read is a broken promise, which the
+// checker reports as a phantom.
+func (w *writer) publish(ctx context.Context, v uint64) (int32, int64, bool) {
+	w.rec.op(op{Process: "producer", Type: "invoke", F: "publish", Value: v})
 	r := &kgo.Record{
-		Topic:     topic,
-		Partition: int32((v - 1) % uint64(partitions)),
+		Topic:     w.topic,
+		Partition: int32((v - 1) % uint64(w.partitions)),
 		Value:     []byte(strconv.FormatUint(v, 10)),
 	}
-	if err := cl.ProduceSync(ctx, r).FirstErr(); err != nil {
-		rec.op(op{Process: "producer", Type: "info", F: "publish", Value: v, Error: err.Error()})
+	sendCtx := ctx
+	if w.deadline > 0 {
+		var cancel context.CancelFunc
+		sendCtx, cancel = context.WithTimeout(ctx, w.deadline)
+		defer cancel()
+	}
+	err := w.cl.ProduceSync(sendCtx, r).FirstErr()
+	if w.late != nil && sendCtx.Err() != nil {
+		w.late()
+	}
+	if err != nil {
+		w.rec.op(op{Process: "producer", Type: "fail", F: "publish", Value: v, Error: err.Error()})
 		return 0, 0, false
 	}
-	rec.op(op{Process: "producer", Type: "ok", F: "publish", Value: v, Partition: &r.Partition, Offset: &r.Offset})
+	w.rec.op(op{Process: "producer", Type: "ok", F: "publish", Value: v, Partition: &r.Partition, Offset: &r.Offset})
 	return r.Partition, r.Offset, true
+}
+
+// timeoutWatch is a franz-go logger that watches for one thing: a produce
+// request the broker answered with REQUEST_TIMED_OUT. franz-go v1.20.6 and
+// v1.20.7 both log every failed produce batch at info level, with the
+// broker's error, as "batch in a produce request failed". That answer is the
+// ambiguous one 1217 needs, because the broker may have written the record
+// anyway. If a later franz-go words the message differently, this never
+// fires and the run comes out invalid rather than clean.
+type timeoutWatch struct {
+	seen func()
+}
+
+func (t timeoutWatch) Level() kgo.LogLevel { return kgo.LogLevelInfo }
+
+func (t timeoutWatch) Log(_ kgo.LogLevel, msg string, keyvals ...any) {
+	if msg != "batch in a produce request failed" {
+		return
+	}
+	for i := 0; i+1 < len(keyvals); i += 2 {
+		if err, ok := keyvals[i+1].(error); ok && keyvals[i] == "err" && errors.Is(err, kerr.RequestTimedOut) {
+			t.seen()
+		}
+	}
+}
+
+// startPause freezes the brokers that hold partition 0's other copies, but
+// not its leader, and returns finish, which unfreezes them after hold. With
+// two of the three brokers frozen, the cluster also has no controller
+// quorum, so nothing can take the frozen followers out of the in-sync set:
+// the leader stores each record but can never get it copied. finish runs on
+// its own goroutine, because the sends keep waiting meanwhile. The fault
+// only counts as done if docker shows every follower was really paused.
+// Containers are named after the brokers' node IDs, as deploy/kafka.yaml
+// names them.
+func startPause(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, hold time.Duration) (func() error, error) {
+	leader, followers, err := followersOf(ctx, cl, topic)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(followers))
+	for i, id := range followers {
+		names[i] = fmt.Sprintf("kafka-%d", id)
+	}
+	rec.op(op{Process: "nemesis", Type: "invoke", F: "pause", Detail: map[string]any{"leader": leader, "paused": names}})
+	if _, err := docker(append([]string{"pause"}, names...)...); err != nil {
+		docker(append([]string{"unpause"}, names...)...) // never leave one of them frozen
+		return nil, err
+	}
+	paused, checkErr := docker(append([]string{"inspect", "-f", "{{.State.Paused}}"}, names...)...)
+	return func() error {
+		time.Sleep(hold)
+		// Unpause whatever the check said, so a run never leaves brokers
+		// frozen.
+		if _, err := docker(append([]string{"unpause"}, names...)...); err != nil {
+			return err
+		}
+		if checkErr != nil {
+			return checkErr
+		}
+		if allTrue(paused, len(names)) {
+			rec.op(op{Process: "nemesis", Type: "ok", F: "pause"})
+		}
+		return nil
+	}, nil
+}
+
+// followersOf asks which broker leads partition 0 of the topic, and which
+// brokers hold its other copies.
+func followersOf(ctx context.Context, cl *kgo.Client, topic string) (int32, []int32, error) {
+	req := kmsg.NewPtrMetadataRequest()
+	t := kmsg.NewMetadataRequestTopic()
+	t.Topic = kmsg.StringPtr(topic)
+	req.Topics = append(req.Topics, t)
+	resp, err := req.RequestWith(ctx, cl)
+	if err != nil {
+		return 0, nil, fmt.Errorf("finding the followers of %s: %w", topic, err)
+	}
+	if len(resp.Topics) != 1 {
+		return 0, nil, fmt.Errorf("finding the followers of %s: got %d topics back", topic, len(resp.Topics))
+	}
+	if err := kerr.ErrorForCode(resp.Topics[0].ErrorCode); err != nil {
+		return 0, nil, fmt.Errorf("finding the followers of %s: %w", topic, err)
+	}
+	for _, p := range resp.Topics[0].Partitions {
+		if p.Partition != 0 {
+			continue
+		}
+		var followers []int32
+		for _, id := range p.Replicas {
+			if id != p.Leader {
+				followers = append(followers, id)
+			}
+		}
+		return p.Leader, followers, nil
+	}
+	return 0, nil, fmt.Errorf("topic %s has no partition 0", topic)
+}
+
+// allTrue says whether docker inspect printed "true" once per container.
+func allTrue(out string, n int) bool {
+	fields := strings.Fields(out)
+	if n == 0 || len(fields) != n {
+		return false
+	}
+	for _, f := range fields {
+		if f != "true" {
+			return false
+		}
+	}
+	return true
+}
+
+// docker runs one docker command and returns what it printed. It gives up
+// after 30 seconds, so a docker daemon that hangs can't hang the run.
+func docker(args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, bytes.TrimSpace(out))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // helper is the solo consumer, the Kafka counterpart of the NATS ordered
@@ -404,28 +622,36 @@ type op struct {
 	Offset    *int64 `json:"offset,omitempty"`
 	Poll      uint64 `json:"poll,omitempty"`
 	Error     string `json:"error,omitempty"`
+	Detail    any    `json:"detail,omitempty"`
 }
 
 type metaLine struct {
-	Type     string `json:"type"`
-	Driver   string `json:"driver"`
-	Client   string `json:"client"`
-	API      string `json:"api,omitempty"`
-	Server   string `json:"server"`
-	Scenario string `json:"scenario"`
-	Params   params `json:"params"`
-	Driftlab string `json:"driftlab"`
+	Type     string   `json:"type"`
+	Driver   string   `json:"driver"`
+	Client   string   `json:"client"`
+	API      string   `json:"api,omitempty"`
+	Server   string   `json:"server"`
+	Scenario string   `json:"scenario"`
+	Faults   []string `json:"faults,omitempty"`
+	Params   params   `json:"params"`
+	Driftlab string   `json:"driftlab"`
 }
 
 type params struct {
 	N          uint64 `json:"n"`
 	Partitions int    `json:"partitions"`
 	Topic      string `json:"topic"`
+	Deadline   string `json:"deadline,omitempty"`
+	Hold       string `json:"hold,omitempty"`
 }
 
 // newMeta describes the run, including the topic, so the evidence can be
 // found in the cluster afterwards. A run with a helper also says how it
 // consumes: "direct" means partitions assigned by the driver, with no group.
+// A freeze scenario declares the three things the 1217 trigger needs: the
+// freeze itself, the broker answering REQUEST_TIMED_OUT, and a send coming
+// back after its deadline. If any of them leaves no evidence, the checker
+// calls the run invalid instead of clean.
 func newMeta(c config, sc scenario, topic string) metaLine {
 	client, rev := provenance()
 	m := metaLine{
@@ -434,11 +660,18 @@ func newMeta(c config, sc scenario, topic string) metaLine {
 		Client:   client,
 		Server:   c.server,
 		Scenario: c.scenario,
-		Params:   params{N: c.n, Partitions: c.partitions, Topic: topic},
+		Params:   params{N: c.n, Partitions: sc.partitions, Topic: topic},
 		Driftlab: rev,
 	}
 	if sc.consumer {
 		m.API = "direct"
+	}
+	if sc.deadline > 0 {
+		m.Params.Deadline = sc.deadline.String()
+	}
+	if sc.pause {
+		m.Faults = []string{"pause", "timeout", "deadline"}
+		m.Params.Hold = sc.hold.String()
 	}
 	return m
 }

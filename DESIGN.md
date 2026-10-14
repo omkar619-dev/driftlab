@@ -290,9 +290,25 @@ as a `nonmonotonic-poll`. This document promises Jepsen's meanings, so v0's anom
 **Calibration.** In https://github.com/twmb/franz-go/issues/1217, an idempotent produce timed out
 and the client treated it as never written, letting the caller cancel it, although the broker had
 appended it. The next batch reused its sequence numbers, so the broker took it for a retry and
-acked it without writing it. The fix shipped in v1.20.7, so v1.20.6 must fail and v1.20.7 must
-pass, the same shape as the 2107 pair. The history should show a lost write plus an inconsistent
-offset, because the ack names a position that holds a different message.
+acked it without writing it. The fix, https://github.com/twmb/franz-go/pull/1218, shipped in
+v1.20.7: a batch the broker answered with REQUEST_TIMED_OUT is now marked unsure, and an unsure
+batch can't be canceled. So v1.20.6 must fail and v1.20.7 must pass, the same shape as the 2107
+pair.
+
+**The 1217 scenario.** The reporter's reproducer is probabilistic: it loads the CPU and hopes for a
+timeout. driftlab makes the timeout certain. In `followers-pause` the topic has one partition,
+every send has a 2-second deadline, and halfway through the flood the driver freezes the two
+brokers that hold the partition's other copies, with `docker pause`. With two of three brokers
+frozen there is also no controller quorum, so nothing can drop them from the in-sync set: the
+leader stores each record, can't get it copied, and answers REQUEST_TIMED_OUT once franz-go's
+default 10-second produce timeout runs out. The freeze lasts 25 seconds. The run declares three
+faults, each with evidence of its own: the freeze (docker shows both brokers paused), the timeout
+(franz-go logs the broker's REQUEST_TIMED_OUT) and a send that came back after its deadline.
+Without all three, the trigger didn't fire, and the run is invalid rather than clean. Because
+franz-go's errors are recorded as `fail`, a v1.20.6 history should show a phantom, the canceled
+record that the broker kept, plus a lost write and an inconsistent offset, a later record acked at
+the canceled one's offset. `deadline-control` is the same run without the freeze and should be
+clean on both versions. `scripts/kafka-calibrate.sh` runs both scenarios three times on each.
 
 **Orchestration.** Still a script. v1 starts with v0's shape, one client library in two versions,
 and the faults stay inside each driver. A Go `driftlab run` comes with v3, whose fault schedules
@@ -343,8 +359,11 @@ exactly what produced it.
 Field rules:
 
 - `type` is one of `invoke`, `ok`, `fail` or `info`, following Jepsen's vocabulary. The only other
-  value is `meta`. v0 records every publish error as `info`. Telling which errors are definite
-  failures takes care, so that comes later.
+  value is `meta`. The NATS driver records every publish error as `info`, because nats.go promises
+  nothing about them. The franz-go driver records them as `fail`: franz-go fails an idempotent
+  record only when it knows the record was not written, since its Produce docs call a record whose
+  request has been sent "not safe to fail". A failed value that turns up in the final read is then
+  a phantom, and a broken promise.
 - `value` is unique per message across the run: the producer assigns 1, 2, 3, and so on. This
   makes every message identifiable end to end, independently of the server.
 - `stream_seq` is the server's sequence. It appears on `ok` publishes (taken from the PubAck), on
@@ -509,7 +528,8 @@ driftlab/
 │   ├── compose.yaml
 │   └── kafka.yaml
 └── scripts/
-    └── matrix.sh
+    ├── matrix.sh
+    └── kafka-calibrate.sh
 ```
 
 | Path | What it is |
@@ -529,6 +549,7 @@ driftlab/
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
+| `scripts/kafka-calibrate.sh` | runs v1's calibration (2 franz-go versions × 2 scenarios × 3 repeats) and checks every verdict against the expected one |
 
 ## Milestones
 
