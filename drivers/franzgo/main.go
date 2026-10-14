@@ -299,24 +299,28 @@ func (w *writer) publish(ctx context.Context, v uint64) (int32, int64, bool) {
 }
 
 // timeoutWatch is a franz-go logger that watches for one thing: a produce
-// request the broker answered with REQUEST_TIMED_OUT. franz-go v1.20.6 and
-// v1.20.7 both log every failed produce batch at info level, with the
-// broker's error, as "batch in a produce request failed". That answer is the
+// request the broker answered with REQUEST_TIMED_OUT. That answer is the
 // ambiguous one 1217 needs, because the broker may have written the record
-// anyway. If a later franz-go words the message differently, this never
-// fires and the run comes out invalid rather than clean.
+// anyway. franz-go retries a REQUEST_TIMED_OUT without an info-level line:
+// its "batch in a produce request failed" is only for a batch that ends in
+// an error. The answer does show up in the debug-level summary franz-go
+// writes after every produce response, "produced", whose "to" value lists
+// each batch, such as "retrying@50,1(REQUEST_TIMED_OUT: The request timed
+// out.)". v1.20.6 and v1.20.7 write it the same way. If a later franz-go
+// words it differently, this never fires and the run comes out invalid
+// rather than clean.
 type timeoutWatch struct {
 	seen func()
 }
 
-func (t timeoutWatch) Level() kgo.LogLevel { return kgo.LogLevelInfo }
+func (t timeoutWatch) Level() kgo.LogLevel { return kgo.LogLevelDebug }
 
 func (t timeoutWatch) Log(_ kgo.LogLevel, msg string, keyvals ...any) {
-	if msg != "batch in a produce request failed" {
+	if msg != "produced" {
 		return
 	}
 	for i := 0; i+1 < len(keyvals); i += 2 {
-		if err, ok := keyvals[i+1].(error); ok && keyvals[i] == "err" && errors.Is(err, kerr.RequestTimedOut) {
+		if to, ok := keyvals[i+1].(string); ok && keyvals[i] == "to" && strings.Contains(to, "REQUEST_TIMED_OUT") {
 			t.seen()
 		}
 	}

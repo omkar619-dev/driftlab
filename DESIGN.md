@@ -303,7 +303,7 @@ frozen there is also no controller quorum, so nothing can drop them from the in-
 leader stores each record, can't get it copied, and answers REQUEST_TIMED_OUT once franz-go's
 default 10-second produce timeout runs out. The freeze lasts 25 seconds. The run declares three
 faults, each with evidence of its own: the freeze (docker shows both brokers paused), the timeout
-(franz-go logs the broker's REQUEST_TIMED_OUT) and a send that came back after its deadline.
+(franz-go's debug log shows REQUEST_TIMED_OUT) and a send that came back after its deadline.
 Without all three, the trigger didn't fire, and the run is invalid rather than clean. Because
 franz-go's errors are recorded as `fail`, a v1.20.6 history should show a phantom, the canceled
 record that the broker kept, plus a lost write and an inconsistent offset, a later record acked at
