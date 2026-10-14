@@ -1,0 +1,10 @@
+{"type":"meta","driver":"fixture","client":"hand-written","scenario":"kafka-reordered"}
+{"index":0,"process":"producer","type":"invoke","f":"publish","value":1}
+{"index":1,"process":"producer","type":"ok","f":"publish","value":1,"partition":0,"offset":0}
+{"index":2,"process":"producer","type":"invoke","f":"publish","value":2}
+{"index":3,"process":"producer","type":"invoke","f":"publish","value":3}
+{"index":4,"process":"producer","type":"ok","f":"publish","value":3,"partition":0,"offset":1}
+{"index":5,"process":"producer","type":"ok","f":"publish","value":2,"partition":0,"offset":2}
+{"index":6,"process":"final-read","type":"ok","f":"read","value":1,"partition":0,"offset":0}
+{"index":7,"process":"final-read","type":"ok","f":"read","value":3,"partition":0,"offset":1}
+{"index":8,"process":"final-read","type":"ok","f":"read","value":2,"partition":0,"offset":2}

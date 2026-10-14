@@ -117,6 +117,10 @@ func TestCheckFixtures(t *testing.T) {
 			"verdict failed, 0 of 3 publishes unknown",
 			"duplicate final-read ops=[7 8]: value 2 is stored at 2 positions: partition 0 offset 1, partition 0 offset 2",
 		}},
+		{"kafka-reordered.jsonl", []string{
+			"verdict failed, 0 of 3 publishes unknown",
+			"nonmonotonic-send producer ops=[4 5]: value 3 was sent after value 2 but acked at partition 0 offset 1, not after value 2 at partition 0 offset 2",
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.file, func(t *testing.T) {

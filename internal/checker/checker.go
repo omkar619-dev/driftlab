@@ -37,6 +37,7 @@ const (
 	Phantom             Kind = "phantom"
 	Duplicate           Kind = "duplicate"
 	InconsistentOffsets Kind = "inconsistent-offsets"
+	NonmonotonicSend    Kind = "nonmonotonic-send"
 )
 
 // Anomaly is one broken promise, with the history indexes that prove it.
@@ -113,6 +114,7 @@ func Check(h *history.History) Result {
 	n := numbering{kafka: h.Kafka}
 	final := readFinal(h.Ops)
 	r := Result{Anomalies: checkOrdered(h.Ops, n)}
+	r.Anomalies = append(r.Anomalies, checkSends(h.Ops, n)...)
 	if final != nil {
 		r.Anomalies = append(r.Anomalies, checkStalls(h.Ops, final, n)...)
 		r.Anomalies = append(r.Anomalies, checkLostWrites(h.Ops, final, n)...)
@@ -333,6 +335,60 @@ func checkOrdered(ops []history.Op, n numbering) []Anomaly {
 		total := sk.hi - sk.lo + 1
 		out[sk.at].Msg = fmt.Sprintf("expected %s, got %d: %d skipped, %d delivered late, %d never delivered",
 			n.at(history.Pos{Partition: sk.part, Offset: sk.lo}), sk.hi+1, total, late, total-late)
+	}
+	return out
+}
+
+// send is one acked publish, with when its producer invoked it.
+type send struct {
+	value  uint64
+	invoke int         // history index of its invoke
+	ack    int         // history index of its ok
+	pos    history.Pos // where its ack says it was stored
+}
+
+// checkSends reports a producer whose acks place a send at or before the
+// send it made just before, in the same partition. franz-go documents that
+// records are produced in order per partition when they succeed, and Jepsen
+// calls a break in that order a nonmonotonic send. Sends are taken in the
+// order the producer invoked them, which is the order it handed them over,
+// not the order their acks came back.
+func checkSends(ops []history.Op, n numbering) []Anomaly {
+	invoked := map[uint64]int{}  // value -> history index of its invoke
+	sends := map[string][]send{} // producer -> its acked sends
+	var order []string
+	for _, op := range ops {
+		if op.F != history.Publish {
+			continue
+		}
+		switch op.Type {
+		case history.Invoke:
+			invoked[op.Value] = op.Index
+		case history.OK:
+			p, _ := op.Pos()
+			if _, ok := sends[op.Process]; !ok {
+				order = append(order, op.Process)
+			}
+			sends[op.Process] = append(sends[op.Process], send{value: op.Value, invoke: invoked[op.Value], ack: op.Index, pos: p})
+		}
+	}
+	var out []Anomaly
+	for _, name := range order {
+		ss := sends[name]
+		slices.SortFunc(ss, func(a, b send) int { return a.invoke - b.invoke })
+		last := map[uint32]send{} // partition -> the send made just before, there
+		for _, s := range ss {
+			prev, ok := last[s.pos.Partition]
+			if ok && s.pos.Offset <= prev.pos.Offset {
+				out = append(out, Anomaly{
+					Kind:    NonmonotonicSend,
+					Process: name,
+					Ops:     []int{min(prev.ack, s.ack), max(prev.ack, s.ack)},
+					Msg:     fmt.Sprintf("value %d was sent after value %d but acked at %s, not after value %d at %s", s.value, prev.value, n.at(s.pos), prev.value, n.at(prev.pos)),
+				})
+			}
+			last[s.pos.Partition] = s
+		}
 	}
 	return out
 }

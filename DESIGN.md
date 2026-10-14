@@ -24,15 +24,15 @@ driftlab's lane is **the client library you actually import**. It runs the same 
 different client APIs and versions, and one checker judges all of them.
 
 What is *not* new, stated up front: the anomaly vocabulary (lost-write, poll-skip,
-nonmonotonic-poll, duplicate, inconsistent-offsets) comes from Jepsen's Kafka workload
-(https://jepsen-io.github.io/jepsen/jepsen.tests.kafka.html). We reuse those names for the same
-failures on purpose, so anyone who knows Jepsen can read driftlab output without a glossary. The
-other names (stall, phantom, duplicate-delivery) are driftlab's own. `lost-write` is judged
-differently. Jepsen infers it from reads: an acked message that nobody read, although someone
-read a later offset; an acked message nobody read at all is `unseen`. driftlab checks each acked
-message against a final read of the whole log instead, so it can tell a message the log lost
-(a lost write) from one the log kept but a consumer never got (a stall or a poll-skip), and it
-also catches a message that a consumer received before the log lost it.
+nonmonotonic-poll, nonmonotonic-send, duplicate, inconsistent-offsets) comes from Jepsen's Kafka
+workload (https://jepsen-io.github.io/jepsen/jepsen.tests.kafka.html). We reuse those names for
+the same failures on purpose, so anyone who knows Jepsen can read driftlab output without a
+glossary. The other names (stall, phantom, duplicate-delivery) are driftlab's own. `lost-write`
+is judged differently. Jepsen infers it from reads: an acked message that nobody read, although
+someone read a later offset; an acked message nobody read at all is `unseen`. driftlab checks each
+acked message against a final read of the whole log instead, so it can tell a message the log
+lost (a lost write) from one the log kept but a consumer never got (a stall or a poll-skip), and
+it also catches a message that a consumer received before the log lost it.
 
 ## First principles
 
@@ -308,7 +308,10 @@ goes to partition (v - 1) mod 3, so a history can be checked by hand. The produc
 franz-go's defaults, which are what users get: acks from every in-sync replica, and idempotent
 writes. In `control`, a solo helper reads the topic while it is written: a client of its own that
 consumes every partition directly from the start, with no group, and the meta line says
-`"api":"direct"`.
+`"api":"direct"`. The two builds differ in timing too: v1.20.7 also stopped `ProduceSync` waiting
+out the 10 ms linger that franz-go has defaulted to since v1.20.0, and on 2026-10-14, 100
+one-at-a-time publishes took 0.44 s on v1.20.7 and 1.70 s on v1.20.6. Anything in the
+calibration that depends on timing behaves differently between the two.
 
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
@@ -388,6 +391,7 @@ Even liveness is judged by position in the history (principle 4).
 | `phantom` | a value seen by the consumer or the final read that no producer ever invoked, or whose publish was recorded as `fail` | client or server |
 | `duplicate` | one value at more than one position in the final read: one write stored twice | client (producer) or server |
 | `inconsistent-offsets` | an ack or a delivery places a value at a position where the final read found a different one | client or server |
+| `nonmonotonic-send` | one producer's acks place a send at or before the send it made just before, in the same partition, taking sends in the order the producer made them | client (producer) or server |
 
 In a Kafka history every rule applies within each partition, with offsets, which count from 0, in
 place of stream sequences. A consumer has to reach the end of every partition the final read
