@@ -298,6 +298,16 @@ offset, because the ack names a position that holds a different message.
 and the faults stay inside each driver. A Go `driftlab run` comes with v3, whose fault schedules
 have to be generated, re-run and shrunk.
 
+**The witness.** `drivers/franzgo` is a module of its own, built twice like the NATS driver: its
+`go.mod` pins franz-go v1.20.7, and `v1.20.6.mod` pins the release before the fix. Both franz-go
+releases declare Go 1.24 and need the same `kmsg` v1.12.0, so the two binaries differ only in
+franz-go. The driver creates its topic and finds where each partition ends with raw `kmsg`
+requests, not franz-go's admin package `kadm`: `kadm` requires franz-go v1.22.1, and importing it
+would quietly upgrade the v1.20.6 build. Each run gets a fresh three-partition topic, and value v
+goes to partition (v - 1) mod 3, so a history can be checked by hand. The producer keeps
+franz-go's defaults, which are what users get: acks from every in-sync replica, and idempotent
+writes.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
@@ -480,10 +490,13 @@ driftlab/
 │   └── checker/
 │       └── testdata/
 ├── drivers/
-│   └── natsgo/
+│   ├── natsgo/
+│   │   ├── go.mod
+│   │   ├── v1.53.1.mod
+│   │   └── repro2180/
+│   └── franzgo/
 │       ├── go.mod
-│       ├── v1.53.1.mod
-│       └── repro2180/
+│       └── v1.20.6.mod
 ├── deploy/
 │   ├── compose.yaml
 │   └── kafka.yaml
@@ -502,6 +515,9 @@ driftlab/
 | `drivers/natsgo/go.mod` | pins nats.go v1.54.0 (the fixed release) |
 | `drivers/natsgo/v1.53.1.mod` | pins nats.go v1.53.1 (the last buggy release), used via `-modfile` |
 | `drivers/natsgo/repro2180/` | a standalone reproducer for nats.go issue 2180, which needs only nats-server |
+| `drivers/franzgo/` | a separate module that talks to Kafka through franz-go and writes a history to stdout |
+| `drivers/franzgo/go.mod` | pins franz-go v1.20.7 (the release that fixed issue 1217) |
+| `drivers/franzgo/v1.20.6.mod` | pins franz-go v1.20.6 (the last release before the fix), used via `-modfile` |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
