@@ -84,6 +84,26 @@ func TestCheckFixtures(t *testing.T) {
 			"verdict failed, 0 of 2 publishes unknown",
 			"stall consumer ops=[5 7]: had received nothing when the final read began; the stream ends at stream_seq 2",
 		}},
+		{"kafka-clean.jsonl", []string{
+			"verdict clean, 0 of 4 publishes unknown",
+		}},
+		{"kafka-first-skip.jsonl", []string{
+			"verdict failed, 0 of 4 publishes unknown",
+			"poll-skip consumer ops=[12]: expected partition 1 offset 0, got 1: 1 skipped, 0 delivered late, 1 never delivered",
+		}},
+		{"kafka-hole.jsonl", []string{
+			"verdict invalid, 1 of 4 publishes unknown",
+			"invalid: final read has a hole no acked publish explains: 1 of 2 offsets in partition 1 missing, starting at 0",
+		}},
+		{"kafka-stall.jsonl", []string{
+			"verdict failed, 0 of 2 publishes unknown",
+			"stall consumer ops=[6 8]: had received nothing from partition 1 when the final read began; it ends at offset 0",
+		}},
+		{"kafka-recovery.jsonl", []string{
+			"verdict clean, 0 of 3 publishes unknown",
+			"recovery consumer: caught up 2.5s after the faults ended",
+			"lag consumer: the longest wait from an ack to its delivery was 11.497s (value 2)",
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.file, func(t *testing.T) {

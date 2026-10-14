@@ -4,6 +4,7 @@ package checker
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -44,8 +45,9 @@ type Anomaly struct {
 }
 
 // Recovery is how long one consumer took, after the last fault ended, to
-// receive every stream sequence that had been acked by then. It is a
-// measurement, and it never affects the verdict (DESIGN.md principle 4).
+// receive everything up to the last message acked by then, in every
+// partition. It is a measurement, and it never affects the verdict
+// (DESIGN.md principle 4).
 type Recovery struct {
 	Process string
 	Caught  bool
@@ -105,15 +107,16 @@ func (r Result) Lines() []string {
 // holds for a contiguous stream, so a hole in the final read that no acked
 // publish explains makes the run invalid (DESIGN.md principle 5).
 func Check(h *history.History) Result {
+	n := numbering{kafka: h.Kafka}
 	final := readFinal(h.Ops)
-	r := Result{Anomalies: checkOrdered(h.Ops)}
+	r := Result{Anomalies: checkOrdered(h.Ops, n)}
 	if final != nil {
-		r.Anomalies = append(r.Anomalies, checkStalls(h.Ops, final)...)
-		r.Anomalies = append(r.Anomalies, checkLostWrites(h.Ops, final)...)
+		r.Anomalies = append(r.Anomalies, checkStalls(h.Ops, final, n)...)
+		r.Anomalies = append(r.Anomalies, checkLostWrites(h.Ops, final, n)...)
 	}
 	r.Anomalies = append(r.Anomalies, checkPhantoms(h.Ops)...)
-	r.Reasons = append(checkFinalRead(h.Ops, final), checkFaults(h)...)
-	r.Recoveries = measureRecovery(h.Ops)
+	r.Reasons = append(checkFinalRead(h.Ops, final, n), checkFaults(h)...)
+	r.Recoveries = measureRecovery(h.Ops, n)
 	r.Lags = measureLag(h.Ops)
 	for _, op := range h.Ops {
 		if op.F != history.Publish {
@@ -137,12 +140,39 @@ func Check(h *history.History) Result {
 	return r
 }
 
+// numbering is how a history numbers stored messages. A NATS stream counts
+// from 1, and every Kafka partition counts from 0.
+type numbering struct {
+	kafka bool
+}
+
+// first is the offset every partition starts at.
+func (n numbering) first() uint64 {
+	if n.kafka {
+		return 0
+	}
+	return 1
+}
+
+// at names a position the way the history writes it.
+func (n numbering) at(p history.Pos) string {
+	if n.kafka {
+		return fmt.Sprintf("partition %d offset %d", p.Partition, p.Offset)
+	}
+	return fmt.Sprintf("stream_seq %d", p.Offset)
+}
+
 type finalRead struct {
-	seqs   map[uint64]bool // stream sequences it returned
-	values map[uint64]bool // values it returned
-	last   uint64          // highest stream sequence it returned
-	lastOp int             // history index of that record
-	start  int             // history index of its first record
+	at     map[history.Pos]int // position -> history index of the record there
+	values map[uint64]bool     // values it returned
+	tails  map[uint32]tail     // partition -> the last record it returned there
+	start  int                 // history index of its first record
+}
+
+// tail is the last record a final read returned from one partition.
+type tail struct {
+	offset uint64
+	op     int // its history index
 }
 
 func readFinal(ops []history.Op) *finalRead {
@@ -152,41 +182,60 @@ func readFinal(ops []history.Op) *finalRead {
 			continue
 		}
 		if f == nil {
-			f = &finalRead{seqs: map[uint64]bool{}, values: map[uint64]bool{}, start: op.Index}
+			f = &finalRead{at: map[history.Pos]int{}, values: map[uint64]bool{}, tails: map[uint32]tail{}, start: op.Index}
 		}
-		f.seqs[op.StreamSeq] = true
+		p, _ := op.Pos()
+		f.at[p] = op.Index
 		f.values[op.Value] = true
-		if op.StreamSeq > f.last {
-			f.last, f.lastOp = op.StreamSeq, op.Index
+		if t, ok := f.tails[p.Partition]; !ok || p.Offset > t.offset {
+			f.tails[p.Partition] = tail{offset: p.Offset, op: op.Index}
 		}
 	}
 	return f
 }
 
-func checkFinalRead(ops []history.Op, final *finalRead) []string {
+// partitions lists the partitions the final read returned, in order, so
+// whatever is reported per partition comes out in the same order every run.
+func (f *finalRead) partitions() []uint32 {
+	return slices.Sorted(maps.Keys(f.tails))
+}
+
+func checkFinalRead(ops []history.Op, final *finalRead, n numbering) []string {
 	if final == nil {
 		return []string{"no final read, so the stream's contents are unknown"}
 	}
-	acked := map[uint64]bool{}
+	acked := map[history.Pos]bool{}
 	for _, op := range ops {
 		if op.F == history.Publish && op.Type == history.OK {
-			acked[op.StreamSeq] = true
+			p, _ := op.Pos()
+			acked[p] = true
 		}
 	}
-	var holes, first uint64
-	for q := uint64(1); q <= final.last; q++ {
-		if final.seqs[q] || acked[q] {
-			continue
+	var reasons []string
+	for _, part := range final.partitions() {
+		last := final.tails[part].offset
+		var holes, start uint64
+		for q := n.first(); q <= last; q++ {
+			p := history.Pos{Partition: part, Offset: q}
+			if _, ok := final.at[p]; ok || acked[p] {
+				continue
+			}
+			if holes == 0 {
+				start = q
+			}
+			holes++
 		}
 		if holes == 0 {
-			first = q
+			continue
 		}
-		holes++
+		what := "stream sequences"
+		if n.kafka {
+			what = fmt.Sprintf("offsets in partition %d", part)
+		}
+		reasons = append(reasons, fmt.Sprintf("final read has a hole no acked publish explains: %d of %d %s missing, starting at %d",
+			holes, last-n.first()+1, what, start))
 	}
-	if holes == 0 {
-		return nil
-	}
-	return []string{fmt.Sprintf("final read has a hole no acked publish explains: %d of %d stream sequences missing, starting at %d", holes, final.last, first)}
+	return reasons
 }
 
 func checkFaults(h *history.History) []string {
@@ -203,18 +252,24 @@ func checkFaults(h *history.History) []string {
 }
 
 type consumer struct {
-	max   uint64         // highest stream_seq delivered so far
-	maxOp int            // history index of that delivery; -1 before the first
-	seen  map[uint64]int // stream_seq -> history index of its first delivery
+	cursors map[uint32]*cursor  // partition -> its place there
+	seen    map[history.Pos]int // position -> history index of its first delivery
+}
+
+// cursor is a consumer's place in one partition.
+type cursor struct {
+	next   uint64 // the offset it should deliver next
+	lastOp int    // history index of its latest in-order delivery; -1 before the first
 }
 
 type skip struct {
 	at      int    // index in the anomaly list
 	process string // the consumer that skipped
-	lo, hi  uint64 // the skipped stream sequences, inclusive
+	part    uint32 // the partition it skipped in
+	lo, hi  uint64 // the skipped offsets, inclusive
 }
 
-func checkOrdered(ops []history.Op) []Anomaly {
+func checkOrdered(ops []history.Op, n numbering) []Anomaly {
 	var out []Anomaly
 	var skips []skip
 	consumers := map[string]*consumer{}
@@ -224,60 +279,65 @@ func checkOrdered(ops []history.Op) []Anomaly {
 		}
 		c := consumers[op.Process]
 		if c == nil {
-			c = &consumer{maxOp: -1, seen: map[uint64]int{}}
+			c = &consumer{cursors: map[uint32]*cursor{}, seen: map[history.Pos]int{}}
 			consumers[op.Process] = c
 		}
-		s := op.StreamSeq
-		if first, ok := c.seen[s]; ok {
+		p, _ := op.Pos()
+		if earlier, ok := c.seen[p]; ok {
 			out = append(out, Anomaly{
 				Kind:    DuplicateDelivery,
 				Process: op.Process,
-				Ops:     []int{first, op.Index},
-				Msg:     fmt.Sprintf("stream_seq %d delivered again", s),
+				Ops:     []int{earlier, op.Index},
+				Msg:     fmt.Sprintf("%s delivered again", n.at(p)),
 			})
 			continue
 		}
-		c.seen[s] = op.Index
+		c.seen[p] = op.Index
+		cur := c.cursors[p.Partition]
+		if cur == nil {
+			cur = &cursor{next: n.first(), lastOp: -1}
+			c.cursors[p.Partition] = cur
+		}
 		switch {
-		case s < c.max:
+		case p.Offset+1 < cur.next:
 			out = append(out, Anomaly{
 				Kind:    NonmonotonicPoll,
 				Process: op.Process,
-				Ops:     []int{c.maxOp, op.Index},
-				Msg:     fmt.Sprintf("stream_seq %d delivered after %d", s, c.max),
+				Ops:     []int{cur.lastOp, op.Index},
+				Msg:     fmt.Sprintf("%s delivered after %d", n.at(p), cur.next-1),
 			})
 			continue
-		case s > c.max+1:
+		case p.Offset > cur.next:
 			ev := []int{op.Index}
-			if c.maxOp >= 0 {
-				ev = []int{c.maxOp, op.Index}
+			if cur.lastOp >= 0 {
+				ev = []int{cur.lastOp, op.Index}
 			}
-			skips = append(skips, skip{at: len(out), process: op.Process, lo: c.max + 1, hi: s - 1})
+			skips = append(skips, skip{at: len(out), process: op.Process, part: p.Partition, lo: cur.next, hi: p.Offset - 1})
 			out = append(out, Anomaly{Kind: PollSkip, Process: op.Process, Ops: ev})
 		}
-		c.max, c.maxOp = s, op.Index
+		cur.next, cur.lastOp = p.Offset+1, op.Index
 	}
 	for _, sk := range skips {
 		seen := consumers[sk.process].seen
 		var late uint64
 		for q := sk.lo; q <= sk.hi; q++ {
-			if _, ok := seen[q]; ok {
+			if _, ok := seen[history.Pos{Partition: sk.part, Offset: q}]; ok {
 				late++
 			}
 		}
-		n := sk.hi - sk.lo + 1
-		out[sk.at].Msg = fmt.Sprintf("expected stream_seq %d, got %d: %d skipped, %d delivered late, %d never delivered",
-			sk.lo, sk.hi+1, n, late, n-late)
+		total := sk.hi - sk.lo + 1
+		out[sk.at].Msg = fmt.Sprintf("expected %s, got %d: %d skipped, %d delivered late, %d never delivered",
+			n.at(history.Pos{Partition: sk.part, Offset: sk.lo}), sk.hi+1, total, late, total-late)
 	}
 	return out
 }
 
 type progress struct {
-	reached uint64 // highest stream_seq delivered before the final read
-	lastOp  int    // history index of its latest subscribe or delivery
+	reached map[uint32]uint64 // partition -> highest offset delivered before the final read
+	lastOp  int               // history index of its latest subscribe or delivery
 }
 
-func checkStalls(ops []history.Op, final *finalRead) []Anomaly {
+func checkStalls(ops []history.Op, final *finalRead, n numbering) []Anomaly {
 	consumers := map[string]*progress{}
 	var order []string
 	for _, op := range ops[:final.start] {
@@ -287,41 +347,54 @@ func checkStalls(ops []history.Op, final *finalRead) []Anomaly {
 		}
 		p := consumers[op.Process]
 		if p == nil {
-			p = &progress{}
+			p = &progress{reached: map[uint32]uint64{}}
 			consumers[op.Process] = p
 			order = append(order, op.Process)
 		}
 		p.lastOp = op.Index
 		if op.F == history.Deliver {
-			p.reached = max(p.reached, op.StreamSeq)
+			pos, _ := op.Pos()
+			if got, ok := p.reached[pos.Partition]; !ok || pos.Offset > got {
+				p.reached[pos.Partition] = pos.Offset
+			}
 		}
 	}
 	var out []Anomaly
 	for _, name := range order {
 		p := consumers[name]
-		if p.reached >= final.last {
-			continue
+		for _, part := range final.partitions() {
+			end := final.tails[part]
+			got, ok := p.reached[part]
+			if ok && got >= end.offset {
+				continue
+			}
+			var msg string
+			switch {
+			case ok:
+				msg = fmt.Sprintf("had reached %s of %d when the final read began", n.at(history.Pos{Partition: part, Offset: got}), end.offset)
+			case n.kafka:
+				msg = fmt.Sprintf("had received nothing from partition %d when the final read began; it ends at offset %d", part, end.offset)
+			default:
+				msg = fmt.Sprintf("had received nothing when the final read began; the stream ends at stream_seq %d", end.offset)
+			}
+			out = append(out, Anomaly{Kind: Stall, Process: name, Ops: []int{p.lastOp, end.op}, Msg: msg})
 		}
-		msg := fmt.Sprintf("had reached stream_seq %d of %d when the final read began", p.reached, final.last)
-		if p.reached == 0 {
-			msg = fmt.Sprintf("had received nothing when the final read began; the stream ends at stream_seq %d", final.last)
-		}
-		out = append(out, Anomaly{Kind: Stall, Process: name, Ops: []int{p.lastOp, final.lastOp}, Msg: msg})
 	}
 	return out
 }
 
-func checkLostWrites(ops []history.Op, final *finalRead) []Anomaly {
+func checkLostWrites(ops []history.Op, final *finalRead, n numbering) []Anomaly {
 	var out []Anomaly
 	for _, op := range ops {
 		if op.F != history.Publish || op.Type != history.OK || final.values[op.Value] {
 			continue
 		}
+		p, _ := op.Pos()
 		out = append(out, Anomaly{
 			Kind:    LostWrite,
 			Process: op.Process,
 			Ops:     []int{op.Index},
-			Msg:     fmt.Sprintf("value %d was acked at stream_seq %d but is missing from the final read", op.Value, op.StreamSeq),
+			Msg:     fmt.Sprintf("value %d was acked at %s but is missing from the final read", op.Value, n.at(p)),
 		})
 	}
 	return out
@@ -364,7 +437,7 @@ func checkPhantoms(ops []history.Op) []Anomaly {
 	return out
 }
 
-func measureRecovery(ops []history.Op) []Recovery {
+func measureRecovery(ops []history.Op, n numbering) []Recovery {
 	end := -1
 	for i, op := range ops {
 		if op.Process == history.Nemesis && op.Type == history.OK {
@@ -374,37 +447,50 @@ func measureRecovery(ops []history.Op) []Recovery {
 	if end < 0 {
 		return nil
 	}
-	var target uint64
+	// In each partition the target is the highest offset acked before the
+	// last fault ended. Offsets have no holes, so a consumer has caught up
+	// once it has received every offset from the first one to the target.
+	targets := map[uint32]uint64{}
 	for _, op := range ops[:end] {
-		if op.F == history.Publish && op.Type == history.OK {
-			target = max(target, op.StreamSeq)
+		if op.F != history.Publish || op.Type != history.OK {
+			continue
+		}
+		p, _ := op.Pos()
+		if t, ok := targets[p.Partition]; !ok || p.Offset > t {
+			targets[p.Partition] = p.Offset
 		}
 	}
-	if target == 0 {
+	if len(targets) == 0 {
 		return nil
 	}
+	need := 0
+	for _, t := range targets {
+		need += int(t - n.first() + 1)
+	}
 
-	// For each consumer: its position in out, and which stream sequences up
-	// to target it has received so far.
+	// For each consumer: its index in out, and which positions up to the
+	// targets it has received so far.
 	var out []Recovery
-	pos := map[string]int{}
-	seen := map[string]map[uint64]bool{}
+	idx := map[string]int{}
+	seen := map[string]map[history.Pos]bool{}
 	for _, op := range ops {
 		if op.F != history.Deliver {
 			continue
 		}
-		i, ok := pos[op.Process]
+		i, ok := idx[op.Process]
 		if !ok {
 			i = len(out)
-			pos[op.Process] = i
-			seen[op.Process] = map[uint64]bool{}
+			idx[op.Process] = i
+			seen[op.Process] = map[history.Pos]bool{}
 			out = append(out, Recovery{Process: op.Process})
 		}
-		if out[i].Caught || op.StreamSeq > target {
+		p, _ := op.Pos()
+		t, aimed := targets[p.Partition]
+		if out[i].Caught || !aimed || p.Offset > t {
 			continue
 		}
-		seen[op.Process][op.StreamSeq] = true
-		if uint64(len(seen[op.Process])) == target {
+		seen[op.Process][p] = true
+		if len(seen[op.Process]) == need {
 			out[i].Caught = true
 			out[i].After = max(0, op.Time-ops[end].Time)
 		}
@@ -422,37 +508,39 @@ func measureLag(ops []history.Op) []Lag {
 	if !faulted {
 		return nil
 	}
-	acked := map[uint64]time.Duration{} // stream_seq -> when its ack arrived
+	acked := map[history.Pos]time.Duration{} // position -> when its ack arrived
 	for _, op := range ops {
 		if op.F == history.Publish && op.Type == history.OK {
-			acked[op.StreamSeq] = op.Time
+			p, _ := op.Pos()
+			acked[p] = op.Time
 		}
 	}
 
 	var out []Lag
-	pos := map[string]int{}
-	seen := map[string]map[uint64]bool{}
+	idx := map[string]int{}
+	seen := map[string]map[history.Pos]bool{}
 	for _, op := range ops {
 		if op.F != history.Deliver {
 			continue
 		}
-		at, ok := acked[op.StreamSeq]
-		if !ok || seen[op.Process][op.StreamSeq] {
+		p, _ := op.Pos()
+		at, ok := acked[p]
+		if !ok || seen[op.Process][p] {
 			continue
 		}
 		// A consumer can receive a message just before its ack gets back to
 		// the producer, so a negative wait counts as none.
 		wait := max(0, op.Time-at)
-		i, known := pos[op.Process]
+		i, known := idx[op.Process]
 		if !known {
 			i = len(out)
-			pos[op.Process] = i
-			seen[op.Process] = map[uint64]bool{}
+			idx[op.Process] = i
+			seen[op.Process] = map[history.Pos]bool{}
 			out = append(out, Lag{Process: op.Process, Value: op.Value, Wait: wait})
 		} else if wait > out[i].Wait {
 			out[i].Value, out[i].Wait = op.Value, wait
 		}
-		seen[op.Process][op.StreamSeq] = true
+		seen[op.Process][p] = true
 	}
 	return out
 }

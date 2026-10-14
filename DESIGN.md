@@ -368,6 +368,10 @@ Even liveness is judged by position in the history (principle 4).
 | `stall` | when the final read begins, the consumer hasn't yet received the stream's last sequence. Consumers are known from their deliveries and their `subscribe` operations, so one that received nothing is still judged | client (liveness) |
 | `phantom` | a value seen by the consumer or the final read that no producer ever invoked, or whose publish was recorded as `fail` | client or server |
 
+In a Kafka history every rule applies within each partition, with offsets, which count from 0, in
+place of stream sequences. A consumer has to reach the end of every partition the final read
+returns, and a hole in any partition counts.
+
 An `info` publish may or may not appear in the stream, and neither case is an anomaly. In v0 every
 publish error is recorded as `info` (see the field rules), so only the first half of `phantom` can
 fire until definite failures are classified.
