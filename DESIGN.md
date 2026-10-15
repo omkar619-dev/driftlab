@@ -550,7 +550,8 @@ driftlab/
 │   └── kafka.yaml
 └── scripts/
     ├── matrix.sh
-    └── kafka-calibrate.sh
+    ├── kafka-calibrate.sh
+    └── compare-nats.sh
 ```
 
 | Path | What it is |
@@ -571,6 +572,7 @@ driftlab/
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 | `scripts/kafka-calibrate.sh` | runs v1's calibration (2 franz-go versions × 2 scenarios × 3 repeats) and checks every verdict against the expected one |
+| `scripts/compare-nats.sh` | runs the eight NATS scenarios against two or more driver builds, such as a nats.go pull request and the commit it starts from, and prints their verdicts, recovery and lag side by side |
 
 ## Milestones
 
