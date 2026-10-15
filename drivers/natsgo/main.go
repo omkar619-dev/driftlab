@@ -696,8 +696,18 @@ func provenance() (client, rev string) {
 		return client, rev
 	}
 	for _, dep := range info.Deps {
-		if dep.Path == "github.com/nats-io/nats.go" {
-			client = dep.Path + "@" + dep.Version
+		if dep.Path != "github.com/nats-io/nats.go" {
+			continue
+		}
+		client = dep.Path + "@" + dep.Version
+		// A build that swaps in another copy of nats.go, such as a pull
+		// request's branch, says which: Go reports the swap separately, and
+		// the version above would still name the release it replaced.
+		if r := dep.Replace; r != nil {
+			client += " => " + r.Path
+			if r.Version != "" {
+				client += "@" + r.Version
+			}
 		}
 	}
 	dirty := false
