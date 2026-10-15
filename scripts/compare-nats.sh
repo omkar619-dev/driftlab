@@ -11,20 +11,33 @@
 # every scenario should come out clean on a correct build, and the point is
 # the side-by-side numbers. Run it on the machine that hosts nats-server and
 # toxiproxy. Each run's history and verdict land in runs/compare/.
+#
+# One run can be unlucky, so RUNS repeats every scenario, and SCENARIOS
+# picks some of the eight:
+#
+#	RUNS=5 SCENARIOS="slow-long server-kill" scripts/compare-nats.sh legacy bin/a bin/b
+#
+# Each scenario runs on every build back to back, so the rows to compare sit
+# together and a busy moment on the machine lands on both builds.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
 if [ $# -lt 2 ]; then
-	echo "usage: scripts/compare-nats.sh legacy|jetstream driver-binary..." >&2
+	echo "usage: [RUNS=n] [SCENARIOS=\"a b\"] scripts/compare-nats.sh legacy|jetstream driver-binary..." >&2
 	exit 2
 fi
 api=$1
 shift
 
+runs=${RUNS:-1}
+if ! [[ $runs =~ ^[1-9][0-9]*$ ]]; then
+	echo "RUNS must be a whole number above 0, not \"$runs\"" >&2
+	exit 2
+fi
+read -r -a scenarios <<<"${SCENARIOS:-control proxy-control slow-short slow-long net-slow net-cut server-pause server-kill}"
+
 out=runs/compare
 mkdir -p "$out"
-
-scenarios=(control proxy-control slow-short slow-long net-slow net-cut server-pause server-kill)
 
 go build -o bin/driftlab ./cmd/driftlab || exit 1
 docker compose -f deploy/compose.yaml up -d || exit 1
@@ -33,32 +46,34 @@ sleep 2 # give servers that compose just started a moment to begin listening
 # driftlab check's exit code is a position in this list.
 verdicts=(clean failed invalid "couldn't run")
 
-printf '%-28s %-13s %-12s %-18s %s\n' build scenario got recovery lag
-for bin in "$@"; do
-	build=$(basename "$bin")
+printf '%-4s %-28s %-13s %-12s %-18s %s\n' run build scenario got recovery lag
+for run in $(seq "$runs"); do
 	for scenario in "${scenarios[@]}"; do
-		name=$build-$api-$scenario
-		rm -f "$out/$name.txt"
-		# A race-detector build that finds a race exits non-zero, which
-		# shows up here as a driver error.
-		if "$bin" -api "$api" -scenario "$scenario" -grace 60s >"$out/$name.jsonl"; then
-			bin/driftlab check "$out/$name.jsonl" >"$out/$name.txt"
-			got=${verdicts[$?]}
-		else
-			got="driver error"
-		fi
+		for bin in "$@"; do
+			build=$(basename "$bin")
+			name=$build-$api-$scenario-$run
+			rm -f "$out/$name.txt"
+			# A race-detector build that finds a race exits non-zero, which
+			# shows up here as a driver error.
+			if "$bin" -api "$api" -scenario "$scenario" -grace 60s >"$out/$name.jsonl"; then
+				bin/driftlab check "$out/$name.jsonl" >"$out/$name.txt"
+				got=${verdicts[$?]}
+			else
+				got="driver error"
+			fi
 
-		# Keep the middle of "recovery consumer: caught up 13.006s after the
-		# faults ended", and the duration from "lag consumer: the longest
-		# wait from an ack to its delivery was 13.801s (value 3)". Runs
-		# without faults have neither.
-		line=$(grep '^recovery' "$out/$name.txt" 2>/dev/null)
-		recovery=${line#*: }
-		recovery=${recovery% after the faults ended}
-		line=$(grep '^lag' "$out/$name.txt" 2>/dev/null)
-		lag=${line#*was }
-		lag=${lag%% *}
+			# Keep the middle of "recovery consumer: caught up 13.006s after the
+			# faults ended", and the duration from "lag consumer: the longest
+			# wait from an ack to its delivery was 13.801s (value 3)". Runs
+			# without faults have neither.
+			line=$(grep '^recovery' "$out/$name.txt" 2>/dev/null)
+			recovery=${line#*: }
+			recovery=${recovery% after the faults ended}
+			line=$(grep '^lag' "$out/$name.txt" 2>/dev/null)
+			lag=${line#*was }
+			lag=${lag%% *}
 
-		printf '%-28s %-13s %-12s %-18s %s\n' "$build" "$scenario" "$got" "${recovery:--}" "${lag:--}"
+			printf '%-4s %-28s %-13s %-12s %-18s %s\n' "$run" "$build" "$scenario" "$got" "${recovery:--}" "${lag:--}"
+		done
 	done
 done
