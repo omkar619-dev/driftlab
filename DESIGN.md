@@ -27,12 +27,12 @@ What is *not* new, stated up front: the anomaly vocabulary (lost-write, poll-ski
 nonmonotonic-poll, nonmonotonic-send, duplicate, inconsistent-offsets) comes from Jepsen's Kafka
 workload (https://jepsen-io.github.io/jepsen/jepsen.tests.kafka.html). We reuse those names for
 the same failures on purpose, so anyone who knows Jepsen can read driftlab output without a
-glossary. The other names (stall, phantom, duplicate-delivery) are driftlab's own. `lost-write`
-is judged differently. Jepsen infers it from reads: an acked message that nobody read, although
-someone read a later offset; an acked message nobody read at all is `unseen`. driftlab checks each
-acked message against a final read of the whole log instead, so it can tell a message the log
-lost (a lost write) from one the log kept but a consumer never got (a stall or a poll-skip), and
-it also catches a message that a consumer received before the log lost it.
+glossary. The other names (stall, phantom, duplicate-delivery, nonmonotonic-copy) are driftlab's
+own. `lost-write` is judged differently. Jepsen infers it from reads: an acked message that nobody
+read, although someone read a later offset; an acked message nobody read at all is `unseen`.
+driftlab checks each acked message against a final read of the whole log instead, so it can tell
+a message the log lost (a lost write) from one the log kept but a consumer never got (a stall or a
+poll-skip), and it also catches a message that a consumer received before the log lost it.
 
 ## First principles
 
@@ -359,6 +359,21 @@ partitions directly, with no group. That should promise what the NATS ordered co
 every offset once and in order, so the v0 rules apply; each client's docs get quoted when its
 driver is written (principle 1).
 
+**Relay runs.** Some programs copy messages from one Kafka cluster to another, such as relays and
+mirrors. Testing one takes two clusters: a one-broker source, `deploy/kafka-source.yaml`, and the
+three brokers of `deploy/kafka.yaml`, which hold the copy. The writer's acks then come from the
+source and the final read is of the copy, so a position on one side says nothing about the other.
+The meta line declares such a run with `"relay":true`. `lost-write`, `duplicate` and `phantom`
+already judge by value, so they keep their meaning: every value the source acked must be in the
+copy exactly once, and nothing else may be. `inconsistent-offsets` is switched off, because it
+compares an ack's position with the final read's: after a single duplicate, every later message in
+the copy sits one offset further along, and it would report every one of them. In its place,
+`nonmonotonic-copy` checks order: in each partition of the copy, the first copies of the values
+from one source partition must sit in the order the source stored them. Repeats are left to
+`duplicate`, and values from different source partitions may mix, because the source never ordered
+them against each other. Which partition of the copy a value lands in isn't judged yet. The
+source's acks can't explain a hole in the copy, so any hole makes a relay run invalid. Recovery and
+lag aren't measured in relay runs yet, because both match acks to deliveries by position.
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -403,6 +418,9 @@ Field rules:
   once it has fully happened. Faults are declared up front instead of inferred from the nemesis's
   own events, because a driver bug that never starts a fault would log nothing, and a rule inferred
   from the log would then demand nothing.
+- `relay` appears only on the meta line, set to `true` in a run that tests a program copying
+  messages from one cluster to another. The acks then give positions in the source, and the final
+  read gives positions in the copy (see Relay runs in v1 design).
 - A consumer records `subscribe` (an `invoke`, then an `ok`) when it starts. Without it, a consumer
   that received nothing would leave no trace at all, and the checker would judge it clean.
 - The consumer also records `disconnect` (an `info`, with the error) when its connection drops,
@@ -432,10 +450,14 @@ Even liveness is judged by position in the history (principle 4).
 | `duplicate` | one value at more than one position in the final read: one write stored twice | client (producer) or server |
 | `inconsistent-offsets` | an ack or a delivery places a value at a position where the final read found a different one | client or server |
 | `nonmonotonic-send` | one producer's acks place a send at or before the send it made just before, in the same partition, taking sends in the order the producer made them | client (producer) or server |
+| `nonmonotonic-copy` | relay runs only: in one partition of the copy, the first copy of a value sits after the first copy of a value that the source stored later, in the same source partition | the program that copies |
 
 In a Kafka history every rule applies within each partition, with offsets, which count from 0, in
 place of stream sequences. A consumer has to reach the end of every partition the final read
 returns, and a hole in any partition counts.
+In a relay run (see Relay runs in v1 design), `nonmonotonic-copy` takes the place of
+`inconsistent-offsets`, the source's acks can't explain a hole in the copy, and recovery and lag
+aren't measured.
 
 An `info` publish may or may not appear in the stream, and neither case is an anomaly. In v0 every
 publish error is recorded as `info` (see the field rules), so only the first half of `phantom` can

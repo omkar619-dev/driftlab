@@ -38,6 +38,7 @@ const (
 	Duplicate           Kind = "duplicate"
 	InconsistentOffsets Kind = "inconsistent-offsets"
 	NonmonotonicSend    Kind = "nonmonotonic-send"
+	NonmonotonicCopy    Kind = "nonmonotonic-copy"
 )
 
 // Anomaly is one broken promise, with the history indexes that prove it.
@@ -112,19 +113,32 @@ func (r Result) Lines() []string {
 // publish explains makes the run invalid (DESIGN.md principle 5).
 func Check(h *history.History) Result {
 	n := numbering{kafka: h.Kafka}
+	relay := h.Meta.Relay
 	final := readFinal(h.Ops)
 	r := Result{Anomalies: checkOrdered(h.Ops, n)}
 	r.Anomalies = append(r.Anomalies, checkSends(h.Ops, n)...)
 	if final != nil {
 		r.Anomalies = append(r.Anomalies, checkStalls(h.Ops, final, n)...)
-		r.Anomalies = append(r.Anomalies, checkLostWrites(h.Ops, final, n)...)
-		r.Anomalies = append(r.Anomalies, checkInconsistentOffsets(h.Ops, final, n)...)
+		r.Anomalies = append(r.Anomalies, checkLostWrites(h.Ops, final, n, relay)...)
+		// A relay run's acks give positions in the source, and its final read
+		// gives positions in the copy, so the two can't be compared. The
+		// copy's order is checked instead.
+		if relay {
+			r.Anomalies = append(r.Anomalies, checkCopies(h.Ops, final, n)...)
+		} else {
+			r.Anomalies = append(r.Anomalies, checkInconsistentOffsets(h.Ops, final, n)...)
+		}
 		r.Anomalies = append(r.Anomalies, checkDuplicates(h.Ops, final, n)...)
 	}
 	r.Anomalies = append(r.Anomalies, checkPhantoms(h.Ops)...)
-	r.Reasons = append(checkFinalRead(h.Ops, final, n), checkFaults(h)...)
-	r.Recoveries = measureRecovery(h.Ops, n)
-	r.Lags = measureLag(h.Ops)
+	r.Reasons = append(checkFinalRead(h.Ops, final, n, relay), checkFaults(h)...)
+	// Both measurements match acks to deliveries by position, so relay runs
+	// go without them until they record deliveries that can be matched by
+	// value.
+	if !relay {
+		r.Recoveries = measureRecovery(h.Ops, n)
+		r.Lags = measureLag(h.Ops)
+	}
 	for _, op := range h.Ops {
 		if op.F != history.Publish {
 			continue
@@ -207,13 +221,16 @@ func (f *finalRead) partitions() []uint32 {
 	return slices.Sorted(maps.Keys(f.tails))
 }
 
-func checkFinalRead(ops []history.Op, final *finalRead, n numbering) []string {
+func checkFinalRead(ops []history.Op, final *finalRead, n numbering, relay bool) []string {
 	if final == nil {
 		return []string{"no final read, so the stream's contents are unknown"}
 	}
+	// An ack explains a hole at its own position. A relay run's acks give
+	// positions in the source, which say nothing about the copy, so none of
+	// them explains a hole in it.
 	acked := map[history.Pos]bool{}
 	for _, op := range ops {
-		if op.F == history.Publish && op.Type == history.OK {
+		if op.F == history.Publish && op.Type == history.OK && !relay {
 			p, _ := op.Pos()
 			acked[p] = true
 		}
@@ -447,19 +464,24 @@ func checkStalls(ops []history.Op, final *finalRead, n numbering) []Anomaly {
 // checkLostWrites reports acked publishes whose values are missing from the
 // final read. Jepsen infers lost writes from what consumers read instead, so
 // it can't see a message that a consumer received before the log lost it.
-// Checking against the final read can.
-func checkLostWrites(ops []history.Op, final *finalRead, n numbering) []Anomaly {
+// Checking against the final read can. In a relay run the ack is the
+// source's and the final read is of the copy, and the message says so.
+func checkLostWrites(ops []history.Op, final *finalRead, n numbering, relay bool) []Anomaly {
 	var out []Anomaly
 	for _, op := range ops {
 		if op.F != history.Publish || op.Type != history.OK || final.values[op.Value] {
 			continue
 		}
 		p, _ := op.Pos()
+		msg := fmt.Sprintf("value %d was acked at %s but is missing from the final read", op.Value, n.at(p))
+		if relay {
+			msg = fmt.Sprintf("value %d was acked by the source at %s but is missing from the copy", op.Value, n.at(p))
+		}
 		out = append(out, Anomaly{
 			Kind:    LostWrite,
 			Process: op.Process,
 			Ops:     []int{op.Index},
-			Msg:     fmt.Sprintf("value %d was acked at %s but is missing from the final read", op.Value, n.at(p)),
+			Msg:     msg,
 		})
 	}
 	return out
@@ -490,6 +512,61 @@ func checkInconsistentOffsets(ops []history.Op, final *finalRead, n numbering) [
 			Ops:     []int{op.Index, i},
 			Msg:     fmt.Sprintf("value %d was %s %s, but the final read has value %d there", op.Value, verb, n.at(p), ops[i].Value),
 		})
+	}
+	return out
+}
+
+// copied is the first copy of a value in a relay run's copy: where the copy
+// stores it, and where the source did.
+type copied struct {
+	value    uint64
+	at, from history.Pos
+	op       int // history index of the final-read record that found it
+}
+
+// checkCopies reports, in a relay run, a value that the copy stores after a
+// value the source stored later. The acks say where the source stored each
+// value. Walking each partition of the copy from its first offset, the first
+// copies of the values from one source partition must sit in the order the
+// source stored them. A second copy of a value is left to checkDuplicates,
+// and values from different source partitions may mix, because the source
+// never ordered them against each other.
+func checkCopies(ops []history.Op, final *finalRead, n numbering) []Anomaly {
+	source := map[uint64]history.Pos{} // value -> where the source stored it, from its ack
+	for _, op := range ops {
+		if op.F == history.Publish && op.Type == history.OK {
+			p, _ := op.Pos()
+			source[op.Value] = p
+		}
+	}
+	var out []Anomaly
+	seen := map[uint64]bool{} // values whose first copy has been found
+	for _, part := range final.partitions() {
+		latest := map[uint32]copied{} // source partition -> its first copy stored latest in the source so far
+		for q := n.first(); q <= final.tails[part].offset; q++ {
+			at := history.Pos{Partition: part, Offset: q}
+			i, ok := final.at[at]
+			if !ok {
+				continue
+			}
+			v := ops[i].Value
+			from, acked := source[v]
+			if !acked || seen[v] {
+				continue
+			}
+			seen[v] = true
+			prev, ok := latest[from.Partition]
+			if ok && from.Offset < prev.from.Offset {
+				out = append(out, Anomaly{
+					Kind:    NonmonotonicCopy,
+					Process: ops[i].Process,
+					Ops:     []int{prev.op, i},
+					Msg:     fmt.Sprintf("value %d sits after value %d in the copy (%s, after %s), but before it in the source (%s, before %s)", v, prev.value, n.at(at), n.at(prev.at), n.at(from), n.at(prev.from)),
+				})
+				continue
+			}
+			latest[from.Partition] = copied{value: v, at: at, from: from, op: i}
+		}
 	}
 	return out
 }

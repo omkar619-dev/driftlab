@@ -121,6 +121,23 @@ func TestCheckFixtures(t *testing.T) {
 			"verdict failed, 0 of 3 publishes unknown",
 			"nonmonotonic-send producer ops=[4 5]: value 3 was sent after value 2 but acked at partition 0 offset 1, not after value 2 at partition 0 offset 2",
 		}},
+		{"relay-clean.jsonl", []string{
+			"verdict clean, 0 of 4 publishes unknown",
+		}},
+		{"relay-collapsed.jsonl", []string{
+			"verdict clean, 0 of 4 publishes unknown",
+		}},
+		{"relay-restart.jsonl", []string{
+			"verdict failed, 0 of 8 publishes unknown",
+			"lost-write producer ops=[9]: value 5 was acked by the source at partition 0 offset 4 but is missing from the copy",
+			"lost-write producer ops=[11]: value 6 was acked by the source at partition 0 offset 5 but is missing from the copy",
+			"duplicate final-read ops=[17 19]: value 2 is stored at 2 positions: partition 0 offset 1, partition 0 offset 3",
+			"duplicate final-read ops=[18 20]: value 3 is stored at 2 positions: partition 0 offset 2, partition 0 offset 4",
+		}},
+		{"relay-reordered.jsonl", []string{
+			"verdict failed, 0 of 4 publishes unknown",
+			"nonmonotonic-copy final-read ops=[9 10]: value 2 sits after value 3 in the copy (partition 0 offset 2, after partition 0 offset 1), but before it in the source (partition 0 offset 1, before partition 0 offset 2)",
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.file, func(t *testing.T) {

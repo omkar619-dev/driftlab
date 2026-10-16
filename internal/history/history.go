@@ -39,6 +39,9 @@ const metaType = "meta"
 
 // Meta is a history's first line: what produced the run. Faults lists the
 // faults the scenario set out to inject, whether or not they happened.
+// Relay is true when the run tests a program that copies messages from one
+// cluster to another: the publishes are acked by the source, and the final
+// read is of the copy.
 type Meta struct {
 	Driver   string          `json:"driver"`
 	Client   string          `json:"client"`
@@ -47,6 +50,7 @@ type Meta struct {
 	Scenario string          `json:"scenario"`
 	Faults   []string        `json:"faults"`
 	Params   json.RawMessage `json:"params"`
+	Relay    bool            `json:"relay"`
 	Driftlab string          `json:"driftlab"`
 }
 
