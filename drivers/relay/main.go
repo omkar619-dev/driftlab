@@ -35,27 +35,32 @@ import (
 
 // scenario describes one experiment. A pause above zero freezes that many of
 // the brokers holding the copy's other replicas, halfway through the writes,
-// for hold. With crash set, the program is killed and started again during
+// for hold, and the copy must then stand still for stall to count as
+// stalled. With crash set, the program is killed and started again during
 // the freeze, and once the copy has caught up it is restarted politely
 // before a last batch of writes.
 type scenario struct {
 	pause int
 	hold  time.Duration
+	stall time.Duration
 	crash bool
 }
 
 // relay-pause freezes both of the copy's follower brokers for 25 seconds,
-// as drivers/franzgo's followers-pause does: longer than a produce timeout
-// of a few seconds, and shorter than the 30 seconds after which a leader
-// drops a follower that has stopped fetching. relay-restart freezes only
-// one, for 35 seconds, so the cluster keeps a controller quorum and a
-// program started during the freeze can still reach it, while the leader
-// keeps waiting for the frozen follower until it drops it, about 30 seconds
-// in. relay-control is the same run without any fault.
+// as drivers/franzgo's followers-pause does. With two of the three frozen
+// there is no controller quorum, so nothing can take them out of the
+// in-sync set, and the copy stands still for the whole freeze.
+// relay-restart freezes only one, so a program started during the freeze
+// can still reach the cluster. That costs time: the controller fences the
+// frozen broker once its session runs out, about 9 seconds in, which takes
+// it out of the in-sync set and lets the copy move again. So the stall
+// only has to last 2 seconds before the driver crashes the program, and
+// the new one gets a few seconds in which the copy's end is stale.
+// relay-control is the same run without any fault.
 var scenarios = map[string]scenario{
 	"relay-control": {},
-	"relay-pause":   {pause: 2, hold: 25 * time.Second},
-	"relay-restart": {pause: 1, hold: 35 * time.Second, crash: true},
+	"relay-pause":   {pause: 2, hold: 25 * time.Second, stall: 10 * time.Second},
+	"relay-restart": {pause: 1, hold: 25 * time.Second, stall: 2 * time.Second, crash: true},
 }
 
 type config struct {
@@ -87,7 +92,7 @@ func main() {
 	flag.DurationVar(&c.interval, "interval", 20*time.Millisecond, "the pause after each write")
 	flag.DurationVar(&c.grace, "grace", 60*time.Second, "how long the copy gets to catch up with the source")
 	flag.DurationVar(&c.hold, "hold", 0, "how long the followers stay frozen; 0 keeps the scenario's own")
-	flag.DurationVar(&c.stall, "stall", 10*time.Second, "how long the copy's end must stay put during the freeze, with the source ahead, to count as stalled")
+	flag.DurationVar(&c.stall, "stall", 0, "how long the copy's end must stay put during the freeze, with the source ahead, to count as stalled; 0 keeps the scenario's own")
 	flag.DurationVar(&c.stop, "stop", 30*time.Second, "how long the program gets to exit after SIGTERM before it is killed")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
@@ -113,6 +118,9 @@ func run(c config, out io.Writer) error {
 	}
 	if c.hold > 0 {
 		sc.hold = c.hold
+	}
+	if c.stall > 0 {
+		sc.stall = c.stall
 	}
 	// Every program the run starts writes to the same log, one after the
 	// other, so it starts empty.
@@ -178,7 +186,7 @@ func run(c config, out io.Writer) error {
 			if err := waitCaughtUp(ctx, src, dst, topic, c.grace); err != nil {
 				return fail(fmt.Errorf("before the freeze: %w", err))
 			}
-			if fz, err = startPause(ctx, src, dst, rec, topic, sc.pause, sc.hold, c.stall); err != nil {
+			if fz, err = startPause(ctx, src, dst, rec, topic, sc.pause, sc.hold, sc.stall); err != nil {
 				return fail(err)
 			}
 		}
@@ -470,7 +478,8 @@ type freeze struct {
 // still in the in-sync set, the leader stores each record but can't count it
 // as copied, so the copy's end stands still. With two frozen there is also no
 // controller quorum, so nothing takes them out of the set; with one frozen,
-// the leader drops it about 30 seconds in. Both faults need evidence of their
+// the controller fences it once its session runs out, about 9 seconds in,
+// and that takes it out of the set. Both faults need evidence of their
 // own. The freeze only counts if docker shows every frozen follower paused,
 // and the stall only if the copy's end then stayed put, with the source ahead
 // of it, so a freeze that missed the copy makes the run invalid instead of
@@ -777,6 +786,7 @@ type params struct {
 	Topic    string `json:"topic"`
 	Witness  string `json:"witness"`
 	Hold     string `json:"hold,omitempty"`
+	Stall    string `json:"stall,omitempty"`
 	Frozen   int    `json:"frozen,omitempty"`
 	Again    uint64 `json:"again,omitempty"`
 }
@@ -803,6 +813,7 @@ func newMeta(c config, sc scenario, topic string) metaLine {
 	if sc.pause > 0 {
 		m.Faults = []string{"pause", "stall"}
 		m.Params.Hold = sc.hold.String()
+		m.Params.Stall = sc.stall.String()
 		m.Params.Frozen = sc.pause
 	}
 	if sc.crash {

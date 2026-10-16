@@ -388,15 +388,17 @@ declares two faults: the freeze, with docker's word that both brokers were pause
 which completes only if the copy's end stayed put for 10 seconds while the source was ahead of it.
 A freeze that missed the copy makes the run invalid rather than clean. `relay-control` is the same
 run without the freeze.
-`relay-restart` freezes only one of the two followers, for 35 seconds. The leader still can't count
-anything as copied, because the frozen follower stays in the in-sync set until the leader drops it,
-about 30 seconds in, but the cluster keeps its controller quorum, so a program started during the
-freeze can still reach it. Once the stall is seen, the driver kills the program with SIGKILL, as a
-crash would, and starts it again, as a supervisor would, starting it once more whenever it exits
-within three seconds. That third fault, the crash, only counts if a new program then runs for three
-seconds while the copy's end still stands where it stalled, so it must have started from that stale
-end. After the freeze, once the copy has caught up, the driver restarts the program politely and
-writes half as many values again, which shows whether the restart skips any.
+
+`relay-restart` freezes only one of the two followers, for 25 seconds. The cluster keeps its
+controller quorum, so a program started during the freeze can still reach it, but the controller
+also fences the frozen broker once its session runs out, about 9 seconds in, and that takes it out
+of the in-sync set. Until then the leader can't count anything as copied, so this stall only has to
+last 2 seconds. Then the driver kills the program with SIGKILL, as a crash would, and starts it
+again, as a supervisor would, starting it once more whenever it exits within three seconds. That
+third fault, the crash, only counts if a new program then runs for three seconds while the copy's
+end still stands where it stalled, so it must have started from that stale end. After the freeze,
+once the copy has caught up, the driver restarts the program politely and writes half as many
+values again, which shows whether the restart skips any.
 
 ## History format (the wire contract)
 
@@ -617,7 +619,7 @@ driftlab/
 | `drivers/franzgo/` | a separate module that talks to Kafka through franz-go and writes a history to stdout |
 | `drivers/franzgo/go.mod` | pins franz-go v1.20.7 (the release that fixed issue 1217) |
 | `drivers/franzgo/v1.20.6.mod` | pins franz-go v1.20.6 (the last release before the fix), used via `-modfile` |
-| `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command, writes into the source, can freeze the copy's cluster, and reads the copy back |
+| `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command, writes into the source, can freeze the copy's cluster and crash the program meanwhile, and reads the copy back |
 | `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
