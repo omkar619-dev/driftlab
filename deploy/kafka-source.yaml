@@ -1,0 +1,47 @@
+# One Kafka broker as a second, separate cluster, for testing programs that
+# copy messages from one cluster to another, such as relays and mirrors. A
+# run writes into this cluster, and the program copies into the three
+# brokers of kafka.yaml, so a fault aimed at those three never touches the
+# source. Like kafka.yaml, it lives in a file and project of its own
+# (DESIGN.md principle 8) and uses the same pinned image.
+#
+# The one container is the broker and the only KRaft controller. Its data
+# lives inside the container, so `docker compose down` gives a fresh cluster.
+name: driftlab-kafka-source
+
+services:
+  kafka-src:
+    image: apache/kafka:4.3.1
+    hostname: kafka-src
+    container_name: kafka-src
+    # Localhost only, like kafka.yaml, and on a port of its own so the two
+    # clusters can't be mixed up.
+    ports:
+      - "127.0.0.1:59092:59092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-src:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # A single broker has no other brokers to talk to, so one client
+      # listener does both jobs: programs on this machine use it, and so does
+      # the broker for its own requests.
+      KAFKA_LISTENERS: CONTROLLER://:9093,EXTERNAL://:59092
+      KAFKA_ADVERTISED_LISTENERS: EXTERNAL://127.0.0.1:59092
+      KAFKA_INTER_BROKER_LISTENER_NAME: EXTERNAL
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # A different cluster from kafka.yaml's, so a different id.
+      CLUSTER_ID: DpiaYYB2TemYgKJc9ZsNfA
+      # One broker can only keep one copy of anything.
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      # Runs create their topics explicitly, as in kafka.yaml.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
