@@ -374,6 +374,20 @@ from one source partition must sit in the order the source stored them. Repeats 
 them against each other. Which partition of the copy a value lands in isn't judged yet. The
 source's acks can't explain a hole in the copy, so any hole makes a relay run invalid. Recovery and
 lag aren't measured in relay runs yet, because both match acks to deliveries by position.
+
+**The relay witness.** `drivers/relay` treats the program under test as a black box. It creates
+the same fresh one-partition topic on both clusters, starts the program with a command it is given
+plus the two topic names, and writes numbered values into the source at a steady pace, each acked
+by the source. Its own reads and writes use franz-go v1.20.7, whatever the program under test
+links, so the witness is never the thing being tested. Once the copy has caught up, or a grace
+window has passed, it stops the program with SIGTERM, as an operator would, and kills it if it is
+still running 30 seconds later, which the history records. Then it reads the copy back. In
+`relay-pause`, once the copy has caught up with the first half of the writes, it freezes the two
+brokers that hold the copy's other replicas for 25 seconds, as `followers-pause` does. That run
+declares two faults: the freeze, with docker's word that both brokers were paused, and a stall,
+which completes only if the copy's end stayed put for 10 seconds while the source was ahead of it.
+A freeze that missed the copy makes the run invalid rather than clean. `relay-control` is the same
+run without the freeze.
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -564,9 +578,11 @@ driftlab/
 │   │   ├── go.mod
 │   │   ├── v1.53.1.mod
 │   │   └── repro2180/
-│   └── franzgo/
-│       ├── go.mod
-│       └── v1.20.6.mod
+│   ├── franzgo/
+│   │   ├── go.mod
+│   │   └── v1.20.6.mod
+│   └── relay/
+│       └── go.mod
 ├── deploy/
 │   ├── compose.yaml
 │   ├── kafka.yaml
@@ -591,6 +607,8 @@ driftlab/
 | `drivers/franzgo/` | a separate module that talks to Kafka through franz-go and writes a history to stdout |
 | `drivers/franzgo/go.mod` | pins franz-go v1.20.7 (the release that fixed issue 1217) |
 | `drivers/franzgo/v1.20.6.mod` | pins franz-go v1.20.6 (the last release before the fix), used via `-modfile` |
+| `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command, writes into the source, can freeze the copy's cluster, and reads the copy back |
+| `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `deploy/kafka-source.yaml` | a one-broker Kafka cluster in a compose project of its own: the source for programs that copy messages between two clusters |
