@@ -388,6 +388,16 @@ declares two faults: the freeze, with docker's word that both brokers were pause
 which completes only if the copy's end stayed put for 10 seconds while the source was ahead of it.
 A freeze that missed the copy makes the run invalid rather than clean. `relay-control` is the same
 run without the freeze.
+`relay-restart` freezes only one of the two followers, for 35 seconds. The leader still can't count
+anything as copied, because the frozen follower stays in the in-sync set until the leader drops it,
+about 30 seconds in, but the cluster keeps its controller quorum, so a program started during the
+freeze can still reach it. Once the stall is seen, the driver kills the program with SIGKILL, as a
+crash would, and starts it again, as a supervisor would, starting it once more whenever it exits
+within three seconds. That third fault, the crash, only counts if a new program then runs for three
+seconds while the copy's end still stands where it stalled, so it must have started from that stale
+end. After the freeze, once the copy has caught up, the driver restarts the program politely and
+writes half as many values again, which shows whether the restart skips any.
+
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
