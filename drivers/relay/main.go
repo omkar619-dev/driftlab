@@ -386,7 +386,7 @@ func startPause(ctx context.Context, src, dst *kgo.Client, rec *recorder, topic 
 	watched := make(chan struct{})
 	go func() {
 		defer close(watched)
-		watchStall(ctx, src, dst, rec, topic, stall, stop)
+		watchStall(ctx, src, dst, leader, rec, topic, stall, stop)
 	}()
 	return func() error {
 		time.Sleep(hold)
@@ -410,22 +410,29 @@ func startPause(ctx context.Context, src, dst *kgo.Client, rec *recorder, topic 
 // watchStall records the stall's ok once the copy's end offset has stayed
 // put for stall while the source's end was ahead of it, checking every 250
 // milliseconds until stop is closed. A copy whose end doesn't move while
-// the source has more for it is stuck, not idle.
-func watchStall(ctx context.Context, src, dst *kgo.Client, rec *recorder, topic string, stall time.Duration, stop <-chan struct{}) {
+// the source has more for it is stuck, not idle. If stop comes first, it
+// records what it saw instead, so a run that comes out invalid shows why.
+func watchStall(ctx context.Context, src, dst *kgo.Client, leader int32, rec *recorder, topic string, stall time.Duration, stop <-chan struct{}) {
 	last := int64(-1)
-	since := time.Now()
+	var since time.Time
+	var reads, fails int
+	var lastErr string
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	for {
 		select {
 		case <-stop:
+			rec.op(op{Process: "nemesis", Type: "info", F: "stall", Error: "the copy's end never stayed put long enough", Detail: map[string]any{"reads": reads, "failed_reads": fails, "last_error": lastErr, "target_end": last}})
 			return
 		case <-tick.C:
 		}
-		d, err := endOf(ctx, dst, topic)
+		d, err := leaderEnd(ctx, dst, leader, topic)
 		if err != nil {
+			fails++
+			lastErr = err.Error()
 			continue
 		}
+		reads++
 		if d != last {
 			last, since = d, time.Now()
 			continue
@@ -440,6 +447,36 @@ func watchStall(ctx context.Context, src, dst *kgo.Client, rec *recorder, topic 
 		rec.op(op{Process: "nemesis", Type: "ok", F: "stall", Detail: map[string]any{"source_end": s, "target_end": d, "for": stall.String()}})
 		return
 	}
+}
+
+// leaderEnd asks the copy's leader directly where partition 0 ends. The
+// usual route can first ask a broker picked at random for metadata, and
+// during the freeze two of the three brokers don't answer. Asking the
+// leader needs no lookup. Like endOf, it gives the request two seconds.
+func leaderEnd(ctx context.Context, cl *kgo.Client, leader int32, topic string) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req := kmsg.NewPtrListOffsetsRequest()
+	t := kmsg.NewListOffsetsRequestTopic()
+	t.Topic = topic
+	tp := kmsg.NewListOffsetsRequestTopicPartition()
+	tp.Partition = 0
+	tp.Timestamp = -1 // -1 asks for the latest offset
+	t.Partitions = append(t.Partitions, tp)
+	req.Topics = append(req.Topics, t)
+	resp, err := cl.Broker(int(leader)).Request(ctx, req)
+	if err != nil {
+		return 0, err
+	}
+	lr, ok := resp.(*kmsg.ListOffsetsResponse)
+	if !ok || len(lr.Topics) != 1 || len(lr.Topics[0].Partitions) != 1 {
+		return 0, fmt.Errorf("broker %d gave an unexpected answer about where %s ends", leader, topic)
+	}
+	rp := lr.Topics[0].Partitions[0]
+	if err := kerr.ErrorForCode(rp.ErrorCode); err != nil {
+		return 0, err
+	}
+	return rp.Offset, nil
 }
 
 // followersOf asks which broker leads partition 0 of the topic, and which
