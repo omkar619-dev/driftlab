@@ -72,16 +72,17 @@ var scenarios = map[string]scenario{
 }
 
 type config struct {
-	url       string
-	helperURL string
-	toxiproxy string
-	container string
-	scenario  string
-	api       string
-	n         uint64
-	pending   int
-	grace     time.Duration
-	hold      time.Duration
+	url             string
+	helperURL       string
+	toxiproxy       string
+	container       string
+	scenario        string
+	api             string
+	n               uint64
+	pending         int
+	grace           time.Duration
+	hold            time.Duration
+	blockDisconnect time.Duration
 }
 
 func main() {
@@ -96,6 +97,7 @@ func main() {
 	flag.IntVar(&c.pending, "pending", 20, "the consumer's tray size during a stall, in messages")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the consumer gets to catch up before the final read")
 	flag.DurationVar(&c.hold, "hold", 0, "how long a network or server fault lasts; 0 keeps the scenario's own")
+	flag.DurationVar(&c.blockDisconnect, "block-disconnect", 0, "how long the consumer's disconnect handler blocks after it records a drop, as a slow application handler would; 0 returns at once")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "natsdriver:", err)
@@ -170,7 +172,9 @@ func run(c config, out io.Writer) error {
 // them, so the connection gets an error handler that records them. A slow
 // consumer error is also the proof that the overflow fault happened: the
 // client's pending tray filled up and it dropped messages. The connection
-// also records when it drops and when it comes back.
+// also records when it drops and when it comes back, and with
+// -block-disconnect its disconnect handler then blocks, the way a slow
+// application handler would.
 func connectHelper(c config, sc scenario, rec *recorder) (*nats.Conn, error) {
 	url := c.url
 	if sc.proxy {
@@ -193,6 +197,10 @@ func connectHelper(c config, sc scenario, rec *recorder) (*nats.Conn, error) {
 		// Close reports a nil error; only a dropped connection is news.
 		if err != nil {
 			rec.op(op{Process: "consumer", Type: "info", F: "disconnect", Error: err.Error()})
+			// -block-disconnect plays a slow application handler; 0 doesn't
+			// sleep. nats.go runs a connection's callbacks one at a time,
+			// so anything it queues behind this one waits too.
+			time.Sleep(c.blockDisconnect)
 		}
 	}
 	onReconnect := func(_ *nats.Conn) {
@@ -594,12 +602,13 @@ type metaLine struct {
 }
 
 type params struct {
-	N           uint64 `json:"n"`
-	PendingMsgs int    `json:"pending_msgs,omitempty"`
-	Stall       string `json:"stall,omitempty"`
-	Via         string `json:"via,omitempty"`
-	Hold        string `json:"hold,omitempty"`
-	Latency     string `json:"latency,omitempty"`
+	N               uint64 `json:"n"`
+	PendingMsgs     int    `json:"pending_msgs,omitempty"`
+	Stall           string `json:"stall,omitempty"`
+	Via             string `json:"via,omitempty"`
+	Hold            string `json:"hold,omitempty"`
+	Latency         string `json:"latency,omitempty"`
+	BlockDisconnect string `json:"block_disconnect,omitempty"`
 }
 
 // newMeta describes the run. A stall scenario declares the stall, and for
@@ -607,7 +616,8 @@ type params struct {
 // server scenario declares its fault (slow, cut, pause or kill) and how
 // long it lasts. If a declared fault never happens, the checker calls the
 // run invalid instead of clean. A proxy scenario says its consumer's line
-// ran through toxiproxy.
+// ran through toxiproxy, and -block-disconnect says how long the consumer's
+// disconnect handler blocked.
 func newMeta(server string, c config, sc scenario) metaLine {
 	client, rev := provenance()
 	m := metaLine{
@@ -621,6 +631,9 @@ func newMeta(server string, c config, sc scenario) metaLine {
 	}
 	if sc.consumer {
 		m.API = c.api
+		if c.blockDisconnect > 0 {
+			m.Params.BlockDisconnect = c.blockDisconnect.String()
+		}
 	}
 	if sc.proxy {
 		m.Params.Via = "toxiproxy"

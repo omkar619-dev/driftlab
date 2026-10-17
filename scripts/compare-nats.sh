@@ -17,13 +17,18 @@
 #
 #	RUNS=5 SCENARIOS="slow-long server-kill" scripts/compare-nats.sh legacy bin/a bin/b
 #
+# ARGS adds driver flags to every run, and its letters and digits to every
+# file name, so those runs don't overwrite plain ones:
+#
+#	ARGS="-block-disconnect 30s" scripts/compare-nats.sh legacy bin/a bin/b
+#
 # Each scenario runs on every build back to back, so the rows to compare sit
 # together and a busy moment on the machine lands on both builds.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
 if [ $# -lt 2 ]; then
-	echo "usage: [RUNS=n] [SCENARIOS=\"a b\"] scripts/compare-nats.sh legacy|jetstream driver-binary..." >&2
+	echo "usage: [RUNS=n] [SCENARIOS=\"a b\"] [ARGS=\"-flag value\"] scripts/compare-nats.sh legacy|jetstream driver-binary..." >&2
 	exit 2
 fi
 api=$1
@@ -35,6 +40,8 @@ if ! [[ $runs =~ ^[1-9][0-9]*$ ]]; then
 	exit 2
 fi
 read -r -a scenarios <<<"${SCENARIOS:-control proxy-control slow-short slow-long net-slow net-cut server-pause server-kill}"
+read -r -a extra <<<"${ARGS:-}"
+tag=$(printf '%s' "${ARGS:-}" | tr -cd '[:alnum:]')
 
 out=runs/compare
 mkdir -p "$out"
@@ -46,16 +53,21 @@ sleep 2 # give servers that compose just started a moment to begin listening
 # driftlab check's exit code is a position in this list.
 verdicts=(clean failed invalid "couldn't run")
 
+if [ -n "$tag" ]; then
+	echo "every run adds: $ARGS"
+fi
 printf '%-4s %-28s %-13s %-12s %-18s %s\n' run build scenario got recovery lag
 for run in $(seq "$runs"); do
 	for scenario in "${scenarios[@]}"; do
 		for bin in "$@"; do
 			build=$(basename "$bin")
-			name=$build-$api-$scenario-$run
+			name=$build-$api-$scenario${tag:+-$tag}-$run
 			rm -f "$out/$name.txt"
 			# A race-detector build that finds a race exits non-zero, which
-			# shows up here as a driver error.
-			if "$bin" -api "$api" -scenario "$scenario" -grace 60s >"$out/$name.jsonl"; then
+			# shows up here as a driver error. The ARGS flags go in through a
+			# form that expands to nothing when there are none, because under
+			# set -u, bash before 4.4 calls an empty array unbound.
+			if "$bin" -api "$api" -scenario "$scenario" -grace 60s ${extra[@]+"${extra[@]}"} >"$out/$name.jsonl"; then
 				bin/driftlab check "$out/$name.jsonl" >"$out/$name.txt"
 				got=${verdicts[$?]}
 			else

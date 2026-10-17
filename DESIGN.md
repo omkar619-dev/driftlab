@@ -451,7 +451,10 @@ Field rules:
   that received nothing would leave no trace at all, and the checker would judge it clean.
 - The consumer also records `disconnect` (an `info`, with the error) when its connection drops,
   and `reconnect` when it comes back. They show when the client noticed a network or server
-  fault; the checker ignores them.
+  fault; the checker ignores them. With `-block-disconnect`, the disconnect handler then blocks
+  for that long, the way a slow application handler would, and the meta line's params record it
+  as `block_disconnect`. nats.go runs a connection's callbacks one at a time, so this shows
+  whether the client's recovery waits behind them.
 - `time_ns` is monotonic time since the driver started, not wall-clock time. That follows from
   principle 4. Once one run has several processes, the harness will stamp receive times instead.
 - Unknown fields are ignored, so the format can grow.
@@ -626,7 +629,7 @@ driftlab/
 | `deploy/kafka-source.yaml` | a one-broker Kafka cluster in a compose project of its own: the source for programs that copy messages between two clusters |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 | `scripts/kafka-calibrate.sh` | runs v1's calibration (2 franz-go versions × 2 scenarios × 3 repeats) and checks every verdict against the expected one |
-| `scripts/compare-nats.sh` | runs the eight NATS scenarios against two or more driver builds, such as a nats.go pull request and the commit it starts from, and prints their verdicts, recovery and lag side by side |
+| `scripts/compare-nats.sh` | runs the eight NATS scenarios against two or more driver builds, such as a nats.go pull request and the commit it starts from, and prints their verdicts, recovery and lag side by side; `RUNS` repeats them, `SCENARIOS` picks some, and `ARGS` adds driver flags such as `-block-disconnect` |
 
 ## Milestones
 
