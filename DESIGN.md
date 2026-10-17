@@ -454,6 +454,13 @@ commits `6604a58` to `3ca91b6`:
   kaf-relay gives that call 1 second, and the program exited until the supervisor started it
   again. A cut follower keeps answering, so a restart reads the end at once, and the window lasts
   all 25 seconds.
+- **A franz-go request can wait out another request's dial, past its own deadline.** Each broker
+  handles its requests one at a time, and a request waiting its turn doesn't look at its context,
+  which is most likely why the 1-second call above took 10 seconds: an earlier request was still
+  dialing the frozen broker. `drivers/franzgo/repro1505` shows it with no broker at all. On its
+  own, a request with a 1-second deadline returns after 1 second; sent 200 milliseconds after one
+  with a 15-second deadline whose dial hangs, it returns after 9.8 seconds, when that dial gives
+  up. The same on v1.20.6 and v1.22.2. Reported as https://github.com/twmb/franz-go/issues/1505.
 - **kaf-relay survives franz-go issue 1217.** In `relay-pause` the trigger fired on v1.20.6, with
   three timed-out writes per run, but kaf-relay retries exactly the records that failed, and
   v1.20.6 rewinds a failed batch's sequence numbers, so the retry carried the same numbers and the
@@ -671,7 +678,8 @@ driftlab/
 │   │   └── repro2180/
 │   ├── franzgo/
 │   │   ├── go.mod
-│   │   └── v1.20.6.mod
+│   │   ├── v1.20.6.mod
+│   │   └── repro1505/
 │   └── relay/
 │       └── go.mod
 ├── deploy/
@@ -699,6 +707,7 @@ driftlab/
 | `drivers/franzgo/` | a separate module that talks to Kafka through franz-go and writes a history to stdout |
 | `drivers/franzgo/go.mod` | pins franz-go v1.20.7 (the release that fixed issue 1217) |
 | `drivers/franzgo/v1.20.6.mod` | pins franz-go v1.20.6 (the last release before the fix), used via `-modfile` |
+| `drivers/franzgo/repro1505/` | a standalone reproducer for franz-go issue 1505, which needs no broker at all |
 | `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command and keeps it running as a supervisor would, writes into the source, can freeze or cut the copy's followers and crash the program meanwhile, and reads the copy back |
 | `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
@@ -727,8 +736,8 @@ driftlab/
   `deploy/kafka.yaml`, explored by hand, and the decisions in v1 design. First exit reached on
   2026-10-14: the calibration pair reproduces, with franz-go v1.20.6 failing and v1.20.7 passing
   in all 12 runs (see v1 calibration results). The relay driver followed, and its first target,
-  kaf-relay, gave two upstream reports, kaf-relay issues 48 and 49 (see Relay results). The
-  version ends with the published table.
+  kaf-relay, gave two upstream reports, kaf-relay issues 48 and 49, and a third for franz-go
+  itself, franz-go issue 1505 (see Relay results). The version ends with the published table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 

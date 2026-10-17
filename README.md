@@ -32,6 +32,15 @@ Against nats.go, the Go client for NATS JetStream, at v1.53.1 and v1.54.0:
 
 Neither loses or duplicates a message.
 
+Against franz-go, the Go client for Kafka:
+
+- **A request doesn't return when its context ends while another request to the same broker is
+  still dialing.** It waits for that dial to give up, 10 seconds by default. It surfaced in the
+  kaf-relay runs below, where a call with a 1-second timeout took 10 seconds, and
+  `drivers/franzgo/repro1505` reproduces it with no broker at all.
+  https://github.com/twmb/franz-go/issues/1505 (reported 2026-10-17), not yet confirmed by the
+  maintainer.
+
 Against kaf-relay, a program that keeps Kafka clusters in sync by copying topics, at v2.1.0
 (`2dcedd3`):
 
@@ -87,6 +96,13 @@ The standalone reproducer for 2180 needs only a nats-server with JetStream:
 ```bash
 go build -C drivers/natsgo -o ../../bin/repro2180 ./repro2180
 ./bin/repro2180
+```
+
+The one for franz-go 1505 needs no broker at all:
+
+```bash
+go build -C drivers/franzgo -o ../../bin/repro1505 ./repro1505
+./bin/repro1505
 ```
 
 ## More
