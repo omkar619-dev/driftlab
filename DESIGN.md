@@ -378,27 +378,42 @@ lag aren't measured in relay runs yet, because both match acks to deliveries by 
 **The relay witness.** `drivers/relay` treats the program under test as a black box. It creates
 the same fresh one-partition topic on both clusters, starts the program with a command it is given
 plus the two topic names, and writes numbered values into the source at a steady pace, each acked
-by the source. Its own reads and writes use franz-go v1.20.7, whatever the program under test
-links, so the witness is never the thing being tested. Once the copy has caught up, or a grace
-window has passed, it stops the program with SIGTERM, as an operator would, and kills it if it is
-still running 30 seconds later, which the history records. Then it reads the copy back. In
-`relay-pause`, once the copy has caught up with the first half of the writes, it freezes the two
-brokers that hold the copy's other replicas for 25 seconds, as `followers-pause` does. That run
-declares two faults: the freeze, with docker's word that both brokers were paused, and a stall,
-which completes only if the copy's end stayed put for 10 seconds while the source was ahead of it.
-A freeze that missed the copy makes the run invalid rather than clean. `relay-control` is the same
-run without the freeze.
+by the source. It keeps the program running the way systemd or Kubernetes would: whenever the
+program exits without being asked to, the driver records the exit and starts it again, at once if
+it had run for a while, and after a second if it died within three seconds of starting. Its own
+reads and writes use franz-go v1.20.7, whatever the program under test links, so the witness is
+never the thing being tested. Once the copy has caught up, or a grace window has passed, it stops
+the program with SIGTERM, as an operator would, and kills it if it is still running 30 seconds
+later, which the history records. Then it reads the copy back. In `relay-pause`, once the copy has
+caught up with the first half of the writes, it freezes the two brokers that hold the copy's other
+replicas for 25 seconds, as `followers-pause` does. That run declares two faults: the freeze, with
+docker's word that both brokers were paused, and a stall, which completes only if the copy's end
+stayed put for 10 seconds while the source was ahead of it. A freeze that missed the copy makes the
+run invalid rather than clean. When a fault ends, its `ok` records the partition's in-sync set as
+the leader saw it just before. `relay-control` is the same run without the freeze.
 
 `relay-restart` freezes only one of the two followers, for 25 seconds. The cluster keeps its
 controller quorum, so a program started during the freeze can still reach it, but the controller
 also fences the frozen broker once its session runs out, about 9 seconds in, and that takes it out
 of the in-sync set. Until then the leader can't count anything as copied, so this stall only has to
-last 2 seconds. Then the driver kills the program with SIGKILL, as a crash would, and starts it
-again, as a supervisor would, starting it once more whenever it exits within three seconds. That
-third fault, the crash, only counts if a new program then runs for three seconds while the copy's
-end still stands where it stalled, so it must have started from that stale end. After the freeze,
-once the copy has caught up, the driver restarts the program politely and writes half as many
-values again, which shows whether the restart skips any.
+last 2 seconds. Then the driver kills the program with SIGKILL, as a crash would, and the
+supervisor starts it again. That third fault, the crash, only counts if a new program then runs for
+three seconds while the copy's end still stands where it stalled. That shows the new program had a
+stale end to read, not that it read it: one that is slow to start can read the end after it has
+moved, so a clean `relay-restart` run says less than a failed one. After the freeze, once the copy
+has caught up, the driver restarts the program politely and writes half as many values again,
+which shows whether the restart skips any.
+
+`relay-restart-cut` is the same run with a fault that keeps the copy's end stale for all 25
+seconds. Instead of freezing a follower, it cuts that follower's fetches: a throwaway container
+built from `deploy/nft` joins the follower's network namespace and adds an nftables table whose
+one rule drops every packet the follower sends to port 19092, where the brokers fetch from each
+other. The follower keeps checking in with the controller on port 9093 and keeps answering
+clients, so it is never fenced, and the leader only drops it from the in-sync set once it has
+lagged for 30 seconds (`replica.lag.time.max.ms`), longer than the cut lasts. That is closer to a
+follower with a slow disk or a broken link to the leader than a frozen broker is, and a program
+that restarts during the cut never meets a broker that doesn't answer. The cut only counts if nft
+lists the rule in the follower's network, and deleting the table ends it.
 
 ## History format (the wire contract)
 
@@ -601,7 +616,8 @@ driftlab/
 ├── deploy/
 │   ├── compose.yaml
 │   ├── kafka.yaml
-│   └── kafka-source.yaml
+│   ├── kafka-source.yaml
+│   └── nft/
 └── scripts/
     ├── matrix.sh
     ├── kafka-calibrate.sh
@@ -622,11 +638,12 @@ driftlab/
 | `drivers/franzgo/` | a separate module that talks to Kafka through franz-go and writes a history to stdout |
 | `drivers/franzgo/go.mod` | pins franz-go v1.20.7 (the release that fixed issue 1217) |
 | `drivers/franzgo/v1.20.6.mod` | pins franz-go v1.20.6 (the last release before the fix), used via `-modfile` |
-| `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command, writes into the source, can freeze the copy's cluster and crash the program meanwhile, and reads the copy back |
+| `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command and keeps it running as a supervisor would, writes into the source, can freeze or cut the copy's followers and crash the program meanwhile, and reads the copy back |
 | `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `deploy/kafka-source.yaml` | a one-broker Kafka cluster in a compose project of its own: the source for programs that copy messages between two clusters |
+| `deploy/nft/` | the image the relay driver's cut fault runs `nft` from: Alpine with nftables, built once with `docker build -t driftlab-nft deploy/nft` |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 | `scripts/kafka-calibrate.sh` | runs v1's calibration (2 franz-go versions × 2 scenarios × 3 repeats) and checks every verdict against the expected one |
 | `scripts/compare-nats.sh` | runs the eight NATS scenarios against two or more driver builds, such as a nats.go pull request and the commit it starts from, and prints their verdicts, recovery and lag side by side; `RUNS` repeats them, `SCENARIOS` picks some, and `ARGS` adds driver flags such as `-block-disconnect` |

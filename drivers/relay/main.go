@@ -3,12 +3,13 @@
 // to stdout, in the format DESIGN.md specifies.
 //
 // The program under test is a black box. The driver starts it with a
-// command it is given, writes numbered values into the source cluster, can
-// freeze the target cluster and crash the program while the copy runs,
-// stops the program, and reads the copy back. The driver's own reads and
-// writes use franz-go v1.20.7, whatever the program under test links, so
-// the witness is never the thing being tested. Its admin requests go
-// through kmsg, as in drivers/franzgo.
+// command it is given and keeps it running, the way a supervisor would. It
+// writes numbered values into the source cluster, can stall the target
+// cluster and crash the program while the copy runs, stops the program,
+// and reads the copy back. The driver's own reads and writes use franz-go
+// v1.20.7, whatever the program under test links, so the witness is never
+// the thing being tested. Its admin requests go through kmsg, as in
+// drivers/franzgo.
 package main
 
 import (
@@ -33,17 +34,21 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// scenario describes one experiment. A pause above zero freezes that many of
-// the brokers holding the copy's other replicas, halfway through the writes,
-// for hold, and the copy must then stand still for stall to count as
-// stalled. With crash set, the program is killed and started again during
-// the freeze, and once the copy has caught up it is restarted politely
-// before a last batch of writes.
+// scenario describes one experiment. A fault, "pause" or "cut", hits that
+// many of the brokers holding the copy's other replicas, halfway through
+// the writes, for hold, and the copy must then stand still for stall to
+// count as stalled. "pause" freezes the brokers with docker pause; "cut"
+// only drops their fetches from the other brokers, so they stay alive and
+// keep checking in with the controller. With crash set, the program is
+// killed during the fault and the supervisor starts it again, and once the
+// copy has caught up it is restarted politely before a last batch of
+// writes.
 type scenario struct {
-	pause int
-	hold  time.Duration
-	stall time.Duration
-	crash bool
+	fault     string
+	followers int
+	hold      time.Duration
+	stall     time.Duration
+	crash     bool
 }
 
 // relay-pause freezes both of the copy's follower brokers for 25 seconds,
@@ -56,11 +61,16 @@ type scenario struct {
 // it out of the in-sync set and lets the copy move again. So the stall
 // only has to last 2 seconds before the driver crashes the program, and
 // the new one gets a few seconds in which the copy's end is stale.
+// relay-restart-cut cuts one follower's fetches instead. It keeps checking
+// in, so the controller never fences it, and the leader only drops it from
+// the in-sync set once it has lagged for 30 seconds, longer than the cut
+// lasts, so the copy's end stays stale for the whole cut.
 // relay-control is the same run without any fault.
 var scenarios = map[string]scenario{
-	"relay-control": {},
-	"relay-pause":   {pause: 2, hold: 25 * time.Second, stall: 10 * time.Second},
-	"relay-restart": {pause: 1, hold: 25 * time.Second, stall: 2 * time.Second, crash: true},
+	"relay-control":     {},
+	"relay-pause":       {fault: "pause", followers: 2, hold: 25 * time.Second, stall: 10 * time.Second},
+	"relay-restart":     {fault: "pause", followers: 1, hold: 25 * time.Second, stall: 2 * time.Second, crash: true},
+	"relay-restart-cut": {fault: "cut", followers: 1, hold: 25 * time.Second, stall: 2 * time.Second, crash: true},
 }
 
 type config struct {
@@ -71,6 +81,8 @@ type config struct {
 	relayLog string
 	server   string
 	scenario string
+	nftImage string
+	cutPort  int
 	n        uint64
 	interval time.Duration
 	grace    time.Duration
@@ -87,12 +99,14 @@ func main() {
 	flag.StringVar(&c.client, "client", "", "what the program under test is, recorded in the meta line, such as its name, commit and Kafka client")
 	flag.StringVar(&c.relayLog, "relay-log", "relay.log", "the file the program's output goes to, from every start in the run")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line")
-	flag.StringVar(&c.scenario, "scenario", "relay-control", "relay-control, relay-pause or relay-restart")
+	flag.StringVar(&c.scenario, "scenario", "relay-control", "relay-control, relay-pause, relay-restart or relay-restart-cut")
 	flag.Uint64Var(&c.n, "n", 200, "number of values to write into the source")
 	flag.DurationVar(&c.interval, "interval", 20*time.Millisecond, "the pause after each write")
 	flag.DurationVar(&c.grace, "grace", 60*time.Second, "how long the copy gets to catch up with the source")
-	flag.DurationVar(&c.hold, "hold", 0, "how long the followers stay frozen; 0 keeps the scenario's own")
-	flag.DurationVar(&c.stall, "stall", 0, "how long the copy's end must stay put during the freeze, with the source ahead, to count as stalled; 0 keeps the scenario's own")
+	flag.DurationVar(&c.hold, "hold", 0, "how long the fault lasts; 0 keeps the scenario's own")
+	flag.DurationVar(&c.stall, "stall", 0, "how long the copy's end must stay put during the fault, with the source ahead, to count as stalled; 0 keeps the scenario's own")
+	flag.StringVar(&c.nftImage, "nft-image", "driftlab-nft", "the image the cut fault runs nft from, inside a broker's network (docker build -t driftlab-nft deploy/nft)")
+	flag.IntVar(&c.cutPort, "cut-port", 19092, "the port the brokers fetch from each other on, which the cut fault drops (deploy/kafka.yaml's INTERNAL listener)")
 	flag.DurationVar(&c.stop, "stop", 30*time.Second, "how long the program gets to exit after SIGTERM before it is killed")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
@@ -107,7 +121,7 @@ func run(c config, out io.Writer) error {
 		return fmt.Errorf("unknown scenario %q", c.scenario)
 	}
 	if c.n < 2 {
-		return errors.New("-n must be at least 2, so the freeze can fall between two writes")
+		return errors.New("-n must be at least 2, so the fault can fall between two writes")
 	}
 	argv := strings.Fields(c.relay)
 	if len(argv) == 0 {
@@ -147,7 +161,7 @@ func run(c config, out io.Writer) error {
 	defer dst.Close()
 
 	// The same fresh topic on both sides, with one partition, so every value
-	// goes through the frozen followers and the copy can be checked by hand.
+	// goes through the stalled followers and the copy can be checked by hand.
 	topic := fmt.Sprintf("driftlab-%s-%d", c.scenario, time.Now().UnixMilli())
 	setup, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -162,31 +176,37 @@ func run(c config, out io.Writer) error {
 			return err
 		}
 	}
+	// A cut that an earlier run left behind would stall this run's copy
+	// before its own fault starts, so a cut run clears any first.
+	if sc.fault == "cut" {
+		clearCuts(setup, dst, topic, c)
+	}
 
 	rec.writeMeta(newMeta(c, sc, topic))
-	r, err := startRelay(rec, argv, topic, c.relayLog)
+	sup, err := supervise(rec, argv, topic, c.relayLog)
 	if err != nil {
 		return err
 	}
 	// From here on, an error still stops the program, so a run never leaves
 	// it running.
 	fail := func(err error) error {
-		r.stop(rec, c.stop)
+		sup.stop(c.stop)
 		return err
 	}
 
 	w := &writer{cl: src, rec: rec, topic: topic}
 	var fz *freeze
 	for v := uint64(1); v <= c.n; v++ {
-		// The freeze waits until the copy has caught up with the first half,
+		// The fault waits until the copy has caught up with the first half,
 		// so the program is already copying, with its producer set up, and
-		// the first value written after it has to cross the frozen brokers.
-		// It ends on its own timer, because the writes go on meanwhile.
-		if sc.pause > 0 && v == c.n/2+1 {
+		// the first value written after it has to cross the stalled
+		// followers. It ends on its own timer, because the writes go on
+		// meanwhile.
+		if sc.fault != "" && v == c.n/2+1 {
 			if err := waitCaughtUp(ctx, src, dst, topic, c.grace); err != nil {
-				return fail(fmt.Errorf("before the freeze: %w", err))
+				return fail(fmt.Errorf("before the fault: %w", err))
 			}
-			if fz, err = startPause(ctx, src, dst, rec, topic, sc.pause, sc.hold, sc.stall); err != nil {
+			if fz, err = startFault(ctx, src, dst, rec, topic, sc, c); err != nil {
 				return fail(err)
 			}
 		}
@@ -199,13 +219,7 @@ func run(c config, out io.Writer) error {
 		if sc.crash {
 			select {
 			case <-fz.stalled:
-				nr, err := crash(ctx, rec, r, argv, topic, c.relayLog, dst, fz)
-				if nr != nil {
-					r = nr
-				}
-				if err != nil {
-					return fail(err)
-				}
+				crash(ctx, rec, sup, dst, fz, topic)
 			case <-fz.over:
 			}
 		}
@@ -225,8 +239,10 @@ func run(c config, out io.Writer) error {
 		// caught up. It starts from the copy's end, which a duplicate would
 		// have pushed past the source's, so the values written next show
 		// whether it skips any.
-		r.stop(rec, c.stop)
-		if r, err = startRelay(rec, argv, topic, c.relayLog); err != nil {
+		if err := sup.stop(c.stop); err != nil {
+			return err
+		}
+		if sup, err = supervise(rec, argv, topic, c.relayLog); err != nil {
 			return err
 		}
 		for v := c.n + 1; v <= c.n+c.n/2; v++ {
@@ -237,7 +253,9 @@ func run(c config, out io.Writer) error {
 			rec.op(op{Process: "relay", Type: "info", F: "catch-up", Error: err.Error()})
 		}
 	}
-	r.stop(rec, c.stop)
+	if err := sup.stop(c.stop); err != nil {
+		return err
+	}
 	return finalRead(ctx, dst, dstSeeds, rec, topic, 1)
 }
 
@@ -299,12 +317,12 @@ func allLed(resp *kmsg.MetadataResponse, partitions int32) bool {
 	return true
 }
 
-// relay is a running program under test. exited closes once the program
-// has exited, with exitErr set to how it did, so any number of callers can
-// wait for it.
+// relay is one start of the program under test. exited closes once it has
+// exited, with exitErr set to how it did and its output file closed, so any
+// number of callers can wait for it.
 type relay struct {
 	cmd     *exec.Cmd
-	out     *os.File
+	began   time.Time
 	exited  chan struct{}
 	exitErr error
 }
@@ -325,38 +343,117 @@ func startRelay(rec *recorder, argv []string, topic, logPath string) (*relay, er
 		return nil, fmt.Errorf("starting the program under test: %w", err)
 	}
 	rec.op(op{Process: "relay", Type: "ok", F: "start", Detail: map[string]any{"pid": cmd.Process.Pid}})
-	r := &relay{cmd: cmd, out: out, exited: make(chan struct{})}
+	r := &relay{cmd: cmd, began: time.Now(), exited: make(chan struct{})}
 	go func() {
 		r.exitErr = cmd.Wait()
+		out.Close()
 		close(r.exited)
 	}()
 	return r, nil
 }
 
-// stop asks the program to stop the way an operator would, with SIGTERM, and
-// waits up to grace for it to exit. A program still running after that is
-// killed, and the history says so: a copier that can't shut down is a
-// finding of its own.
-func (r *relay) stop(rec *recorder, grace time.Duration) {
-	defer r.out.Close()
-	rec.op(op{Process: "relay", Type: "invoke", F: "stop"})
-	r.cmd.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-r.exited:
-		rec.op(op{Process: "relay", Type: "ok", F: "stop", Detail: map[string]any{"exit": exitString(r.exitErr)}})
-	case <-time.After(grace):
-		r.cmd.Process.Kill()
+// supervisor keeps the program under test running, the way systemd or
+// Kubernetes would: whenever it exits without the driver stopping it, the
+// supervisor records the exit and starts it again. A program that ran for
+// a while comes back at once; one that exited within three seconds of its
+// start waits a second first, so a program that can't start at all doesn't
+// flood the history.
+type supervisor struct {
+	rec     *recorder
+	argv    []string
+	topic   string
+	logPath string
+
+	// mu guards the fields below it. started closes, and is replaced,
+	// whenever a new program starts. err says why starting one failed, if
+	// it did, and done closes once the supervisor has stopped watching.
+	mu       sync.Mutex
+	cur      *relay
+	started  chan struct{}
+	stopping bool
+	err      error
+	done     chan struct{}
+}
+
+// supervise starts the program and a supervisor that keeps it running.
+func supervise(rec *recorder, argv []string, topic, logPath string) (*supervisor, error) {
+	r, err := startRelay(rec, argv, topic, logPath)
+	if err != nil {
+		return nil, err
+	}
+	s := &supervisor{rec: rec, argv: argv, topic: topic, logPath: logPath, cur: r, started: make(chan struct{}), done: make(chan struct{})}
+	go s.watch()
+	return s, nil
+}
+
+// watch waits for each program to exit and starts the next, until stop.
+func (s *supervisor) watch() {
+	defer close(s.done)
+	for {
+		r, _ := s.current()
 		<-r.exited
-		rec.op(op{Process: "relay", Type: "info", F: "stop", Error: fmt.Sprintf("still running %s after SIGTERM, so it was killed (%s)", grace, exitString(r.exitErr))})
+		s.mu.Lock()
+		stopping := s.stopping
+		s.mu.Unlock()
+		if stopping {
+			return
+		}
+		s.rec.op(op{Process: "relay", Type: "info", F: "exit", Detail: map[string]any{"exit": exitString(r.exitErr)}})
+		wait := 100 * time.Millisecond
+		if time.Since(r.began) < 3*time.Second {
+			wait = time.Second
+		}
+		time.Sleep(wait)
+		s.mu.Lock()
+		if s.stopping {
+			s.mu.Unlock()
+			return
+		}
+		next, err := startRelay(s.rec, s.argv, s.topic, s.logPath)
+		if err != nil {
+			s.err = err
+			s.mu.Unlock()
+			return
+		}
+		s.cur = next
+		close(s.started)
+		s.started = make(chan struct{})
+		s.mu.Unlock()
 	}
 }
 
-// kill ends the program the way a crash would, with SIGKILL.
-func (r *relay) kill(rec *recorder) {
-	defer r.out.Close()
-	r.cmd.Process.Kill()
-	<-r.exited
-	rec.op(op{Process: "relay", Type: "info", F: "kill", Detail: map[string]any{"exit": exitString(r.exitErr)}})
+// current returns the program the supervisor is running, or the one that
+// last exited, and a channel that closes when the next one starts.
+func (s *supervisor) current() (*relay, chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cur, s.started
+}
+
+// stop asks the program to stop the way an operator would, with SIGTERM,
+// and waits up to grace for it to exit, without starting it again. A
+// program still running after that is killed, and the history says so: a
+// copier that can't shut down is a finding of its own. It returns the error
+// that kept the supervisor from starting a program, if one did.
+func (s *supervisor) stop(grace time.Duration) error {
+	s.mu.Lock()
+	s.stopping = true
+	r := s.cur
+	s.mu.Unlock()
+	s.rec.op(op{Process: "relay", Type: "invoke", F: "stop"})
+	r.cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-r.exited:
+		s.rec.op(op{Process: "relay", Type: "ok", F: "stop", Detail: map[string]any{"exit": exitString(r.exitErr)}})
+	case <-time.After(grace):
+		r.cmd.Process.Kill()
+		<-r.exited
+		s.rec.op(op{Process: "relay", Type: "info", F: "stop", Error: fmt.Sprintf("still running %s after SIGTERM, so it was killed (%s)", grace, exitString(r.exitErr))})
+	}
+	<-s.done
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
 }
 
 // exitString describes how a program exited, the way cmd.Wait reports it.
@@ -367,31 +464,30 @@ func exitString(err error) string {
 	return err.Error()
 }
 
-// crash kills the program the way a crash would, with SIGKILL, and starts
-// it again, as a supervisor would, while the freeze lasts. The crash only
-// counts once a new program has run for three seconds while the copy's end
-// still stands where it stalled: that program must have started from the
-// stale end. A new program that exits sooner is started again a second
-// later. If the freeze ends first, the program is started anyway, so the
-// run can finish, but the crash doesn't count.
-func crash(ctx context.Context, rec *recorder, old *relay, argv []string, topic, logPath string, dst *kgo.Client, fz *freeze) (*relay, error) {
+// crash kills the program the way a crash would, with SIGKILL, and lets the
+// supervisor start it again. The crash only counts once a new program has
+// run for three seconds while the copy's end still stands where it stalled.
+// That shows the new program had a stale end to read, not that it read it:
+// one that is slow to start can read the end after it has moved. If the
+// fault ends first, the crash doesn't count.
+func crash(ctx context.Context, rec *recorder, sup *supervisor, dst *kgo.Client, fz *freeze, topic string) {
+	old, started := sup.current()
 	rec.op(op{Process: "nemesis", Type: "invoke", F: "crash", Detail: map[string]any{"pid": old.cmd.Process.Pid}})
-	old.kill(rec)
+	old.cmd.Process.Kill()
 	for {
-		r, err := startRelay(rec, argv, topic, logPath)
-		if err != nil {
-			return nil, err
+		select {
+		case <-started:
+		case <-fz.over:
+			return
 		}
+		r, next := sup.current()
 		select {
 		case <-r.exited:
-			r.out.Close()
-			rec.op(op{Process: "relay", Type: "info", F: "exit", Detail: map[string]any{"exit": exitString(r.exitErr)}})
-			select {
-			case <-fz.over:
-				return startRelay(rec, argv, topic, logPath)
-			case <-time.After(time.Second):
-			}
+			// It died within three seconds; wait for the supervisor's next.
+			started = next
 			continue
+		case <-fz.over:
+			return
 		case <-time.After(3 * time.Second):
 		}
 		d, err := leaderEnd(ctx, dst, fz.leader, topic)
@@ -402,7 +498,7 @@ func crash(ctx context.Context, rec *recorder, old *relay, argv []string, topic,
 				rec.op(op{Process: "nemesis", Type: "ok", F: "crash", Detail: map[string]any{"pid": r.cmd.Process.Pid, "target_end": d}})
 			}
 		}
-		return r, nil
+		return
 	}
 }
 
@@ -460,10 +556,10 @@ func endOf(ctx context.Context, cl *kgo.Client, topic string) (int64, error) {
 	return ends[0], nil
 }
 
-// freeze is a running freeze of the copy's followers. stalled closes once
-// the stall's ok is recorded, with end set to where the copy stood still,
-// and over closes once the brokers are unfrozen, with err set if something
-// went wrong.
+// freeze is a running fault on the copy's followers, which should freeze
+// the copy's end. stalled closes once the stall's ok is recorded, with end
+// set to where the copy stood still, and over closes once the fault has
+// ended, with err set if something went wrong.
 type freeze struct {
 	leader  int32
 	end     int64
@@ -472,53 +568,80 @@ type freeze struct {
 	err     error
 }
 
-// startPause freezes count of the brokers that hold the copy's other
-// replicas, never its leader, and unfreezes them after hold on a goroutine of
-// its own, because the writes go on meanwhile. While a frozen follower is
-// still in the in-sync set, the leader stores each record but can't count it
-// as copied, so the copy's end stands still. With two frozen there is also no
-// controller quorum, so nothing takes them out of the set; with one frozen,
-// the controller fences it once its session runs out, about 9 seconds in,
-// and that takes it out of the set. Both faults need evidence of their
-// own. The freeze only counts if docker shows every frozen follower paused,
-// and the stall only if the copy's end then stayed put, with the source ahead
-// of it, so a freeze that missed the copy makes the run invalid instead of
-// clean. Containers are named after the brokers' node IDs, as
-// deploy/kafka.yaml names them.
-func startPause(ctx context.Context, src, dst *kgo.Client, rec *recorder, topic string, count int, hold, stall time.Duration) (*freeze, error) {
+// startFault starts the scenario's fault on sc.followers of the brokers that
+// hold the copy's other replicas, never its leader, and ends it after
+// sc.hold on a goroutine of its own, because the writes go on meanwhile.
+// While a follower that has stopped fetching is still in the in-sync set,
+// the leader stores each record but can't count it as copied, so the copy's
+// end stands still. A paused follower also stops checking in with the
+// controller: with two paused there is no controller quorum, so nothing
+// takes them out of the set, and with one paused, the controller fences it
+// once its session runs out, about 9 seconds in, which does. A cut follower
+// keeps checking in, so it stays in the set until the leader drops it for
+// lagging, after 30 seconds.
+//
+// Both faults need evidence of their own. A pause only counts if docker
+// shows every follower paused, a cut only if nft shows the drop rule in
+// every follower's network, and the stall only if the copy's end then
+// stayed put, with the source ahead of it, so a fault that missed the copy
+// makes the run invalid instead of clean. The fault's ok also records the
+// partition's in-sync set as the leader saw it just before the fault ended.
+// Containers are named after the brokers' node IDs, as deploy/kafka.yaml
+// names them.
+func startFault(ctx context.Context, src, dst *kgo.Client, rec *recorder, topic string, sc scenario, c config) (*freeze, error) {
 	leader, followers, err := followersOf(ctx, dst, topic)
 	if err != nil {
 		return nil, err
 	}
-	if count > len(followers) {
-		return nil, fmt.Errorf("asked to freeze %d followers of %s, which has %d", count, topic, len(followers))
+	if sc.followers > len(followers) {
+		return nil, fmt.Errorf("asked to stall %d followers of %s, which has %d", sc.followers, topic, len(followers))
 	}
-	names := make([]string, count)
-	for i, id := range followers[:count] {
+	names := make([]string, sc.followers)
+	for i, id := range followers[:sc.followers] {
 		names[i] = fmt.Sprintf("kafka-%d", id)
 	}
-	rec.op(op{Process: "nemesis", Type: "invoke", F: "pause", Detail: map[string]any{"leader": leader, "paused": names}})
-	if _, err := docker(append([]string{"pause"}, names...)...); err != nil {
-		docker(append([]string{"unpause"}, names...)...) // never leave one of them frozen
-		return nil, err
+	key := "paused"
+	if sc.fault == "cut" {
+		key = "cut"
 	}
-	paused, checkErr := docker(append([]string{"inspect", "-f", "{{.State.Paused}}"}, names...)...)
+	rec.op(op{Process: "nemesis", Type: "invoke", F: sc.fault, Detail: map[string]any{"leader": leader, key: names}})
+	var took bool
+	var checkErr error
+	switch sc.fault {
+	case "pause":
+		if _, err := docker(append([]string{"pause"}, names...)...); err != nil {
+			docker(append([]string{"unpause"}, names...)...) // never leave one of them frozen
+			return nil, err
+		}
+		var paused string
+		paused, checkErr = docker(append([]string{"inspect", "-f", "{{.State.Paused}}"}, names...)...)
+		took = allTrue(paused, len(names))
+	case "cut":
+		for _, name := range names {
+			if _, err := nft(c, name, cutRules(c.cutPort), "-f", "-"); err != nil {
+				healCuts(c, names) // never leave one of them cut
+				return nil, fmt.Errorf("%w (is the image built? docker build -t %s deploy/nft)", err, c.nftImage)
+			}
+		}
+		took, checkErr = cutsInPlace(c, names)
+	}
 	rec.op(op{Process: "nemesis", Type: "invoke", F: "stall"})
 	fz := &freeze{leader: leader, stalled: make(chan struct{}), over: make(chan struct{})}
 	stop := make(chan struct{})
 	watched := make(chan struct{})
 	go func() {
 		defer close(watched)
-		watchStall(ctx, src, dst, fz, rec, topic, stall, stop)
+		watchStall(ctx, src, dst, fz, rec, topic, sc.stall, stop)
 	}()
 	go func() {
 		defer close(fz.over)
-		time.Sleep(hold)
+		time.Sleep(sc.hold)
 		close(stop)
 		<-watched
-		// Unpause whatever the check said, so a run never leaves brokers
-		// frozen.
-		if _, err := docker(append([]string{"unpause"}, names...)...); err != nil {
+		isr, isrErr := leaderISR(ctx, dst, leader, topic)
+		// End the fault whatever the checks said, so a run never leaves
+		// brokers frozen or cut.
+		if err := endFault(sc.fault, names, c); err != nil {
 			fz.err = err
 			return
 		}
@@ -526,11 +649,89 @@ func startPause(ctx context.Context, src, dst *kgo.Client, rec *recorder, topic 
 			fz.err = checkErr
 			return
 		}
-		if allTrue(paused, len(names)) {
-			rec.op(op{Process: "nemesis", Type: "ok", F: "pause"})
+		if took {
+			var detail any
+			if isrErr == nil {
+				detail = map[string]any{"isr": isr}
+			}
+			rec.op(op{Process: "nemesis", Type: "ok", F: sc.fault, Detail: detail})
 		}
 	}()
 	return fz, nil
+}
+
+// endFault ends a pause or a cut on the named brokers.
+func endFault(fault string, names []string, c config) error {
+	if fault == "pause" {
+		_, err := docker(append([]string{"unpause"}, names...)...)
+		return err
+	}
+	return healCuts(c, names)
+}
+
+// cutTable is the nftables table the cut fault adds to a broker's network
+// namespace. Its one chain drops every packet the broker sends to the port
+// the brokers fetch from each other on, so it stops copying from the
+// leaders, while its traffic to the controllers and to clients carries on.
+// Deleting the table ends the cut.
+const cutTable = "driftlab"
+
+// cutRules is the cut's ruleset, in the form nft -f reads.
+func cutRules(port int) string {
+	return fmt.Sprintf("table inet %s {\n\tchain fetches {\n\t\ttype filter hook output priority 0; policy accept;\n\t\ttcp dport %d drop\n\t}\n}\n", cutTable, port)
+}
+
+// nft runs nft inside a broker container's network namespace, from a
+// throwaway container of the -nft-image image that joins that namespace with
+// the right to change its firewall. stdin, if not empty, is what nft reads.
+func nft(c config, name, stdin string, args ...string) (string, error) {
+	full := []string{"run", "--rm", "--network", "container:" + name, "--cap-add", "NET_ADMIN"}
+	if stdin != "" {
+		full = append(full, "-i")
+	}
+	full = append(full, c.nftImage, "nft")
+	return dockerIn(stdin, append(full, args...)...)
+}
+
+// cutsInPlace says whether nft shows the drop rule in every named broker's
+// network.
+func cutsInPlace(c config, names []string) (bool, error) {
+	rule := fmt.Sprintf("tcp dport %d drop", c.cutPort)
+	for _, name := range names {
+		out, err := nft(c, name, "", "list", "table", "inet", cutTable)
+		if err != nil {
+			return false, err
+		}
+		if !strings.Contains(out, rule) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// healCuts deletes the cut table from every named broker's network, and
+// returns the first error.
+func healCuts(c config, names []string) error {
+	var first error
+	for _, name := range names {
+		if _, err := nft(c, name, "", "delete", "table", "inet", cutTable); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// clearCuts deletes any cut an earlier run left behind on the topic's
+// brokers. It ignores errors, most of which mean there was no cut to
+// delete; a missing image shows up when the fault starts.
+func clearCuts(ctx context.Context, cl *kgo.Client, topic string, c config) {
+	leader, followers, err := followersOf(ctx, cl, topic)
+	if err != nil {
+		return
+	}
+	for _, id := range append(followers, leader) {
+		nft(c, fmt.Sprintf("kafka-%d", id), "", "delete", "table", "inet", cutTable)
+	}
 }
 
 // watchStall records the stall's ok once the copy's end offset has stayed
@@ -607,6 +808,32 @@ func leaderEnd(ctx context.Context, cl *kgo.Client, leader int32, topic string) 
 	return rp.Offset, nil
 }
 
+// leaderISR asks the copy's leader directly which replicas of partition 0
+// are in the in-sync set, for the same reason leaderEnd asks it directly,
+// and gives the request two seconds too.
+func leaderISR(ctx context.Context, cl *kgo.Client, leader int32, topic string) ([]int32, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req := kmsg.NewPtrMetadataRequest()
+	t := kmsg.NewMetadataRequestTopic()
+	t.Topic = kmsg.StringPtr(topic)
+	req.Topics = append(req.Topics, t)
+	resp, err := cl.Broker(int(leader)).Request(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	mr, ok := resp.(*kmsg.MetadataResponse)
+	if !ok || len(mr.Topics) != 1 {
+		return nil, fmt.Errorf("broker %d gave an unexpected answer about %s", leader, topic)
+	}
+	for _, p := range mr.Topics[0].Partitions {
+		if p.Partition == 0 {
+			return p.ISR, nil
+		}
+	}
+	return nil, fmt.Errorf("broker %d knows no partition 0 of %s", leader, topic)
+}
+
 // followersOf asks which broker leads partition 0 of the topic, and which
 // brokers hold its other copies.
 func followersOf(ctx context.Context, cl *kgo.Client, topic string) (int32, []int32, error) {
@@ -656,9 +883,18 @@ func allTrue(out string, n int) bool {
 // docker runs one docker command and returns what it printed. It gives up
 // after 30 seconds, so a docker daemon that hangs can't hang the run.
 func docker(args ...string) (string, error) {
+	return dockerIn("", args...)
+}
+
+// dockerIn is docker with stdin, if not empty, as the command's input.
+func dockerIn(stdin string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, bytes.TrimSpace(out))
 	}
@@ -788,16 +1024,18 @@ type params struct {
 	Hold     string `json:"hold,omitempty"`
 	Stall    string `json:"stall,omitempty"`
 	Frozen   int    `json:"frozen,omitempty"`
+	Cut      int    `json:"cut,omitempty"`
 	Again    uint64 `json:"again,omitempty"`
 }
 
 // newMeta describes the run: what was tested, the topic, so the evidence can
 // be found in both clusters afterwards, and the franz-go the driver itself
 // used. "relay": true tells the checker the acks and the final read come
-// from different clusters. A freeze declares two faults, the freeze itself
-// and the stall it should cause in the copy, and relay-restart a third, the
-// crash during the freeze. Frozen says how many followers were frozen, and
-// again how many values were written after the polite restart.
+// from different clusters. A fault declares two faults, the pause or the
+// cut itself and the stall it should cause in the copy, and a crash
+// scenario a third, the crash during the fault. Frozen or cut says how many
+// followers the fault hit, and again how many values were written after the
+// polite restart.
 func newMeta(c config, sc scenario, topic string) metaLine {
 	witness, rev := provenance()
 	m := metaLine{
@@ -810,11 +1048,15 @@ func newMeta(c config, sc scenario, topic string) metaLine {
 		Params:   params{N: c.n, Interval: c.interval.String(), Topic: topic, Witness: witness},
 		Driftlab: rev,
 	}
-	if sc.pause > 0 {
-		m.Faults = []string{"pause", "stall"}
+	if sc.fault != "" {
+		m.Faults = []string{sc.fault, "stall"}
 		m.Params.Hold = sc.hold.String()
 		m.Params.Stall = sc.stall.String()
-		m.Params.Frozen = sc.pause
+		if sc.fault == "pause" {
+			m.Params.Frozen = sc.followers
+		} else {
+			m.Params.Cut = sc.followers
+		}
 	}
 	if sc.crash {
 		m.Faults = append(m.Faults, "crash")
@@ -824,7 +1066,7 @@ func newMeta(c config, sc scenario, topic string) metaLine {
 }
 
 // recorder writes the history. Its mutex guards every other field, so the
-// freeze and stall goroutines can record too.
+// fault and stall goroutines can record too.
 type recorder struct {
 	mu    sync.Mutex
 	enc   *json.Encoder
