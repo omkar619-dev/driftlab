@@ -415,6 +415,67 @@ follower with a slow disk or a broken link to the leader than a frozen broker is
 that restarts during the cut never meets a broker that doesn't answer. The cut only counts if nft
 lists the rule in the follower's network, and deleting the table ends it.
 
+## Relay results: kaf-relay
+
+The first copier tested is kaf-relay (https://github.com/zerodha/kaf-relay), which keeps Kafka
+clusters in sync by copying topics from one to another. It ran at main `2dcedd3` (v2.1.0), in
+`--mode single`, with the settings in its `config.sample.toml` apart from SASL, which is off, and
+the target's `request_timeout`, raised from 100 ms to 1 s. It keeps no bookmark of its own: every
+start resumes the source at the copy's end offsets, and its README says that offset tracking
+between source and target allows de-duplication without external stores. It pins franz-go
+v1.20.6, and it was also built against v1.20.7 and v1.22.2 through a modfile, to tell what it does
+itself from what its client does. The runs took place on 2026-10-16 and 2026-10-17, at driver
+commits `6604a58` to `3ca91b6`:
+
+| Scenario | franz-go v1.20.6 | franz-go v1.20.7 | franz-go v1.22.2 |
+|---|---|---|---|
+| `relay-control` | clean | not run | not run |
+| `relay-pause` | clean ×6 | clean ×6 | clean ×6 |
+| `relay-restart` | **failed** 2 of 6 | **failed** 4 of 6 | **failed** 1 of 6 |
+| `relay-restart-cut` | **failed** 4 of 4 | **failed** 3 of 3 | **failed** 3 of 3 |
+
+- **A restart while the copy can't commit duplicates a message, and the next restart then skips
+  one, with no error.** Every failed run has the same fingerprint: value 101 at copy offsets 100
+  and 101, and value 201 missing. The killed program had stored value 101 on the leader, which
+  couldn't count it as copied while a follower in the in-sync set wasn't fetching. Its
+  replacement read the copy's end, the high watermark, as 100 and copied value 101 again, under a
+  new producer ID, so the broker couldn't tell it was a retry. From then on the copy was one
+  message ahead of the source, so the polite restart resumed one offset too far and value 201 was
+  never copied. kaf-relay logs where each start resumes: every start that resumed at 100 produced
+  the failure, and every one that resumed at 101 was clean. The second witness, Kafka's console
+  consumer, read the same layout from three failed runs' topics. The franz-go version makes no
+  difference. Reported as https://github.com/zerodha/kaf-relay/issues/49.
+- **The cut hits that window every time, the freeze only sometimes.** The controller fences a
+  frozen broker once its session runs out: 7.6 to 9.4 seconds into the freeze, by its own log, or
+  about 11 when the frozen broker was the active controller and a new one had to be elected
+  first. A program restarted about 2.4 seconds in only read the stale end if its first requests
+  avoided the frozen broker. When they didn't, its connection check waited out a 6-second
+  timeout, or its first `ListEndOffsets` failed after 10 seconds with a dial timeout, although
+  kaf-relay gives that call 1 second, and the program exited until the supervisor started it
+  again. A cut follower keeps answering, so a restart reads the end at once, and the window lasts
+  all 25 seconds.
+- **kaf-relay survives franz-go issue 1217.** In `relay-pause` the trigger fired on v1.20.6, with
+  three timed-out writes per run, but kaf-relay retries exactly the records that failed, and
+  v1.20.6 rewinds a failed batch's sequence numbers, so the retry carried the same numbers and the
+  broker matched it to the records it already had. It costs time: the copy caught up 5.9 to 8.5
+  seconds after the freeze ended, against about 0.1 seconds on v1.20.7 and v1.22.2.
+- **A relay doesn't start on a copy that has caught up, and retries fetch errors with no
+  backoff.** Found by hand on 2026-10-16: with as many messages in the copy as in the source, it
+  waits for the source to grow, and with `--stop-at-end` it never exits. Both come from one
+  comparison in its failover code. Reported as https://github.com/zerodha/kaf-relay/issues/48.
+  The hand tests also ran into a bug someone had already reported, every message landing in
+  partition 0 of the copy (https://github.com/zerodha/kaf-relay/issues/46); the proposed fix,
+  https://github.com/zerodha/kaf-relay/pull/47, was checked here and works for a fresh copy. The
+  relay runs use one-partition topics, so it doesn't affect them.
+- **The invalid verdict caught the harness three more times.** The first `relay-pause` runs read
+  the copy's end through a broker picked at random, which a freeze can leave unanswered, so two
+  of nine never saw the stall; the driver now asks the leader directly. The first `relay-restart`
+  runs, at `f6b4d7a`, all came back invalid, because the stall threshold assumed the leader would
+  wait about 30 seconds for the frozen follower, when the controller fences it after about 9;
+  each scenario now has its own threshold. And clean `relay-restart` runs whose crash counted
+  showed that the crash's evidence proves less than this document first claimed, which it now
+  says.
+
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -665,7 +726,9 @@ driftlab/
 - **v1 (started 2026-10-13; the Go Kafka clients):** the three-broker cluster in
   `deploy/kafka.yaml`, explored by hand, and the decisions in v1 design. First exit reached on
   2026-10-14: the calibration pair reproduces, with franz-go v1.20.6 failing and v1.20.7 passing
-  in all 12 runs (see v1 calibration results). The version ends with the published table.
+  in all 12 runs (see v1 calibration results). The relay driver followed, and its first target,
+  kaf-relay, gave two upstream reports, kaf-relay issues 48 and 49 (see Relay results). The
+  version ends with the published table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 

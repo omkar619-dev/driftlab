@@ -23,17 +23,32 @@ Against nats.go, the Go client for NATS JetStream, at v1.53.1 and v1.54.0:
 - **The push ordered consumer, and the KV watchers built on it, go silent for up to about 14
   seconds after reconnecting, with no error.** It happens after a disconnect longer than about 5
   seconds, or after any server restart, however short.
-  https://github.com/nats-io/nats.go/issues/2180 (reported 2026-10-12)
+  https://github.com/nats-io/nats.go/issues/2180 (reported 2026-10-12). A maintainer has opened a
+  fix, https://github.com/nats-io/nats.go/pull/2201, which driftlab checked; it isn't merged yet.
 - **The `jetstream` ordered consumer uses a 15-second heartbeat instead of the 5 seconds it works
   out for itself, so it takes 30 seconds, not 10, to notice a silent line.**
-  https://github.com/nats-io/nats.go/issues/2181 (reported 2026-10-12)
+  https://github.com/nats-io/nats.go/issues/2181 (reported 2026-10-12). A fix is under review,
+  https://github.com/nats-io/nats.go/pull/2182, which driftlab checked too.
 
-Both are reported upstream and not yet confirmed by the maintainers. Neither loses or duplicates a
-message.
+Neither loses or duplicates a message.
+
+Against kaf-relay, a program that keeps Kafka clusters in sync by copying topics, at v2.1.0
+(`2dcedd3`):
+
+- **A restart while the copy's cluster can't commit leaves a duplicate in the copy, and the next
+  restart then skips a message, with no error.** It takes a crash and a restart while one
+  in-sync follower in the copy's cluster has stopped replicating.
+  https://github.com/zerodha/kaf-relay/issues/49 (reported 2026-10-17)
+- **A relay doesn't start while the copy has caught up, and retries fetch errors with no
+  backoff.** https://github.com/zerodha/kaf-relay/issues/48 (reported 2026-10-16)
+
+Both are reported upstream and not yet confirmed by the maintainers.
 
 Before any of that counted, driftlab was calibrated on a known, fixed bug,
 https://github.com/nats-io/nats.go/issues/2107. It fails v1.53.1 exactly as the issue describes,
-with 80 messages never delivered, and it passes v1.54.0, which has the fix.
+with 80 messages never delivered, and it passes v1.54.0, which has the fix. The Kafka side was
+calibrated the same way, on https://github.com/twmb/franz-go/issues/1217: franz-go v1.20.6 fails
+and v1.20.7 passes, and all 12 calibration runs came out as expected.
 
 ## The matrix
 
@@ -78,6 +93,7 @@ go build -C drivers/natsgo -o ../../bin/repro2180 ./repro2180
 
 - [DESIGN.md](https://github.com/omkar619-dev/driftlab/blob/main/DESIGN.md): the principles, the
   history format, the checker's rules, every scenario and every result.
-- Next is v1: the Go Kafka clients (franz-go, sarama, kafka-go and confluent-kafka-go).
+- v1, the Go Kafka clients, is under way: franz-go is calibrated, and a relay driver tests
+  programs that copy topics between clusters. sarama, kafka-go and confluent-kafka-go come next.
 
 Apache-2.0.
