@@ -350,6 +350,29 @@ out the 10 ms linger that franz-go has defaulted to since v1.20.0, and on 2026-1
 one-at-a-time publishes took 0.44 s on v1.20.7 and 1.70 s on v1.20.6. Anything in the
 calibration that depends on timing behaves differently between the two.
 
+**sarama.** `drivers/sarama` tests IBM's sarama the same way: sarama writes and, in `control`, reads
+while the topic is written, and franz-go v1.20.7 does everything else, from creating the topic to
+the final read, so the witness is never the thing being tested. sarama's defaults leave its
+idempotent producer off, so the driver turns it on, with the three settings sarama requires for it:
+acks from every in-sync replica, one request in flight per broker, and at least one retry, which the
+default of three already gives. Its docs promise that the idempotent producer "will ensure that
+exactly one copy of each message is written", and the checker holds it to that. Two more settings
+only serve the driver: each success comes back with its position, and each message names its
+partition. Everything else stays at sarama's defaults, including the protocol version it speaks,
+2.8, which the meta line records. The driver writes through `AsyncProducer`, at a steady pace and
+without waiting for each ack, so several values are in flight at once, as they are for most sarama
+users. A success is recorded as `ok`, with the partition and offset the broker gave. An error is
+recorded as `info`, not `fail`, because sarama only says the producer failed to deliver the message,
+which doesn't promise that the broker never stored it. In `control` the helper is a
+`PartitionConsumer` on every partition, reading from the oldest offset with no group; sarama hands
+messages over one at a time, so its deliver lines carry no poll number. The calibration pair is
+v1.61.0 and v1.61.1. Before https://github.com/IBM/sarama/pull/3762, released in v1.61.1, a message
+numbered before a failed batch bumped the producer's epoch could be sent under the new epoch with
+its old sequence number, so a later message could share its identity, and the broker would
+acknowledge that one as a duplicate without writing it: the same shape as franz-go 1217.
+`v1.61.0.mod` pins the release before the fix and keeps the compression libraries at the versions
+v1.61.1 needs, so the two builds differ only in sarama.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
@@ -680,8 +703,11 @@ driftlab/
 │   │   ├── go.mod
 │   │   ├── v1.20.6.mod
 │   │   └── repro1505/
-│   └── relay/
-│       └── go.mod
+│   ├── relay/
+│   │   └── go.mod
+│   └── sarama/
+│       ├── go.mod
+│       └── v1.61.0.mod
 ├── deploy/
 │   ├── compose.yaml
 │   ├── kafka.yaml
@@ -710,6 +736,9 @@ driftlab/
 | `drivers/franzgo/repro1505/` | a standalone reproducer for franz-go issue 1505, which needs no broker at all |
 | `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command and keeps it running as a supervisor would, writes into the source, can freeze or cut the copy's followers and crash the program meanwhile, and reads the copy back |
 | `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
+| `drivers/sarama/` | a separate module that writes through sarama's idempotent producer and, in `control`, reads through its partition consumer, with franz-go v1.20.7 as the witness |
+| `drivers/sarama/go.mod` | pins sarama v1.61.1 and franz-go v1.20.7 |
+| `drivers/sarama/v1.61.0.mod` | pins sarama v1.61.0, the release before the fix in sarama PR 3762, used via `-modfile` |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `deploy/kafka-source.yaml` | a one-broker Kafka cluster in a compose project of its own: the source for programs that copy messages between two clusters |
