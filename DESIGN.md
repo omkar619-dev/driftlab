@@ -356,22 +356,59 @@ the final read, so the witness is never the thing being tested. sarama's default
 idempotent producer off, so the driver turns it on, with the three settings sarama requires for it:
 acks from every in-sync replica, one request in flight per broker, and at least one retry, which the
 default of three already gives. Its docs promise that the idempotent producer "will ensure that
-exactly one copy of each message is written", and the checker holds it to that. Two more settings
-only serve the driver: each success comes back with its position, and each message names its
-partition. Everything else stays at sarama's defaults, including the protocol version it speaks,
-2.8, which the meta line records. The driver writes through `AsyncProducer`, at a steady pace and
-without waiting for each ack, so several values are in flight at once, as they are for most sarama
-users. A success is recorded as `ok`, with the partition and offset the broker gave. An error is
-recorded as `info`, not `fail`, because sarama only says the producer failed to deliver the message,
-which doesn't promise that the broker never stored it. In `control` the helper is a
-`PartitionConsumer` on every partition, reading from the oldest offset with no group; sarama hands
-messages over one at a time, so its deliver lines carry no poll number. The calibration pair is
-v1.61.0 and v1.61.1. Before https://github.com/IBM/sarama/pull/3762, released in v1.61.1, a message
+exactly one copy of each message is written", and the checker holds it to that; the same doc says it
+keeps messages in order more strictly, which `nonmonotonic-send` checks. Two more settings only
+serve the driver: each success comes back with its position, and each message names its partition.
+Everything else stays at sarama's defaults, including the protocol version it speaks, 2.8, except
+where a scenario below changes it, and the meta line records each setting a scenario can change. The
+driver writes through `AsyncProducer`, at a steady pace and without waiting for each ack, so several
+values are in flight at once, as they are for most sarama users. A success is recorded as `ok`, with
+the partition and offset the broker gave. An error is recorded as `info`, not `fail`, because sarama
+only says the producer failed to deliver the message, which doesn't promise that the broker never
+stored it. In `control` the helper is a `PartitionConsumer` on every partition, reading from the
+oldest offset with no group; sarama hands messages over one at a time, so its deliver lines carry no
+poll number.
+
+**The sarama calibration pair.** Before https://github.com/IBM/sarama/pull/3762, sarama numbered
+each idempotent message as it queued it for a broker, not when its batch was sent. So a message
 numbered before a failed batch bumped the producer's epoch could be sent under the new epoch with
-its old sequence number, so a later message could share its identity, and the broker would
-acknowledge that one as a duplicate without writing it: the same shape as franz-go 1217.
-`v1.61.0.mod` pins the release before the fix and keeps the compression libraries at the versions
-v1.61.1 needs, so the two builds differ only in sarama.
+its old sequence number, a later message could share its identity, and the broker would acknowledge
+that one as a duplicate without writing it: the same shape as franz-go 1217. The pull request's two
+commits sit between v1.61.0 and v1.61.1, but so do 44 others, among them more producer fixes. After
+https://github.com/IBM/sarama/pull/3768, for one, a failed batch bumps the epoch once instead of
+once per message. So a failure that v1.61.0 has and v1.61.1 doesn't can't be pinned on 3762. The
+calibration pair is two commits instead: d0755db, just before the pull request, and 477992f, its
+last, which differ by the pull request alone. `pr3762-before.mod` and `pr3762-after.mod` pin them.
+`v1.61.0.mod` and `go.mod` pin the releases, which stay in the runs because they are what people
+install. All four keep the compression libraries at the versions v1.61.1 needs, so any two of the
+builds differ only in sarama.
+
+**The 3762 scenario.** The bug needs a batch that uses up its retries, because only then does sarama
+start a new epoch. In `followers-cut` the topic has one partition, and sarama's `Producer.Timeout`,
+how long the leader may wait for its copies, is 2 seconds instead of 10. Just before value 201 the
+driver cuts the fetches of the two brokers that hold the partition's other copies, with the nftables
+cut of `relay-restart-cut`, for 20 seconds. The leader stores each batch but can't get it copied,
+answers REQUEST_TIMED_OUT after 2 seconds, and once sarama's three retries are used up, about 8
+seconds in, the batch fails and the epoch moves on. With the default 10 seconds the retries would
+outlast the cut, and nothing would fail. It is a cut, not the freeze of franz-go's calibration,
+because sarama's idempotent producer refreshes its metadata after every retriable error, on the
+producer's own goroutine, from whichever broker is least busy. With two of three brokers frozen that
+is usually a frozen one, which only answers after the thaw, so no batch would use up its retries
+during the freeze. That comes from reading sarama's code, not from a run. A cut broker keeps
+answering clients. With the few seconds nft takes to put the cut in place, 20 seconds stays well
+under the 30 after which the leader drops a lagging follower. The stream runs at the usual pace for
+3,200 values, so it goes on for about 10 seconds after the cut, and new messages get numbered
+before, during and after each new epoch. The run declares two faults, each with evidence of its own:
+the cut (nft lists the rule in both brokers' networks) and the timeout (a publish that failed with
+REQUEST_TIMED_OUT after the cut began). Without both, the trigger didn't fire, and the run is
+invalid rather than clean. When the cut ends, its `ok` records the in-sync set as the leader saw it.
+A message the bug swallows should show up three ways: a lost write, an inconsistent offset at the
+position it was acked at, and a nonmonotonic send. `timeout-control` is the same run without the
+cut. `scripts/sarama-calibrate.sh` runs both scenarios three times on all four builds and expects
+only the cut on the two builds without 3762 to fail. The lost write needs the swallowed batch to
+carry exactly the numbers of one the broker has just stored, so it may not show in every run.
+`-max-messages 1`, sarama's `Producer.Flush.MaxMessages`, makes every batch one message long, which
+is how franz-go's one-at-a-time sends made 1217 show every time.
 
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
@@ -707,7 +744,9 @@ driftlab/
 │   │   └── go.mod
 │   └── sarama/
 │       ├── go.mod
-│       └── v1.61.0.mod
+│       ├── v1.61.0.mod
+│       ├── pr3762-before.mod
+│       └── pr3762-after.mod
 ├── deploy/
 │   ├── compose.yaml
 │   ├── kafka.yaml
@@ -716,6 +755,7 @@ driftlab/
 └── scripts/
     ├── matrix.sh
     ├── kafka-calibrate.sh
+    ├── sarama-calibrate.sh
     └── compare-nats.sh
 ```
 
@@ -736,15 +776,18 @@ driftlab/
 | `drivers/franzgo/repro1505/` | a standalone reproducer for franz-go issue 1505, which needs no broker at all |
 | `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command and keeps it running as a supervisor would, writes into the source, can freeze or cut the copy's followers and crash the program meanwhile, and reads the copy back |
 | `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
-| `drivers/sarama/` | a separate module that writes through sarama's idempotent producer and, in `control`, reads through its partition consumer, with franz-go v1.20.7 as the witness |
+| `drivers/sarama/` | a separate module that writes through sarama's idempotent producer and, in `control`, reads through its partition consumer, with franz-go v1.20.7 as the witness; it can cut the partition's followers off from its leader |
 | `drivers/sarama/go.mod` | pins sarama v1.61.1 and franz-go v1.20.7 |
-| `drivers/sarama/v1.61.0.mod` | pins sarama v1.61.0, the release before the fix in sarama PR 3762, used via `-modfile` |
+| `drivers/sarama/v1.61.0.mod` | pins sarama v1.61.0, the last release without sarama PR 3762, used via `-modfile` |
+| `drivers/sarama/pr3762-before.mod` | pins sarama at d0755db, the commit just before PR 3762, used via `-modfile` |
+| `drivers/sarama/pr3762-after.mod` | pins sarama at 477992f, PR 3762's last commit, used via `-modfile` |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `deploy/kafka-source.yaml` | a one-broker Kafka cluster in a compose project of its own: the source for programs that copy messages between two clusters |
-| `deploy/nft/` | the image the relay driver's cut fault runs `nft` from: Alpine with nftables, built once with `docker build -t driftlab-nft deploy/nft` |
+| `deploy/nft/` | the image the cut fault of the relay and sarama drivers runs `nft` from: Alpine with nftables, built once with `docker build -t driftlab-nft deploy/nft` |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 | `scripts/kafka-calibrate.sh` | runs v1's calibration (2 franz-go versions × 2 scenarios × 3 repeats) and checks every verdict against the expected one |
+| `scripts/sarama-calibrate.sh` | runs the sarama calibration (2 commits and 2 releases × 2 scenarios × 3 repeats) and checks every verdict against the expected one; `RUNS` and `ARGS` work as in `compare-nats.sh` |
 | `scripts/compare-nats.sh` | runs the eight NATS scenarios against two or more driver builds, such as a nats.go pull request and the commit it starts from, and prints their verdicts, recovery and lag side by side; `RUNS` repeats them, `SCENARIOS` picks some, and `ARGS` adds driver flags such as `-block-disconnect` |
 
 ## Milestones
