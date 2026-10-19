@@ -402,13 +402,17 @@ before, during and after each new epoch. The run declares two faults, each with 
 the cut (nft lists the rule in both brokers' networks) and the timeout (a publish that failed with
 REQUEST_TIMED_OUT after the cut began). Without both, the trigger didn't fire, and the run is
 invalid rather than clean. When the cut ends, its `ok` records the in-sync set as the leader saw it.
-A message the bug swallows should show up three ways: a lost write, an inconsistent offset at the
-position it was acked at, and a nonmonotonic send. `timeout-control` is the same run without the
-cut. `scripts/sarama-calibrate.sh` runs both scenarios three times on all four builds and expects
-only the cut on the two builds without 3762 to fail. The lost write needs the swallowed batch to
-carry exactly the numbers of one the broker has just stored, so it may not show in every run.
-`-max-messages 1`, sarama's `Producer.Flush.MaxMessages`, makes every batch one message long, which
-is how franz-go's one-at-a-time sends made 1217 show every time.
+A message the bug swallows shows up as a lost write and as an inconsistent offset where it was
+acked, and as a nonmonotonic send when its ack lands at or before the offset of the message sent
+just ahead of it. `timeout-control` is the same run without the cut, and `followers-cut-single` is
+the same run with one message per request (sarama's `Producer.Flush.MaxMessages` set to 1). A
+message is only lost when a fresh batch carries exactly the numbers of one the broker has just
+stored. With sarama's normal batching the counts rarely line up, and a batch sent with old numbers
+is turned away as out of order instead: a failure a correct client may report, so the checker calls
+such a run clean. One message per batch lines the numbers up, as franz-go's one-at-a-time sends did
+for 1217. `scripts/sarama-calibrate.sh` runs the three scenarios three times on all four builds. It
+expects only `followers-cut-single` on the two builds without 3762 to fail, and it counts each run's
+publishes turned away as out of order, which only those two builds should have.
 
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
@@ -787,7 +791,7 @@ driftlab/
 | `deploy/nft/` | the image the cut fault of the relay and sarama drivers runs `nft` from: Alpine with nftables, built once with `docker build -t driftlab-nft deploy/nft` |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 | `scripts/kafka-calibrate.sh` | runs v1's calibration (2 franz-go versions × 2 scenarios × 3 repeats) and checks every verdict against the expected one |
-| `scripts/sarama-calibrate.sh` | runs the sarama calibration (2 commits and 2 releases × 2 scenarios × 3 repeats) and checks every verdict against the expected one; `RUNS` and `ARGS` work as in `compare-nats.sh` |
+| `scripts/sarama-calibrate.sh` | runs the sarama calibration (2 commits and 2 releases × 3 scenarios × 3 repeats), checks every verdict against the expected one, and counts each run's out-of-order rejections; `RUNS` and `ARGS` work as in `compare-nats.sh` |
 | `scripts/compare-nats.sh` | runs the eight NATS scenarios against two or more driver builds, such as a nats.go pull request and the commit it starts from, and prints their verdicts, recovery and lag side by side; `RUNS` repeats them, `SCENARIOS` picks some, and `ARGS` adds driver flags such as `-block-disconnect` |
 
 ## Milestones

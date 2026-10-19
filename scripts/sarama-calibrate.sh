@@ -4,10 +4,14 @@
 # last commit, which differ by that pull request alone. The releases on
 # either side, v1.61.0 and v1.61.1, run too, because they are what people
 # install, but 46 commits separate them, so they can't say which fix
-# mattered. Every build goes through timeout-control and followers-cut. The
-# script builds everything from the current commit, judges each run, and
-# compares every verdict with the one DESIGN.md expects: only followers-cut
-# on the two builds without PR 3762 should fail.
+# mattered. Every build goes through timeout-control, followers-cut and
+# followers-cut-single. The script builds everything from the current commit,
+# judges each run, and compares every verdict with the one DESIGN.md expects:
+# only followers-cut-single on the two builds without PR 3762 should fail.
+# In followers-cut, with sarama's normal batching, the bug shows only as
+# batches turned away as out of order, which a correct client may report.
+# The script counts those rejections in a column of their own, and only the
+# two builds without PR 3762 should have any.
 #
 # Run it on the machine that hosts the Kafka brokers, because followers-cut
 # changes their firewalls through docker:
@@ -18,7 +22,7 @@
 # driver flags to every run, and its letters and digits to every file name,
 # so those runs don't overwrite plain ones:
 #
-#	ARGS="-max-messages 1" scripts/sarama-calibrate.sh
+#	RUNS=1 ARGS="-hold 15s" scripts/sarama-calibrate.sh
 #
 # Each scenario runs on every build back to back, so the rows to compare sit
 # together and a busy moment on the machine lands on every build. Each run's
@@ -41,7 +45,7 @@ mkdir -p "$out"
 # Each build is named after the sarama it pins. v1.61.1 is the module's own
 # go.mod; every other build has a modfile of its own name.
 builds=(pr3762-before pr3762-after v1.61.0 v1.61.1)
-scenarios=(timeout-control followers-cut)
+scenarios=(timeout-control followers-cut followers-cut-single)
 
 echo "building from commit $(git rev-parse --short HEAD)"
 go build -o bin/driftlab ./cmd/driftlab || exit 1
@@ -57,10 +61,11 @@ docker compose -f deploy/kafka.yaml up -d || exit 1
 sleep 20 # give brokers that compose just started time to elect a controller
 
 # expected prints the verdict the calibration expects for a build and a
-# scenario. Only the cut breaks the builds without PR 3762.
+# scenario. Only the cut with one message per request makes the builds
+# without PR 3762 lose messages.
 expected() {
 	case $1/$2 in
-	pr3762-before/followers-cut | v1.61.0/followers-cut) echo failed ;;
+	pr3762-before/followers-cut-single | v1.61.0/followers-cut-single) echo failed ;;
 	*) echo clean ;;
 	esac
 }
@@ -73,7 +78,7 @@ if [ -n "$tag" ]; then
 fi
 total=0
 misses=0
-printf '%-4s %-16s %-14s %-8s %-12s %-10s %s\n' run scenario build expected got unknown anomalies
+printf '%-4s %-20s %-14s %-8s %-12s %-10s %-12s %s\n' run scenario build expected got unknown out-of-order anomalies
 for run in $(seq "$runs"); do
 	for scenario in "${scenarios[@]}"; do
 		for build in "${builds[@]}"; do
@@ -91,6 +96,10 @@ for run in $(seq "$runs"); do
 			# verdict line, such as "1712/3200".
 			unknown=$(head -1 "$out/$name.txt" 2>/dev/null | awk '{print $3 "/" $5}')
 
+			# How many publishes the broker turned away as out of order: the
+			# milder outcome of the bug, which a fixed build never shows.
+			ooo=$(grep -c 'out of order sequence number' "$out/$name.jsonl" 2>/dev/null)
+
 			# The anomaly kinds the checker reported, each with how many there
 			# were, such as "inconsistent-offsets:2 lost-write:2".
 			kinds=$(grep -v -E '^(verdict|invalid|recovery|lag)' "$out/$name.txt" 2>/dev/null | cut -d' ' -f1 | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}')
@@ -101,7 +110,7 @@ for run in $(seq "$runs"); do
 				note="  <- not as expected"
 				misses=$((misses + 1))
 			fi
-			printf '%-4s %-16s %-14s %-8s %-12s %-10s %s%s\n' "$run" "$scenario" "$build" "$want" "$got" "${unknown:--}" "${kinds:--}" "$note"
+			printf '%-4s %-20s %-14s %-8s %-12s %-10s %-12s %s%s\n' "$run" "$scenario" "$build" "$want" "$got" "${unknown:--}" "${ooo:--}" "${kinds:--}" "$note"
 		done
 	done
 done

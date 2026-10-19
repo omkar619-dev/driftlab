@@ -40,17 +40,19 @@ const replicas = 3
 // the topic through sarama while it is being written. A non-zero partitions
 // or n overrides the -partitions or -n flag, and a non-zero timeout replaces
 // sarama's Producer.Timeout: how long the leader may wait for its copies
-// before it answers REQUEST_TIMED_OUT. With cut set, the brokers holding
-// partition 0's other copies stop fetching from it for hold, starting just
-// before value cutAt is handed over.
+// before it answers REQUEST_TIMED_OUT. A non-zero maxMessages replaces
+// Producer.Flush.MaxMessages, the most messages one request may carry. With
+// cut set, the brokers holding partition 0's other copies stop fetching from
+// it for hold, starting just before value cutAt is handed over.
 type scenario struct {
-	consumer   bool
-	partitions int
-	n          uint64
-	timeout    time.Duration
-	cut        bool
-	cutAt      uint64
-	hold       time.Duration
+	consumer    bool
+	partitions  int
+	n           uint64
+	timeout     time.Duration
+	maxMessages int
+	cut         bool
+	cutAt       uint64
+	hold        time.Duration
 }
 
 // The calibration scenarios use one partition, so every message meets the
@@ -64,12 +66,17 @@ type scenario struct {
 // the leader drops a follower that has stopped fetching. The stream goes on
 // for about 10 seconds after the cut, so new messages are numbered before,
 // during and after the new epochs. timeout-control is the same run without
-// the cut.
+// the cut. followers-cut-single is followers-cut with one message per
+// request. Before PR 3762, a batch sent with numbers left from an earlier
+// epoch is usually just turned away as out of order; a message is only lost
+// when a later batch carries exactly the numbers of one the broker has just
+// stored, and with one message per batch the numbers line up.
 var scenarios = map[string]scenario{
-	"publish-only":    {},
-	"control":         {consumer: true},
-	"timeout-control": {partitions: 1, n: 3200, timeout: 2 * time.Second},
-	"followers-cut":   {partitions: 1, n: 3200, timeout: 2 * time.Second, cut: true, cutAt: 201, hold: 20 * time.Second},
+	"publish-only":         {},
+	"control":              {consumer: true},
+	"timeout-control":      {partitions: 1, n: 3200, timeout: 2 * time.Second},
+	"followers-cut":        {partitions: 1, n: 3200, timeout: 2 * time.Second, cut: true, cutAt: 201, hold: 20 * time.Second},
+	"followers-cut-single": {partitions: 1, n: 3200, timeout: 2 * time.Second, maxMessages: 1, cut: true, cutAt: 201, hold: 20 * time.Second},
 }
 
 type config struct {
@@ -91,14 +98,14 @@ func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control or followers-cut")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control, followers-cut or followers-cut-single")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish, unless the scenario sets it")
 	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic, unless the scenario sets it")
 	flag.DurationVar(&c.interval, "interval", 10*time.Millisecond, "the pause after handing each value to the producer")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the helper gets to catch up before the final read")
 	flag.DurationVar(&c.timeout, "timeout", 0, "sarama's Producer.Timeout; 0 keeps the scenario's own, or sarama's default")
 	flag.DurationVar(&c.hold, "hold", 0, "how long the cut lasts; 0 keeps the scenario's own")
-	flag.IntVar(&c.maxMessages, "max-messages", 0, "sarama's Producer.Flush.MaxMessages, the most messages one request may carry; 0 keeps sarama's default, no limit")
+	flag.IntVar(&c.maxMessages, "max-messages", 0, "sarama's Producer.Flush.MaxMessages, the most messages one request may carry; 0 keeps the scenario's own, or sarama's default, no limit")
 	flag.StringVar(&c.nftImage, "nft-image", "driftlab-nft", "the image the cut runs nft from, inside a broker's network (docker build -t driftlab-nft deploy/nft)")
 	flag.IntVar(&c.cutPort, "cut-port", 19092, "the port the brokers fetch from each other on, which the cut drops (deploy/kafka.yaml's INTERNAL listener)")
 	flag.Parse()
@@ -113,8 +120,8 @@ func run(c config, out io.Writer) error {
 	if !ok {
 		return fmt.Errorf("unknown scenario %q", c.scenario)
 	}
-	// The flags fill in what the scenario leaves open, and -timeout and -hold
-	// let a run differ from its scenario, to find thresholds.
+	// The flags fill in what the scenario leaves open, and -timeout, -hold and
+	// -max-messages let a run differ from its scenario, to find thresholds.
 	if sc.partitions == 0 {
 		sc.partitions = c.partitions
 	}
@@ -126,6 +133,9 @@ func run(c config, out io.Writer) error {
 	}
 	if c.hold > 0 {
 		sc.hold = c.hold
+	}
+	if c.maxMessages > 0 {
+		sc.maxMessages = c.maxMessages
 	}
 	if sc.n < 1 {
 		return errors.New("-n must be at least 1")
@@ -165,7 +175,7 @@ func run(c config, out io.Writer) error {
 		clearCuts(setup, adm, topic, c)
 	}
 
-	cfg := producerConfig(sc.timeout, c.maxMessages)
+	cfg := producerConfig(sc.timeout, sc.maxMessages)
 	rec.writeMeta(newMeta(c, sc, topic, cfg))
 	var h *helper
 	if sc.consumer {
