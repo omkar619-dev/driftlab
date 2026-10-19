@@ -450,6 +450,20 @@ publishes turned away as out of order, which only those two builds should have.
   runs were clean. As with franz-go's first full run, the miss was in what the harness expected, not
   in the checker, and those diaries are kept.
 
+**sarama's table.** After the calibration, the same driver runs the faults of the published table,
+on v1.61.1 with the idempotent settings above, each on a one-partition topic, so every message meets
+the fault, and with a solo helper reading through sarama's partition consumer, whose docs say it
+keeps retrying through every error but an offset out of range. `leader-kill` kills the broker that
+leads the partition just before value 501, the way a crash would, and starts it again 20 seconds
+later. Until the controller notices, after the brokers' 9-second session timeout, and picks a new
+leader from the in-sync set, sarama has nowhere to send, and its three retries, 100 milliseconds
+apart, run out long before; those sends end as `info`. The kill only counts if docker shows the
+broker stopped and the cluster then names a new leader. Its `ok` comes when that leader shows up,
+the moment the partition can be used again, so the helper's recovery is measured from there, and it
+records how long the election took. The broker comes back as a follower, and the run waits until it
+is back in the in-sync set, so the next run starts with three brokers; every run also waits for the
+cluster to list three live brokers before it creates its topic.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
@@ -816,7 +830,7 @@ driftlab/
 | `drivers/franzgo/repro1505/` | a standalone reproducer for franz-go issue 1505, which needs no broker at all |
 | `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command and keeps it running as a supervisor would, writes into the source, can freeze or cut the copy's followers and crash the program meanwhile, and reads the copy back |
 | `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
-| `drivers/sarama/` | a separate module that writes through sarama's idempotent producer and, in `control`, reads through its partition consumer, with franz-go v1.20.7 as the witness; it can cut the partition's followers off from its leader |
+| `drivers/sarama/` | a separate module that writes through sarama's idempotent producer and, with a helper, reads through its partition consumer, with franz-go v1.20.7 as the witness; it can cut the partition's followers off from its leader, or kill the leader |
 | `drivers/sarama/go.mod` | pins sarama v1.61.1 and franz-go v1.20.7 |
 | `drivers/sarama/v1.61.0.mod` | pins sarama v1.61.0, the last release without sarama PR 3762, used via `-modfile` |
 | `drivers/sarama/pr3762-before.mod` | pins sarama at d0755db, the commit just before PR 3762, used via `-modfile` |
