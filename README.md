@@ -27,8 +27,9 @@ Against nats.go, the Go client for NATS JetStream, at v1.53.1 and v1.54.0:
   fix, https://github.com/nats-io/nats.go/pull/2201, which driftlab checked; it isn't merged yet.
 - **The `jetstream` ordered consumer uses a 15-second heartbeat instead of the 5 seconds it works
   out for itself, so it takes 30 seconds, not 10, to notice a silent line.**
-  https://github.com/nats-io/nats.go/issues/2181 (reported 2026-10-12). A fix is under review,
-  https://github.com/nats-io/nats.go/pull/2182, which driftlab checked too.
+  https://github.com/nats-io/nats.go/issues/2181 (reported 2026-10-12). Fixed by
+  https://github.com/nats-io/nats.go/pull/2182, which driftlab checked too. It was merged on
+  2026-10-19, after v1.54.0, so it isn't in a release yet.
 
 Neither loses or duplicates a message.
 

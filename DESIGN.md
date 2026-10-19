@@ -228,7 +228,8 @@ versions within a few hundred milliseconds of each other:
   5-second heartbeat for ordered consumers but never passes it on (see the network paragraph
   above). So `net-slow`'s 25 seconds of silence never raised `ErrNoHeartbeat`, and
   `server-pause`'s 35 seconds raised it at 30.04 s. Reported as
-  https://github.com/nats-io/nats.go/issues/2181.
+  https://github.com/nats-io/nats.go/issues/2181, and fixed by
+  https://github.com/nats-io/nats.go/pull/2182, merged on 2026-10-19, after v1.54.0.
 - **`info` really does mean unknown.** All seven publishes that timed out during `server-pause`,
   and the one during `server-kill`, still landed in the stream once the server was back. Recording
   them as `fail` would have turned each one into a phantom (principle 3).
