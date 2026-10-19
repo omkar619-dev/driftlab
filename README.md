@@ -57,7 +57,10 @@ Before any of that counted, driftlab was calibrated on a known, fixed bug,
 https://github.com/nats-io/nats.go/issues/2107. It fails v1.53.1 exactly as the issue describes,
 with 80 messages never delivered, and it passes v1.54.0, which has the fix. The Kafka side was
 calibrated the same way, on https://github.com/twmb/franz-go/issues/1217: franz-go v1.20.6 fails
-and v1.20.7 passes, and all 12 calibration runs came out as expected.
+and v1.20.7 passes, and all 12 calibration runs came out as expected. sarama was calibrated on the
+commits on either side of https://github.com/IBM/sarama/pull/3762: sending one message per request,
+the commit before the fix lost two acknowledged messages in every run, and the one after it never
+did. All 36 runs came out as expected.
 
 ## The matrix
 
@@ -109,7 +112,7 @@ go build -C drivers/franzgo -o ../../bin/repro1505 ./repro1505
 
 - [DESIGN.md](https://github.com/omkar619-dev/driftlab/blob/main/DESIGN.md): the principles, the
   history format, the checker's rules, every scenario and every result.
-- v1, the Go Kafka clients, is under way: franz-go is calibrated, and a relay driver tests
-  programs that copy topics between clusters. sarama, kafka-go and confluent-kafka-go come next.
+- v1, the Go Kafka clients, is under way: franz-go and sarama are calibrated, and a relay driver
+  tests programs that copy topics between clusters. kafka-go and confluent-kafka-go come next.
 
 Apache-2.0.

@@ -414,6 +414,42 @@ for 1217. `scripts/sarama-calibrate.sh` runs the three scenarios three times on 
 expects only `followers-cut-single` on the two builds without 3762 to fail, and it counts each run's
 publishes turned away as out of order, which only those two builds should have.
 
+**sarama calibration results.** On 2026-10-19, at commit `ef7a8a3`, against apache/kafka 4.3.1, all
+36 runs of `scripts/sarama-calibrate.sh` came out as expected:
+
+| Scenario | d0755db, before 3762 | 477992f, after 3762 | v1.61.0 | v1.61.1 |
+|---|---|---|---|---|
+| `timeout-control` | clean ×3 | clean ×3 | clean ×3 | clean ×3 |
+| `followers-cut` | clean ×3; 415–1226 out of order | clean ×3; none out of order | clean ×3; 416–1246 out of order | clean ×3; none out of order |
+| `followers-cut-single` | **failed** ×3: lost-write, inconsistent-offsets, nonmonotonic-send | clean ×3 | **failed** ×3: the same | clean ×3 |
+
+- Every failure has the same fingerprint: two messages swallowed back to back. In the first
+  `followers-cut-single` run on d0755db, values 1551 and 1552 were stored at offsets 619 and 620.
+  Values 1553 and 1554, sent just after 1552, were acked at offsets 619 and 620 as well, and are
+  missing from the final read: the broker answered them as repeats of 1551 and 1552, the shape PR
+  3762 describes. All four acks came back within 2 milliseconds. Only 1553 breaks the send order,
+  because 1554 comes after it both in sending and in offset. Kafka's own console consumer read the
+  topic again and agrees with the final read at all 2267 offsets.
+- With sarama's normal batching, the same two builds lost nothing, in these 6 runs and in the 6 of
+  the first pass. Each of those 12 runs instead had 415 to 1269 publishes turned away as out of
+  order, and no run on the fixed builds had any. sarama reports them as failed sends, which its
+  promise allows, so the checker calls those runs clean, and only the out-of-order count tells the
+  builds apart.
+- On the builds without the pull request, most failed sends are those rejections, not timeouts:
+  about 715 of about 936 in a `followers-cut-single` run, where the fixed builds fail 921 sends, all
+  of them timed out.
+- The releases behave like the commits on either side of the pull request in every scenario: v1.61.0
+  like d0755db, and v1.61.1 like 477992f. The two commits differ by the pull request alone, so in
+  these runs it accounts for the whole difference between the releases.
+- The first pass got the expectations wrong. At `1b52108` the script still expected `followers-cut`
+  itself to fail on the builds without 3762, and 6 of 24 runs came back not as expected: with normal
+  batching, the bug never lined a stale batch up with a fresh one. Two more passes at that commit
+  with `-max-messages 1` failed all 12 runs on those builds and passed all 12 on the fixed ones,
+  which is why `followers-cut-single` exists. Counting this pass, one message per request has failed
+  all 18 runs on the builds without 3762 and passed all 18 on the fixed ones, and all 48 control
+  runs were clean. As with franz-go's first full run, the miss was in what the harness expected, not
+  in the checker, and those diaries are kept.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
@@ -813,7 +849,9 @@ driftlab/
   2026-10-14: the calibration pair reproduces, with franz-go v1.20.6 failing and v1.20.7 passing
   in all 12 runs (see v1 calibration results). The relay driver followed, and its first target,
   kaf-relay, gave two upstream reports, kaf-relay issues 48 and 49, and a third for franz-go
-  itself, franz-go issue 1505 (see Relay results). The version ends with the published table.
+  itself, franz-go issue 1505 (see Relay results). sarama was calibrated on 2026-10-19, on the
+  commits on either side of sarama PR 3762 (see sarama calibration results). The version ends
+  with the published table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 
