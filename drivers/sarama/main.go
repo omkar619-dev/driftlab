@@ -46,18 +46,23 @@ const replicas = 3
 // before it answers REQUEST_TIMED_OUT. A non-zero maxMessages replaces
 // Producer.Flush.MaxMessages, the most messages one request may carry. A
 // fault, if set, starts just before value faultAt is handed over and lasts
-// hold: "cut" stops the brokers holding partition 0's other copies from
-// fetching from it, "pause" freezes them, and "kill" kills the broker that
-// leads partition 0 and then starts it again.
+// hold: "cut" stops brokers holding partition 0's other copies from fetching
+// from it, "pause" freezes them, and "kill" kills the broker that leads
+// partition 0 and then starts it again. A cut or a freeze hits the first
+// followers of them, or all of them when followers is 0. With expectTimeout
+// set, the run also declares the calibration's trigger: a publish that failed
+// with REQUEST_TIMED_OUT once the fault began.
 type scenario struct {
-	consumer    bool
-	partitions  int
-	n           uint64
-	timeout     time.Duration
-	maxMessages int
-	fault       string
-	faultAt     uint64
-	hold        time.Duration
+	consumer      bool
+	partitions    int
+	n             uint64
+	timeout       time.Duration
+	maxMessages   int
+	fault         string
+	followers     int
+	faultAt       uint64
+	hold          time.Duration
+	expectTimeout bool
 }
 
 // The calibration scenarios use one partition, so every message meets the
@@ -98,14 +103,31 @@ type scenario struct {
 // which doesn't answer until the thaw, the producer waits there, and so does
 // every message behind it. -sarama-log keeps sarama's own log, so that wait
 // can be seen.
+//
+// follower-pause and follower-cut hit only one of the two followers, as a
+// broker that hangs or loses its link to the leader would. A frozen follower
+// stops checking in, so with the other two brokers still a quorum, the
+// controller fences it after the 9-second session timeout, or about 12
+// seconds when it was the active controller and a new one has to be picked
+// first, and fencing takes it out of the in-sync set. A cut follower keeps
+// checking in, so only the leader drops it, once it has lagged for 30
+// seconds; the leader looks every 15 seconds, so that happens 30 to 45
+// seconds in, and the cut holds for 50. Either way the leader then counts a
+// write as copied by the other follower, and the partition takes writes
+// again; an info line records when the in-sync set shrank. Run with -timeout
+// 2s, follower-pause also tests what followers-pause showed: refreshing its
+// metadata after each timed-out batch, sarama's producer can end up waiting on
+// the frozen broker after the partition took writes again.
 var scenarios = map[string]scenario{
 	"publish-only":         {},
 	"control":              {consumer: true},
 	"timeout-control":      {partitions: 1, n: 3200, timeout: 2 * time.Second},
-	"followers-cut":        {partitions: 1, n: 3200, timeout: 2 * time.Second, fault: "cut", faultAt: 201, hold: 20 * time.Second},
-	"followers-cut-single": {partitions: 1, n: 3200, timeout: 2 * time.Second, maxMessages: 1, fault: "cut", faultAt: 201, hold: 20 * time.Second},
+	"followers-cut":        {partitions: 1, n: 3200, timeout: 2 * time.Second, fault: "cut", faultAt: 201, hold: 20 * time.Second, expectTimeout: true},
+	"followers-cut-single": {partitions: 1, n: 3200, timeout: 2 * time.Second, maxMessages: 1, fault: "cut", faultAt: 201, hold: 20 * time.Second, expectTimeout: true},
 	"leader-kill":          {consumer: true, partitions: 1, n: 3000, fault: "kill", faultAt: 501, hold: 20 * time.Second},
 	"followers-pause":      {consumer: true, partitions: 1, n: 4000, fault: "pause", faultAt: 501, hold: 25 * time.Second},
+	"follower-pause":       {consumer: true, partitions: 1, n: 4000, fault: "pause", followers: 1, faultAt: 501, hold: 25 * time.Second},
+	"follower-cut":         {consumer: true, partitions: 1, n: 6500, fault: "cut", followers: 1, faultAt: 501, hold: 50 * time.Second},
 }
 
 type config struct {
@@ -128,7 +150,7 @@ func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control, followers-cut, followers-cut-single, leader-kill or followers-pause")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control, followers-cut, followers-cut-single, leader-kill, followers-pause, follower-pause or follower-cut")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish, unless the scenario sets it")
 	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic, unless the scenario sets it")
 	flag.DurationVar(&c.interval, "interval", 10*time.Millisecond, "the pause after handing each value to the producer")
@@ -238,11 +260,11 @@ func run(c config, out io.Writer) error {
 			return err
 		}
 	}
-	// In a cut run, the first publish that fails with REQUEST_TIMED_OUT after
-	// the cut began is the evidence that a batch used up its retries, which
-	// is when sarama starts a new epoch.
+	// In the calibration's cut runs, the first publish that fails with
+	// REQUEST_TIMED_OUT after the cut began is the evidence that a batch used
+	// up its retries, which is when sarama starts a new epoch.
 	var timedOut func()
-	if sc.fault == "cut" {
+	if sc.expectTimeout {
 		timedOut = sync.OnceFunc(func() {
 			rec.op(op{Process: "nemesis", Type: "ok", F: "timeout"})
 		})
@@ -261,17 +283,19 @@ func run(c config, out io.Writer) error {
 		if sc.fault != "" && v == sc.faultAt {
 			switch sc.fault {
 			case "cut":
-				if ft, err = startCut(ctx, adm, rec, topic, sc.hold, c); err != nil {
+				if ft, err = startCut(ctx, adm, rec, topic, sc.followers, sc.hold, c); err != nil {
 					return err
 				}
-				rec.op(op{Process: "nemesis", Type: "invoke", F: "timeout"})
+				if sc.expectTimeout {
+					rec.op(op{Process: "nemesis", Type: "invoke", F: "timeout"})
+				}
 				w.cutting.Store(true)
 			case "kill":
 				if ft, err = startKill(ctx, adm, rec, topic, sc.hold); err != nil {
 					return err
 				}
 			case "pause":
-				if ft, err = startPause(ctx, adm, rec, topic, sc.hold); err != nil {
+				if ft, err = startPause(ctx, adm, rec, topic, sc.followers, sc.hold); err != nil {
 					return err
 				}
 			}
@@ -532,27 +556,32 @@ type activeFault struct {
 	err  error
 }
 
-// startCut cuts the fetches of the brokers that hold partition 0's other
-// copies, but not its leader's, and heals them after hold on a goroutine of
-// its own, because the stream goes on meanwhile. A cut broker stops copying
+// startCut cuts the fetches of n of the brokers that hold partition 0's other
+// copies, or of all of them when n is 0, but never its leader's, and heals them
+// after hold on a goroutine of its own, because the stream goes on meanwhile.
+// watchISR notes when the in-sync set drops them. A cut broker stops copying
 // from the leader but keeps checking in with the controller and answering
 // clients, so it stays in the in-sync set until the leader drops it for
-// lagging, after 30 seconds. Until then the leader stores each batch but
-// can't count it as copied, and once Producer.Timeout runs out it answers
-// REQUEST_TIMED_OUT. The cut only counts as done if nft showed the drop rule
-// in every cut broker's network, and its ok records the partition's in-sync
-// set as the leader saw it just before the heal. Containers are named after
-// the brokers' node IDs, as deploy/kafka.yaml names them.
-func startCut(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, hold time.Duration, c config) (*activeFault, error) {
-	leader, followers, err := followersOf(ctx, cl, topic)
+// lagging, after 30 seconds. Until then the leader stores each batch but can't
+// count it as copied, and once Producer.Timeout runs out it answers
+// REQUEST_TIMED_OUT. The cut only counts as done if nft showed the drop rule in
+// every cut broker's network, and its ok records the partition's in-sync set as
+// the leader saw it just before the heal. Containers are named after the
+// brokers' node IDs, as deploy/kafka.yaml names them.
+func startCut(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, n int, hold time.Duration, c config) (*activeFault, error) {
+	leader, hit, err := followersOf(ctx, cl, topic)
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, len(followers))
-	for i, id := range followers {
+	if n > 0 && n < len(hit) {
+		hit = hit[:n]
+	}
+	names := make([]string, len(hit))
+	for i, id := range hit {
 		names[i] = fmt.Sprintf("kafka-%d", id)
 	}
 	rec.op(op{Process: "nemesis", Type: "invoke", F: "cut", Detail: map[string]any{"leader": leader, "cut": names}})
+	began := time.Now()
 	for _, name := range names {
 		if _, err := nft(c, name, cutRules(c.cutPort), "-f", "-"); err != nil {
 			healCuts(c, names) // never leave one of them cut
@@ -563,7 +592,9 @@ func startCut(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, 
 	ct := &activeFault{over: make(chan struct{})}
 	go func() {
 		defer close(ct.over)
-		time.Sleep(hold)
+		end := time.Now().Add(hold)
+		watchISR(ctx, cl, rec, leader, topic, hit, began, end)
+		time.Sleep(time.Until(end))
 		isr, isrErr := leaderISR(ctx, cl, leader, topic)
 		// Heal whatever the check said, so a run never leaves brokers cut.
 		if err := healCuts(c, names); err != nil {
@@ -650,26 +681,31 @@ func clearCuts(ctx context.Context, cl *kgo.Client, topic string, c config) {
 	}
 }
 
-// startPause freezes the brokers that hold partition 0's other copies with
-// docker pause, but not its leader, and thaws them after hold, on a goroutine
-// of its own, because the stream goes on meanwhile. With two of the three
-// brokers frozen there is also no controller quorum, so nothing can take
-// them out of the in-sync set: the leader stores each batch but can never get
-// it copied. Unlike a cut broker, a frozen one doesn't answer clients either.
-// The freeze only counts as done if docker showed every follower paused, and
-// its ok records the partition's in-sync set as the leader saw it just
-// before the thaw. Containers are named after the brokers' node IDs, as
-// deploy/kafka.yaml names them.
-func startPause(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, hold time.Duration) (*activeFault, error) {
-	leader, followers, err := followersOf(ctx, cl, topic)
+// startPause freezes n of the brokers that hold partition 0's other copies, or
+// all of them when n is 0, with docker pause, but never its leader, and thaws
+// them after hold, on a goroutine of its own, because the stream goes on
+// meanwhile. With two of the three brokers frozen there is also no controller
+// quorum, so nothing can take them out of the in-sync set: the leader stores
+// each batch but can never get it copied. With one frozen, the controller
+// fences it, and watchISR notes when that drops it from the set. Unlike a cut
+// broker, a frozen one doesn't answer clients either. The freeze only counts as
+// done if docker showed every follower paused, and its ok records the
+// partition's in-sync set as the leader saw it just before the thaw. Containers
+// are named after the brokers' node IDs, as deploy/kafka.yaml names them.
+func startPause(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, n int, hold time.Duration) (*activeFault, error) {
+	leader, hit, err := followersOf(ctx, cl, topic)
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, len(followers))
-	for i, id := range followers {
+	if n > 0 && n < len(hit) {
+		hit = hit[:n]
+	}
+	names := make([]string, len(hit))
+	for i, id := range hit {
 		names[i] = fmt.Sprintf("kafka-%d", id)
 	}
 	rec.op(op{Process: "nemesis", Type: "invoke", F: "pause", Detail: map[string]any{"leader": leader, "paused": names}})
+	began := time.Now()
 	if _, err := dockerIn("", append([]string{"pause"}, names...)...); err != nil {
 		dockerIn("", append([]string{"unpause"}, names...)...) // never leave one of them frozen
 		return nil, err
@@ -678,7 +714,9 @@ func startPause(ctx context.Context, cl *kgo.Client, rec *recorder, topic string
 	ft := &activeFault{over: make(chan struct{})}
 	go func() {
 		defer close(ft.over)
-		time.Sleep(hold)
+		end := time.Now().Add(hold)
+		watchISR(ctx, cl, rec, leader, topic, hit, began, end)
+		time.Sleep(time.Until(end))
 		isr, isrErr := leaderISR(ctx, cl, leader, topic)
 		// Thaw them whatever the check said, so a run never leaves brokers
 		// frozen.
@@ -699,6 +737,23 @@ func startPause(ctx context.Context, cl *kgo.Client, rec *recorder, topic string
 		}
 	}()
 	return ft, nil
+}
+
+// watchISR asks the leader every 250 milliseconds for partition 0's in-sync
+// set, until none of the faulted brokers is in it or end passes, and records
+// an info the first time none is, with how long after began, when the fault
+// was invoked: from then on the leader counts a write as copied without them,
+// so the partition takes writes again. When two followers are frozen, the
+// controller quorum goes with them, and the set never shrinks.
+func watchISR(ctx context.Context, cl *kgo.Client, rec *recorder, leader int32, topic string, faulted []int32, began, end time.Time) {
+	for time.Now().Before(end) {
+		isr, err := leaderISR(ctx, cl, leader, topic)
+		if err == nil && !slices.ContainsFunc(faulted, func(id int32) bool { return slices.Contains(isr, id) }) {
+			rec.op(op{Process: "nemesis", Type: "info", F: "isr", Detail: map[string]any{"isr": isr, "after": time.Since(began).Round(time.Millisecond).String()}})
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // thawAll unpauses every broker in deploy/kafka.yaml. It ignores errors,
@@ -1112,9 +1167,10 @@ type params struct {
 // found in the cluster afterwards, the Kafka protocol version sarama was told
 // to speak, the producer settings a scenario can change, and the franz-go
 // the witness used. A run with a helper also says how it consumes: "direct"
-// means partitions assigned by the driver, with no group. A cut run declares
-// the two things its trigger needs: the cut itself, and a publish that failed
-// with REQUEST_TIMED_OUT once the cut began. A kill run declares the kill,
+// means partitions assigned by the driver, with no group. A calibration cut
+// run declares the two things its trigger needs: the cut itself, and a
+// publish that failed with REQUEST_TIMED_OUT once the cut began; any other cut
+// run declares only the cut. A kill run declares the kill,
 // which completes once the partition has a new leader, and a freeze run the
 // freeze. If a declared fault leaves no evidence, the checker calls the run
 // invalid instead of clean.
@@ -1144,7 +1200,10 @@ func newMeta(c config, sc scenario, topic string, cfg *sarama.Config) metaLine {
 	}
 	switch sc.fault {
 	case "cut":
-		m.Faults = []string{"cut", "timeout"}
+		m.Faults = []string{"cut"}
+		if sc.expectTimeout {
+			m.Faults = append(m.Faults, "timeout")
+		}
 		m.Params.Hold = sc.hold.String()
 	case "kill":
 		m.Faults = []string{"kill"}

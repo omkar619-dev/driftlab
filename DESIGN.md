@@ -474,6 +474,20 @@ sarama's own log, debug lines included, with UTC times to the microsecond and th
 on its first line, so that wait shows as the gap between a `client/metadata fetching metadata` line
 and the next `producer/broker` line. A freeze run first thaws any broker a stopped run left frozen.
 
+`follower-pause` and `follower-cut` hit only one of the two followers, as a broker that hangs or
+loses its link to the leader would. A frozen follower stops checking in, so with the other two
+brokers still a quorum, the controller fences it after the 9-second session timeout, about 12
+seconds when it was the active controller and a new one has to be picked first, and fencing takes it
+out of the in-sync set. A cut follower keeps checking in, so only the leader drops it, once it has
+lagged for 30 seconds; the leader looks every 15 seconds, so that happens 30 to 45 seconds in, and
+the cut holds for 50. Either way the leader then counts a write as copied by the other follower, and
+the partition takes writes again; an `info` line records when the in-sync set shrank, measured from
+the fault's start. Run with `-timeout 2s`, `follower-pause` also tests what `followers-pause`
+showed: refreshing its metadata after each timed-out batch, sarama's producer can end up waiting on
+the frozen broker after the partition took writes again. Only the two calibration scenarios, marked
+`expectTimeout`, now declare the `timeout` fault, so a cut that never times a batch out isn't called
+invalid.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
