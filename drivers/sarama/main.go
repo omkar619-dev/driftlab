@@ -4,10 +4,10 @@
 //
 // sarama does the writing and, in the scenarios with a helper, the reading
 // while the topic is written. Everything else goes through franz-go v1.20.7,
-// pinned in go.mod: creating the topic, finding which brokers to cut or kill
-// and where each partition ends, and the final read, so the witness is never
-// the thing being tested. franz-go's admin requests go through kmsg, as in
-// drivers/franzgo.
+// pinned in go.mod: creating the topic, finding which brokers to cut, freeze
+// or kill and where each partition ends, and the final read, so the witness
+// is never the thing being tested. franz-go's admin requests go through kmsg,
+// as in drivers/franzgo.
 package main
 
 import (
@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"runtime/debug"
@@ -46,8 +47,8 @@ const replicas = 3
 // Producer.Flush.MaxMessages, the most messages one request may carry. A
 // fault, if set, starts just before value faultAt is handed over and lasts
 // hold: "cut" stops the brokers holding partition 0's other copies from
-// fetching from it, and "kill" kills the broker that leads partition 0 and
-// then starts it again.
+// fetching from it, "pause" freezes them, and "kill" kills the broker that
+// leads partition 0 and then starts it again.
 type scenario struct {
 	consumer    bool
 	partitions  int
@@ -86,6 +87,17 @@ type scenario struct {
 // the partition through sarama the whole time. sarama's docs say its
 // partition consumer keeps retrying through every error but an offset out of
 // range, so it has to come back on its own.
+//
+// followers-pause freezes the two brokers that hold the partition's other
+// copies with docker pause, just before value 501, for 25 seconds, as
+// drivers/franzgo's followers-pause does, again with sarama's defaults
+// otherwise and a helper reading. The leader can't get anything copied, so
+// after Producer.Timeout, 10 seconds, it answers REQUEST_TIMED_OUT, and
+// sarama, as an idempotent producer, refreshes its metadata before it
+// retries, from whichever broker is least busy. If that is a frozen one,
+// which doesn't answer until the thaw, the producer waits there, and so does
+// every message behind it. -sarama-log keeps sarama's own log, so that wait
+// can be seen.
 var scenarios = map[string]scenario{
 	"publish-only":         {},
 	"control":              {consumer: true},
@@ -93,12 +105,14 @@ var scenarios = map[string]scenario{
 	"followers-cut":        {partitions: 1, n: 3200, timeout: 2 * time.Second, fault: "cut", faultAt: 201, hold: 20 * time.Second},
 	"followers-cut-single": {partitions: 1, n: 3200, timeout: 2 * time.Second, maxMessages: 1, fault: "cut", faultAt: 201, hold: 20 * time.Second},
 	"leader-kill":          {consumer: true, partitions: 1, n: 3000, fault: "kill", faultAt: 501, hold: 20 * time.Second},
+	"followers-pause":      {consumer: true, partitions: 1, n: 4000, fault: "pause", faultAt: 501, hold: 25 * time.Second},
 }
 
 type config struct {
 	brokers     string
 	server      string
 	scenario    string
+	saramaLog   string
 	nftImage    string
 	cutPort     int
 	n           uint64
@@ -114,13 +128,14 @@ func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control, followers-cut, followers-cut-single or leader-kill")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control, followers-cut, followers-cut-single, leader-kill or followers-pause")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish, unless the scenario sets it")
 	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic, unless the scenario sets it")
 	flag.DurationVar(&c.interval, "interval", 10*time.Millisecond, "the pause after handing each value to the producer")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the helper gets to catch up before the final read")
 	flag.DurationVar(&c.timeout, "timeout", 0, "sarama's Producer.Timeout; 0 keeps the scenario's own, or sarama's default")
-	flag.DurationVar(&c.hold, "hold", 0, "how long the fault lasts: how long the cut holds, or how long a killed broker stays down; 0 keeps the scenario's own")
+	flag.DurationVar(&c.hold, "hold", 0, "how long the fault lasts: how long the cut or the freeze holds, or how long a killed broker stays down; 0 keeps the scenario's own")
+	flag.StringVar(&c.saramaLog, "sarama-log", "", "a file for sarama's own log, debug lines included, with UTC times to the microsecond; empty leaves it off")
 	flag.IntVar(&c.maxMessages, "max-messages", 0, "sarama's Producer.Flush.MaxMessages, the most messages one request may carry; 0 keeps the scenario's own, or sarama's default, no limit")
 	flag.StringVar(&c.nftImage, "nft-image", "driftlab-nft", "the image the cut runs nft from, inside a broker's network (docker build -t driftlab-nft deploy/nft)")
 	flag.IntVar(&c.cutPort, "cut-port", 19092, "the port the brokers fetch from each other on, which the cut drops (deploy/kafka.yaml's INTERNAL listener)")
@@ -177,8 +192,26 @@ func run(c config, out io.Writer) error {
 	defer adm.Close()
 
 	topic := fmt.Sprintf("driftlab-sarama-%s-%d", c.scenario, time.Now().UnixMilli())
+	// sarama logs through one package-wide Logger, and its DebugLogger hands
+	// every line to it, so pointing Logger at the file catches both, from
+	// the producer and the helper alike. The first line ties the log's clock
+	// to the history's.
+	if c.saramaLog != "" {
+		f, err := os.Create(c.saramaLog)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		sarama.Logger = log.New(f, "", log.LstdFlags|log.Lmicroseconds|log.LUTC)
+		sarama.Logger.Printf("driftlab: %s on topic %s; the history's time 0 is %s", c.scenario, topic, rec.start.UTC().Format(time.RFC3339Nano))
+	}
 	setup, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	// A broker that an earlier run froze and never thawed, because the run
+	// was stopped mid-freeze, doesn't answer, so a freeze run thaws any first.
+	if sc.fault == "pause" {
+		thawAll()
+	}
 	// A broker that an earlier run killed needs a few seconds after its
 	// restart to register again, and the topic can't get its copies without
 	// it.
@@ -235,6 +268,10 @@ func run(c config, out io.Writer) error {
 				w.cutting.Store(true)
 			case "kill":
 				if ft, err = startKill(ctx, adm, rec, topic, sc.hold); err != nil {
+					return err
+				}
+			case "pause":
+				if ft, err = startPause(ctx, adm, rec, topic, sc.hold); err != nil {
 					return err
 				}
 			}
@@ -611,6 +648,79 @@ func clearCuts(ctx context.Context, cl *kgo.Client, topic string, c config) {
 	for _, id := range append(followers, leader) {
 		nft(c, fmt.Sprintf("kafka-%d", id), "", "delete", "table", "inet", cutTable)
 	}
+}
+
+// startPause freezes the brokers that hold partition 0's other copies with
+// docker pause, but not its leader, and thaws them after hold, on a goroutine
+// of its own, because the stream goes on meanwhile. With two of the three
+// brokers frozen there is also no controller quorum, so nothing can take
+// them out of the in-sync set: the leader stores each batch but can never get
+// it copied. Unlike a cut broker, a frozen one doesn't answer clients either.
+// The freeze only counts as done if docker showed every follower paused, and
+// its ok records the partition's in-sync set as the leader saw it just
+// before the thaw. Containers are named after the brokers' node IDs, as
+// deploy/kafka.yaml names them.
+func startPause(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, hold time.Duration) (*activeFault, error) {
+	leader, followers, err := followersOf(ctx, cl, topic)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(followers))
+	for i, id := range followers {
+		names[i] = fmt.Sprintf("kafka-%d", id)
+	}
+	rec.op(op{Process: "nemesis", Type: "invoke", F: "pause", Detail: map[string]any{"leader": leader, "paused": names}})
+	if _, err := dockerIn("", append([]string{"pause"}, names...)...); err != nil {
+		dockerIn("", append([]string{"unpause"}, names...)...) // never leave one of them frozen
+		return nil, err
+	}
+	paused, checkErr := dockerIn("", append([]string{"inspect", "-f", "{{.State.Paused}}"}, names...)...)
+	ft := &activeFault{over: make(chan struct{})}
+	go func() {
+		defer close(ft.over)
+		time.Sleep(hold)
+		isr, isrErr := leaderISR(ctx, cl, leader, topic)
+		// Thaw them whatever the check said, so a run never leaves brokers
+		// frozen.
+		if _, err := dockerIn("", append([]string{"unpause"}, names...)...); err != nil {
+			ft.err = err
+			return
+		}
+		if checkErr != nil {
+			ft.err = checkErr
+			return
+		}
+		if allTrue(paused, len(names)) {
+			var detail any
+			if isrErr == nil {
+				detail = map[string]any{"isr": isr}
+			}
+			rec.op(op{Process: "nemesis", Type: "ok", F: "pause", Detail: detail})
+		}
+	}()
+	return ft, nil
+}
+
+// thawAll unpauses every broker in deploy/kafka.yaml. It ignores errors,
+// which mostly mean the broker wasn't paused.
+func thawAll() {
+	for id := 1; id <= replicas; id++ {
+		dockerIn("", "unpause", fmt.Sprintf("kafka-%d", id))
+	}
+}
+
+// allTrue says whether docker inspect printed "true" once per container.
+func allTrue(out string, n int) bool {
+	fields := strings.Fields(out)
+	if n == 0 || len(fields) != n {
+		return false
+	}
+	for _, f := range fields {
+		if f != "true" {
+			return false
+		}
+	}
+	return true
 }
 
 // startKill kills the broker that leads partition 0 with docker kill, the
@@ -1005,8 +1115,9 @@ type params struct {
 // means partitions assigned by the driver, with no group. A cut run declares
 // the two things its trigger needs: the cut itself, and a publish that failed
 // with REQUEST_TIMED_OUT once the cut began. A kill run declares the kill,
-// which completes once the partition has a new leader. If a declared fault
-// leaves no evidence, the checker calls the run invalid instead of clean.
+// which completes once the partition has a new leader, and a freeze run the
+// freeze. If a declared fault leaves no evidence, the checker calls the run
+// invalid instead of clean.
 func newMeta(c config, sc scenario, topic string, cfg *sarama.Config) metaLine {
 	client, witness, rev := provenance()
 	m := metaLine{
@@ -1037,6 +1148,9 @@ func newMeta(c config, sc scenario, topic string, cfg *sarama.Config) metaLine {
 		m.Params.Hold = sc.hold.String()
 	case "kill":
 		m.Faults = []string{"kill"}
+		m.Params.Hold = sc.hold.String()
+	case "pause":
+		m.Faults = []string{"pause"}
 		m.Params.Hold = sc.hold.String()
 	}
 	return m

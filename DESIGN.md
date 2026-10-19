@@ -464,6 +464,16 @@ records how long the election took. The broker comes back as a follower, and the
 is back in the in-sync set, so the next run starts with three brokers; every run also waits for the
 cluster to list three live brokers before it creates its topic.
 
+`followers-pause` freezes the partition's two followers with `docker pause` for 25 seconds, as
+franz-go's calibration does. The leader can't get anything copied, so after `Producer.Timeout`, 10
+seconds, it answers REQUEST_TIMED_OUT, and sarama refreshes its metadata before it retries, from
+whichever broker is least busy. If that is a frozen one, the producer waits there until the thaw,
+and so does every message behind it: the stall the 3762 scenario predicts from reading sarama's
+code. A frozen broker, unlike a cut one, doesn't answer clients either. `-sarama-log` writes
+sarama's own log, debug lines included, with UTC times to the microsecond and the history's time 0
+on its first line, so that wait shows as the gap between a `client/metadata fetching metadata` line
+and the next `producer/broker` line. A freeze run first thaws any broker a stopped run left frozen.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
@@ -830,7 +840,7 @@ driftlab/
 | `drivers/franzgo/repro1505/` | a standalone reproducer for franz-go issue 1505, which needs no broker at all |
 | `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command and keeps it running as a supervisor would, writes into the source, can freeze or cut the copy's followers and crash the program meanwhile, and reads the copy back |
 | `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
-| `drivers/sarama/` | a separate module that writes through sarama's idempotent producer and, with a helper, reads through its partition consumer, with franz-go v1.20.7 as the witness; it can cut the partition's followers off from its leader, or kill the leader |
+| `drivers/sarama/` | a separate module that writes through sarama's idempotent producer and, with a helper, reads through its partition consumer, with franz-go v1.20.7 as the witness; it can cut the partition's followers off from its leader, freeze them, or kill the leader |
 | `drivers/sarama/go.mod` | pins sarama v1.61.1 and franz-go v1.20.7 |
 | `drivers/sarama/v1.61.0.mod` | pins sarama v1.61.0, the last release without sarama PR 3762, used via `-modfile` |
 | `drivers/sarama/pr3762-before.mod` | pins sarama at d0755db, the commit just before PR 3762, used via `-modfile` |
