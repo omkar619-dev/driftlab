@@ -42,6 +42,17 @@ Against franz-go, the Go client for Kafka:
   https://github.com/twmb/franz-go/issues/1505 (reported 2026-10-17), not yet confirmed by the
   maintainer.
 
+Against sarama, another Go client for Kafka, at v1.61.1:
+
+- **The idempotent producer can wait out the whole 30-second read timeout on a broker that isn't
+  answering, after the partition already takes writes again.** When a batch times out, sarama
+  refreshes its metadata from a broker it picks before it retries, and with one request allowed
+  per connection, every broker looks idle to it, a stuck one included. With one follower frozen
+  for 60 seconds, it asked the frozen broker in 4 of 6 runs, and each of those resumed about 24
+  seconds after the partition did, without losing a message. `drivers/sarama/repro3843`
+  reproduces it with mock brokers. https://github.com/IBM/sarama/issues/3843 (reported
+  2026-10-20), not yet confirmed by the maintainers.
+
 Against kaf-relay, a program that keeps Kafka clusters in sync by copying topics, at v2.1.0
 (`2dcedd3`):
 
@@ -107,6 +118,12 @@ The one for franz-go 1505 needs no broker at all:
 ```bash
 go build -C drivers/franzgo -o ../../bin/repro1505 ./repro1505
 ./bin/repro1505
+```
+
+The one for sarama 3843 is a test with mock brokers, and it fails while the bug is there:
+
+```bash
+go test -C drivers/sarama -run TestRetryWaitsForSilentBroker -count=1 -v ./repro3843
 ```
 
 ## More

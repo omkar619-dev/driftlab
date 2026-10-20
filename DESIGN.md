@@ -489,6 +489,17 @@ the frozen broker after the partition took writes again. Only the two calibratio
 `expectTimeout`, now declare the `timeout` fault, so a cut that never times a batch out isn't called
 invalid.
 
+**The metadata stall.** The targeted runs confirmed it. On 2026-10-19, at commit `3a3342f`, six
+`follower-pause` runs with `-timeout 2s -hold 60s` all came out clean, but in four of them the
+producer asked the frozen broker for metadata and waited out the whole 30-second
+`Net.ReadTimeout`: the partition took writes again 7.8 to 8.6 seconds into the freeze, and
+acknowledgements came back at 32.2 seconds. In the other two it never asked the frozen broker, and
+resumed with the partition. With one request allowed per connection, every broker reports nothing
+pending, so the least busy broker is just the first in Go's map order, which was broker 1 in 15 of
+17 requests: the runs stalled exactly when broker 1 was the frozen one. `drivers/sarama/repro3843`
+shows it with mock brokers and no cluster: 6 of 10 sends wait out the read timeout, on v1.61.1 and
+on sarama's main at `f34447e`. Reported as https://github.com/IBM/sarama/issues/3843.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
@@ -825,7 +836,8 @@ driftlab/
 │       ├── go.mod
 │       ├── v1.61.0.mod
 │       ├── pr3762-before.mod
-│       └── pr3762-after.mod
+│       ├── pr3762-after.mod
+│       └── repro3843/
 ├── deploy/
 │   ├── compose.yaml
 │   ├── kafka.yaml
@@ -860,6 +872,7 @@ driftlab/
 | `drivers/sarama/v1.61.0.mod` | pins sarama v1.61.0, the last release without sarama PR 3762, used via `-modfile` |
 | `drivers/sarama/pr3762-before.mod` | pins sarama at d0755db, the commit just before PR 3762, used via `-modfile` |
 | `drivers/sarama/pr3762-after.mod` | pins sarama at 477992f, PR 3762's last commit, used via `-modfile` |
+| `drivers/sarama/repro3843/` | a test that reproduces sarama issue 3843 with mock brokers, which needs no broker at all, and fails while the bug is there |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `deploy/kafka-source.yaml` | a one-broker Kafka cluster in a compose project of its own: the source for programs that copy messages between two clusters |
@@ -889,8 +902,9 @@ driftlab/
   in all 12 runs (see v1 calibration results). The relay driver followed, and its first target,
   kaf-relay, gave two upstream reports, kaf-relay issues 48 and 49, and a third for franz-go
   itself, franz-go issue 1505 (see Relay results). sarama was calibrated on 2026-10-19, on the
-  commits on either side of sarama PR 3762 (see sarama calibration results). The version ends
-  with the published table.
+  commits on either side of sarama PR 3762 (see sarama calibration results), and the freeze runs
+  of its table gave a fourth upstream report, sarama issue 3843 (see the metadata stall). The
+  version ends with the published table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 
