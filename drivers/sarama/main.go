@@ -118,6 +118,9 @@ type scenario struct {
 // 2s, follower-pause also tests what followers-pause showed: refreshing its
 // metadata after each timed-out batch, sarama's producer can end up waiting on
 // the frozen broker after the partition took writes again.
+//
+// With -defaults, every scenario writes with sarama's default producer
+// settings instead of the idempotent ones; see producerConfig.
 var scenarios = map[string]scenario{
 	"publish-only":         {},
 	"control":              {consumer: true},
@@ -144,6 +147,7 @@ type config struct {
 	grace       time.Duration
 	timeout     time.Duration
 	hold        time.Duration
+	defaults    bool
 }
 
 func main() {
@@ -159,6 +163,7 @@ func main() {
 	flag.DurationVar(&c.hold, "hold", 0, "how long the fault lasts: how long the cut or the freeze holds, or how long a killed broker stays down; 0 keeps the scenario's own")
 	flag.StringVar(&c.saramaLog, "sarama-log", "", "a file for sarama's own log, debug lines included, with UTC times to the microsecond; empty leaves it off")
 	flag.IntVar(&c.maxMessages, "max-messages", 0, "sarama's Producer.Flush.MaxMessages, the most messages one request may carry; 0 keeps the scenario's own, or sarama's default, no limit")
+	flag.BoolVar(&c.defaults, "defaults", false, "write with sarama's default producer settings, as most of its users do: acknowledgements from the leader alone, no idempotence, and up to 5 requests in flight per connection")
 	flag.StringVar(&c.nftImage, "nft-image", "driftlab-nft", "the image the cut runs nft from, inside a broker's network (docker build -t driftlab-nft deploy/nft)")
 	flag.IntVar(&c.cutPort, "cut-port", 19092, "the port the brokers fetch from each other on, which the cut drops (deploy/kafka.yaml's INTERNAL listener)")
 	flag.Parse()
@@ -252,7 +257,7 @@ func run(c config, out io.Writer) error {
 		clearCuts(setup, adm, topic, c)
 	}
 
-	cfg := producerConfig(sc.timeout, sc.maxMessages)
+	cfg := producerConfig(c.defaults, sc.timeout, sc.maxMessages)
 	rec.writeMeta(newMeta(c, sc, topic, cfg))
 	var h *helper
 	if sc.consumer {
@@ -331,11 +336,23 @@ func run(c config, out io.Writer) error {
 // request may carry, maxMessages; 0 leaves either at sarama's default.
 // Everything else, the protocol version sarama speaks included, stays at
 // sarama's default.
-func producerConfig(timeout time.Duration, maxMessages int) *sarama.Config {
+//
+// With defaults set, the idempotent producer and its three settings stay off,
+// so the run writes as sarama ships: acknowledgements from the leader alone
+// (WaitForLocal), no idempotence, and up to 5 requests in flight per
+// connection. sarama promises neither one copy nor, its Net.MaxOpenRequests
+// docs say, order with those settings, and Kafka's docs for acks=1 say a
+// record is lost if the leader fails after acknowledging it but before a
+// follower has copied it. So a defaults run's anomalies are observations of
+// documented behavior, not broken promises. The two settings that serve the
+// driver still apply.
+func producerConfig(defaults bool, timeout time.Duration, maxMessages int) *sarama.Config {
 	cfg := sarama.NewConfig()
-	cfg.Producer.Idempotent = true
-	cfg.Producer.RequiredAcks = sarama.WaitForAll
-	cfg.Net.MaxOpenRequests = 1
+	if !defaults {
+		cfg.Producer.Idempotent = true
+		cfg.Producer.RequiredAcks = sarama.WaitForAll
+		cfg.Net.MaxOpenRequests = 1
+	}
 	cfg.Producer.Return.Successes = true
 	cfg.Producer.Partitioner = sarama.NewManualPartitioner
 	if timeout > 0 {
@@ -1151,31 +1168,40 @@ type metaLine struct {
 }
 
 type params struct {
-	N           uint64 `json:"n"`
-	Partitions  int    `json:"partitions"`
-	Topic       string `json:"topic"`
-	Interval    string `json:"interval"`
-	Protocol    string `json:"protocol"`
-	Timeout     string `json:"timeout"`
-	Retries     int    `json:"retries"`
-	MaxMessages int    `json:"max_messages,omitempty"`
-	Hold        string `json:"hold,omitempty"`
-	Witness     string `json:"witness"`
+	N               uint64 `json:"n"`
+	Partitions      int    `json:"partitions"`
+	Topic           string `json:"topic"`
+	Interval        string `json:"interval"`
+	Protocol        string `json:"protocol"`
+	Settings        string `json:"settings"`
+	Acks            int16  `json:"acks"`
+	Idempotent      bool   `json:"idempotent"`
+	MaxOpenRequests int    `json:"max_open_requests"`
+	Timeout         string `json:"timeout"`
+	Retries         int    `json:"retries"`
+	MaxMessages     int    `json:"max_messages,omitempty"`
+	Hold            string `json:"hold,omitempty"`
+	Witness         string `json:"witness"`
 }
 
 // newMeta describes the run, including the topic, so the evidence can be
 // found in the cluster afterwards, the Kafka protocol version sarama was told
-// to speak, the producer settings a scenario can change, and the franz-go
-// the witness used. A run with a helper also says how it consumes: "direct"
-// means partitions assigned by the driver, with no group. A calibration cut
-// run declares the two things its trigger needs: the cut itself, and a
-// publish that failed with REQUEST_TIMED_OUT once the cut began; any other cut
-// run declares only the cut. A kill run declares the kill,
-// which completes once the partition has a new leader, and a freeze run the
-// freeze. If a declared fault leaves no evidence, the checker calls the run
-// invalid instead of clean.
+// to speak, which producer settings it wrote with, idempotent or sarama's
+// defaults, and the three that differ between them, the producer settings a
+// scenario can change, and the franz-go the witness used. A run with a helper
+// also says how it consumes: "direct" means partitions assigned by the
+// driver, with no group. A calibration cut run declares the two things its
+// trigger needs: the cut itself, and a publish that failed with
+// REQUEST_TIMED_OUT once the cut began; any other cut run declares only the
+// cut. A kill run declares the kill, which completes once the partition has a
+// new leader, and a freeze run the freeze. If a declared fault leaves no
+// evidence, the checker calls the run invalid instead of clean.
 func newMeta(c config, sc scenario, topic string, cfg *sarama.Config) metaLine {
 	client, witness, rev := provenance()
+	settings := "idempotent"
+	if c.defaults {
+		settings = "defaults"
+	}
 	m := metaLine{
 		Type:     "meta",
 		Driver:   "sarama",
@@ -1183,15 +1209,19 @@ func newMeta(c config, sc scenario, topic string, cfg *sarama.Config) metaLine {
 		Server:   c.server,
 		Scenario: c.scenario,
 		Params: params{
-			N:           sc.n,
-			Partitions:  sc.partitions,
-			Topic:       topic,
-			Interval:    c.interval.String(),
-			Protocol:    cfg.Version.String(),
-			Timeout:     cfg.Producer.Timeout.String(),
-			Retries:     cfg.Producer.Retry.Max,
-			MaxMessages: cfg.Producer.Flush.MaxMessages,
-			Witness:     witness,
+			N:               sc.n,
+			Partitions:      sc.partitions,
+			Topic:           topic,
+			Interval:        c.interval.String(),
+			Protocol:        cfg.Version.String(),
+			Settings:        settings,
+			Acks:            int16(cfg.Producer.RequiredAcks),
+			Idempotent:      cfg.Producer.Idempotent,
+			MaxOpenRequests: cfg.Net.MaxOpenRequests,
+			Timeout:         cfg.Producer.Timeout.String(),
+			Retries:         cfg.Producer.Retry.Max,
+			MaxMessages:     cfg.Producer.Flush.MaxMessages,
+			Witness:         witness,
 		},
 		Driftlab: rev,
 	}
