@@ -513,6 +513,20 @@ killed leader can take messages it acknowledged with it. v1.61.1's producer stil
 in flight per partition whatever `Net.MaxOpenRequests` says, so on a one-partition topic the order
 should hold.
 
+**The live kill.** Until now every fault started on the driver's main loop, just before value 501,
+so the writer handed sarama nothing while docker acted on the broker: a tenth of a second for a
+freeze and about 0.6 seconds for a cut, measured as the writer's first gap in the `-defaults` runs.
+By the time a killed leader died, every message it had acknowledged had been copied, so
+`leader-kill` can't show what Kafka's docs for `acks=1` describe. A scenario can now start its fault
+live, on a goroutine of its own, and set its own pause between values; `-interval` keeps the
+scenario's pause, 10 milliseconds unless it sets one, when it isn't given. `leader-kill-live` kills
+the leader that way while writing a value every millisecond, 20,000 values, so the writer is still
+sending when the leader dies and writes again once a new one is picked. With `-defaults` it should
+lose the few messages acknowledged in the leader's last milliseconds, each a `lost-write`, with an
+`inconsistent-offsets` once the new leader gives its offset to a later message. With the idempotent
+settings, which wait for every in-sync copy, nothing acknowledged should be lost. The meta line
+marks a live fault, along with the interval the run used.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and

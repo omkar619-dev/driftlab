@@ -41,27 +41,32 @@ const replicas = 3
 
 // scenario describes one experiment. With consumer set, a solo helper reads
 // the topic through sarama while it is being written. A non-zero partitions
-// or n overrides the -partitions or -n flag, and a non-zero timeout replaces
-// sarama's Producer.Timeout: how long the leader may wait for its copies
-// before it answers REQUEST_TIMED_OUT. A non-zero maxMessages replaces
+// or n overrides the -partitions or -n flag, a non-zero interval replaces the
+// pause after each value, 10 milliseconds otherwise, and a non-zero timeout
+// replaces sarama's Producer.Timeout: how long the leader may wait for its
+// copies before it answers REQUEST_TIMED_OUT. A non-zero maxMessages replaces
 // Producer.Flush.MaxMessages, the most messages one request may carry. A
 // fault, if set, starts just before value faultAt is handed over and lasts
 // hold: "cut" stops brokers holding partition 0's other copies from fetching
 // from it, "pause" freezes them, and "kill" kills the broker that leads
 // partition 0 and then starts it again. A cut or a freeze hits the first
-// followers of them, or all of them when followers is 0. With expectTimeout
-// set, the run also declares the calibration's trigger: a publish that failed
-// with REQUEST_TIMED_OUT once the fault began.
+// followers of them, or all of them when followers is 0. The writer waits
+// while a fault is put in place, a fraction of a second, unless live is set:
+// then the fault starts on a goroutine of its own and the writer goes on.
+// With expectTimeout set, the run also declares the calibration's trigger: a
+// publish that failed with REQUEST_TIMED_OUT once the fault began.
 type scenario struct {
 	consumer      bool
 	partitions    int
 	n             uint64
+	interval      time.Duration
 	timeout       time.Duration
 	maxMessages   int
 	fault         string
 	followers     int
 	faultAt       uint64
 	hold          time.Duration
+	live          bool
 	expectTimeout bool
 }
 
@@ -119,6 +124,14 @@ type scenario struct {
 // metadata after each timed-out batch, sarama's producer can end up waiting on
 // the frozen broker after the partition took writes again.
 //
+// leader-kill-live is leader-kill with the kill started live and a value
+// every millisecond, 20,000 of them, so the writer is still sending while
+// docker kills the leader, and goes on long enough to write again once a new
+// leader is picked. With acknowledgements from the leader alone, a value the
+// leader acknowledged in its last few milliseconds, before a follower copied
+// it, dies with it. In leader-kill the writer has paused for docker by then,
+// so everything acknowledged has been copied.
+//
 // With -defaults, every scenario writes with sarama's default producer
 // settings instead of the idempotent ones; see producerConfig.
 var scenarios = map[string]scenario{
@@ -128,6 +141,7 @@ var scenarios = map[string]scenario{
 	"followers-cut":        {partitions: 1, n: 3200, timeout: 2 * time.Second, fault: "cut", faultAt: 201, hold: 20 * time.Second, expectTimeout: true},
 	"followers-cut-single": {partitions: 1, n: 3200, timeout: 2 * time.Second, maxMessages: 1, fault: "cut", faultAt: 201, hold: 20 * time.Second, expectTimeout: true},
 	"leader-kill":          {consumer: true, partitions: 1, n: 3000, fault: "kill", faultAt: 501, hold: 20 * time.Second},
+	"leader-kill-live":     {consumer: true, partitions: 1, n: 20000, interval: time.Millisecond, fault: "kill", faultAt: 501, hold: 20 * time.Second, live: true},
 	"followers-pause":      {consumer: true, partitions: 1, n: 4000, fault: "pause", faultAt: 501, hold: 25 * time.Second},
 	"follower-pause":       {consumer: true, partitions: 1, n: 4000, fault: "pause", followers: 1, faultAt: 501, hold: 25 * time.Second},
 	"follower-cut":         {consumer: true, partitions: 1, n: 6500, fault: "cut", followers: 1, faultAt: 501, hold: 50 * time.Second},
@@ -154,10 +168,10 @@ func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control, followers-cut, followers-cut-single, leader-kill, followers-pause, follower-pause or follower-cut")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control, followers-cut, followers-cut-single, leader-kill, leader-kill-live, followers-pause, follower-pause or follower-cut")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish, unless the scenario sets it")
 	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic, unless the scenario sets it")
-	flag.DurationVar(&c.interval, "interval", 10*time.Millisecond, "the pause after handing each value to the producer")
+	flag.DurationVar(&c.interval, "interval", 0, "the pause after handing each value to the producer; 0 keeps the scenario's own, or 10ms")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the helper gets to catch up before the final read")
 	flag.DurationVar(&c.timeout, "timeout", 0, "sarama's Producer.Timeout; 0 keeps the scenario's own, or sarama's default")
 	flag.DurationVar(&c.hold, "hold", 0, "how long the fault lasts: how long the cut or the freeze holds, or how long a killed broker stays down; 0 keeps the scenario's own")
@@ -178,13 +192,20 @@ func run(c config, out io.Writer) error {
 	if !ok {
 		return fmt.Errorf("unknown scenario %q", c.scenario)
 	}
-	// The flags fill in what the scenario leaves open, and -timeout, -hold and
-	// -max-messages let a run differ from its scenario, to find thresholds.
+	// The flags fill in what the scenario leaves open, and -interval,
+	// -timeout, -hold and -max-messages let a run differ from its scenario, to
+	// find thresholds.
 	if sc.partitions == 0 {
 		sc.partitions = c.partitions
 	}
 	if sc.n == 0 {
 		sc.n = c.n
+	}
+	if c.interval == 0 {
+		c.interval = sc.interval
+	}
+	if c.interval == 0 {
+		c.interval = 10 * time.Millisecond
 	}
 	if c.timeout > 0 {
 		sc.timeout = c.timeout
@@ -284,25 +305,16 @@ func run(c config, out io.Writer) error {
 	var ft *activeFault
 	for v := uint64(1); v <= sc.n; v++ {
 		// The fault starts before this value is handed over and ends on its
-		// own timer, because the stream goes on meanwhile.
+		// own timer, because the stream goes on meanwhile. A live fault also
+		// starts on a goroutine of its own, so the stream doesn't wait while
+		// docker acts on the broker either.
 		if sc.fault != "" && v == sc.faultAt {
-			switch sc.fault {
-			case "cut":
-				if ft, err = startCut(ctx, adm, rec, topic, sc.followers, sc.hold, c); err != nil {
-					return err
-				}
-				if sc.expectTimeout {
-					rec.op(op{Process: "nemesis", Type: "invoke", F: "timeout"})
-				}
-				w.cutting.Store(true)
-			case "kill":
-				if ft, err = startKill(ctx, adm, rec, topic, sc.hold); err != nil {
-					return err
-				}
-			case "pause":
-				if ft, err = startPause(ctx, adm, rec, topic, sc.followers, sc.hold); err != nil {
-					return err
-				}
+			if sc.live {
+				ft = startLive(func() (*activeFault, error) {
+					return startFault(ctx, adm, rec, topic, sc, c, w)
+				})
+			} else if ft, err = startFault(ctx, adm, rec, topic, sc, c, w); err != nil {
+				return err
 			}
 		}
 		w.publish(v)
@@ -571,6 +583,48 @@ func (h *helper) stop() {
 type activeFault struct {
 	over chan struct{}
 	err  error
+}
+
+// startFault puts the scenario's fault in place and returns it. A cut
+// declared with the calibration's trigger also records the trigger's invoke,
+// and tells the writer the cut has begun.
+func startFault(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, sc scenario, c config, w *writer) (*activeFault, error) {
+	switch sc.fault {
+	case "cut":
+		ft, err := startCut(ctx, cl, rec, topic, sc.followers, sc.hold, c)
+		if err != nil {
+			return nil, err
+		}
+		if sc.expectTimeout {
+			rec.op(op{Process: "nemesis", Type: "invoke", F: "timeout"})
+		}
+		w.cutting.Store(true)
+		return ft, nil
+	case "kill":
+		return startKill(ctx, cl, rec, topic, sc.hold)
+	case "pause":
+		return startPause(ctx, cl, rec, topic, sc.followers, sc.hold)
+	}
+	return nil, fmt.Errorf("unknown fault %q", sc.fault)
+}
+
+// startLive runs start on a goroutine of its own and returns at once, so the
+// writer goes on while docker acts on the broker. The fault it returns ends
+// when the started one does, and carries any error from starting it, which
+// the run then reports once the writer is done.
+func startLive(start func() (*activeFault, error)) *activeFault {
+	ft := &activeFault{over: make(chan struct{})}
+	go func() {
+		defer close(ft.over)
+		started, err := start()
+		if err != nil {
+			ft.err = err
+			return
+		}
+		<-started.over
+		ft.err = started.err
+	}()
+	return ft
 }
 
 // startCut cuts the fetches of n of the brokers that hold partition 0's other
@@ -1181,6 +1235,7 @@ type params struct {
 	Retries         int    `json:"retries"`
 	MaxMessages     int    `json:"max_messages,omitempty"`
 	Hold            string `json:"hold,omitempty"`
+	Live            bool   `json:"live,omitempty"`
 	Witness         string `json:"witness"`
 }
 
@@ -1194,8 +1249,9 @@ type params struct {
 // trigger needs: the cut itself, and a publish that failed with
 // REQUEST_TIMED_OUT once the cut began; any other cut run declares only the
 // cut. A kill run declares the kill, which completes once the partition has a
-// new leader, and a freeze run the freeze. If a declared fault leaves no
-// evidence, the checker calls the run invalid instead of clean.
+// new leader, and a freeze run the freeze, and a fault that started live says
+// so. If a declared fault leaves no evidence, the checker calls the run
+// invalid instead of clean.
 func newMeta(c config, sc scenario, topic string, cfg *sarama.Config) metaLine {
 	client, witness, rev := provenance()
 	settings := "idempotent"
@@ -1242,6 +1298,7 @@ func newMeta(c config, sc scenario, topic string, cfg *sarama.Config) metaLine {
 		m.Faults = []string{"pause"}
 		m.Params.Hold = sc.hold.String()
 	}
+	m.Params.Live = sc.fault != "" && sc.live
 	return m
 }
 
