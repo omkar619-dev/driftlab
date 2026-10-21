@@ -660,6 +660,59 @@ commits `6604a58` to `3ca91b6`:
   showed that the crash's evidence proves less than this document first claimed, which it now
   says.
 
+## sarama results
+
+sarama's table ran on v1.61.1 against apache/kafka 4.3.1, each fault on a one-partition topic with
+a solo helper reading, once with the idempotent settings and once with sarama's own defaults
+(`-defaults`). The runs took place from 2026-10-19 to 2026-10-21, at driver commits `93188d0`
+(`leader-kill`), `c9d4441` (`followers-pause`), `3a3342f` (`follower-pause` and `follower-cut`),
+`ccf3e42` (the defaults) and `bf77e5f` (`leader-kill-live`). Times are measured from the start of
+the fault:
+
+| Scenario | Idempotent settings | sarama's defaults |
+|---|---|---|
+| `leader-kill` | clean ×3; acknowledgements stopped for 9.2 to 14.0 s | clean ×3; acknowledgements stopped for 10.4 to 16.4 s |
+| `leader-kill-live` | clean ×3 | **failed ×5**: 1, 526, 1, 524 and 521 acknowledged messages lost |
+| `followers-pause` | clean ×3; the writer waited 25.2 s, the whole freeze | clean ×3; the writer never waited, the reader waited 25.2 s |
+| `follower-pause` | clean ×3; the writer waited 7.8 to 9.3 s, or 25.2 s in one run (the metadata stall) | clean ×3; the writer never waited, the reader waited 8.0 to 10.1 s |
+| `follower-cut` | clean ×3; the writer waited 34.6 to 40.1 s | clean ×3; the writer never waited, the reader waited 30.8 to 40.2 s |
+
+- **The settings decide who waits, not how long.** With the idempotent settings the leader
+  acknowledges a write only once every in-sync copy has it, so a frozen or cut follower holds the
+  writer until Kafka drops it from the in-sync set, or until the thaw when both followers are
+  frozen and no controller quorum is left to drop them. In the same rows with the defaults, the
+  leader acknowledges alone, so the writer never waited longer than 0.1 seconds, apart from the 0.6
+  seconds the driver takes to put a cut in place, and the reader waited instead, since it only gets
+  a message once every in-sync copy has it. The cost is where an acknowledged message lives
+  meanwhile: in `followers-pause` about 2,500 of them existed only on the leader for up to 25
+  seconds, and a leader crash in that window would have lost them. That double fault wasn't run.
+- **The idempotent producer can wait out its read timeout on a frozen broker.** After a timed-out
+  batch it refreshes its metadata before it retries, from a broker it can't tell is stuck, and if
+  that is the frozen follower it waits there until the thaw or `Net.ReadTimeout`, 30 seconds,
+  whichever comes first. That happened in all three `followers-pause` runs, and in the one
+  `follower-pause` run where Kafka took 10.9 seconds to drop the follower, just after the 10-second
+  `Producer.Timeout`. See the metadata stall; reported as https://github.com/IBM/sarama/issues/3843.
+  With the defaults no batch times out in these rows, so they never hit it.
+- **With the defaults, a leader crash loses acknowledged messages.** All five live kills lost some,
+  and none of the three with the idempotent settings did. Two runs lost one message, the last one
+  the leader acknowledged before it died. Three lost every message written so far, 521 to 526: the
+  new leader's first message got offset 0, so the follower that took over had copied nothing,
+  about 0.6 seconds after the topic was created, and still counted as in sync, as every copy of a
+  new partition does. Why it hadn't started copying isn't known. Each loss shows as a `lost-write`
+  and an `inconsistent-offsets`, and each run has one `nonmonotonic-send` where the offsets go
+  back. Kafka's own console consumer agrees with the final read of `defaults-2`: 11,762 records,
+  the first at offset 0 with value 8239, and 12,288 acknowledged minus 526 lost is exactly 11,762.
+  This is what Kafka documents for `acks=1`, not a sarama bug, but it is sarama's default: Kafka's
+  Java producer has defaulted to acknowledgements from every in-sync copy, with idempotence, since
+  Kafka 3.0 (KIP-679).
+- **The harness hid it at first.** The defaults' `leader-kill` runs lost nothing, because the driver
+  started every fault on its main loop and stopped writing while docker acted, so by the time the
+  leader died, everything it had acknowledged had been copied. `leader-kill-live` starts the kill on
+  a goroutine of its own and writes a value every millisecond (see the live kill).
+- **Failed sends aren't losses.** In every kill run sarama gave up on the sends it made while there
+  was no leader: 780 to 1,505 of 3,000 in `leader-kill`, and 6,758 to 11,205 of 20,000 in
+  `leader-kill-live`. They are `info`, unknown, and in the runs checked none of them landed.
+
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -930,8 +983,10 @@ driftlab/
   kaf-relay, gave two upstream reports, kaf-relay issues 48 and 49, and a third for franz-go
   itself, franz-go issue 1505 (see Relay results). sarama was calibrated on 2026-10-19, on the
   commits on either side of sarama PR 3762 (see sarama calibration results), and the freeze runs
-  of its table gave a fourth upstream report, sarama issue 3843 (see the metadata stall). The
-  version ends with the published table.
+  of its table gave a fourth upstream report, sarama issue 3843 (see the metadata stall). sarama's
+  table was done on 2026-10-21, with the idempotent settings and with its defaults (see sarama
+  results). kafka-go and confluent-kafka-go come next, and the version ends with the published
+  table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 

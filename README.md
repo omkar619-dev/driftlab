@@ -52,6 +52,14 @@ Against sarama, another Go client for Kafka, at v1.61.1:
   seconds after the partition did, without losing a message. `drivers/sarama/repro3843`
   reproduces it with mock brokers. https://github.com/IBM/sarama/issues/3843 (reported
   2026-10-20), not yet confirmed by the maintainers.
+- **With its default settings, a leader crash loses acknowledged messages.** By default sarama
+  waits only for the partition's leader to store a write, which Kafka documents can lose messages
+  the leader acknowledged if it dies before a follower copies them; Kafka's own Java producer has
+  waited for every in-sync copy by default since Kafka 3.0. In five leader crashes during steady
+  writing, every run lost acknowledged messages: one in two runs, and all 521 to 526 written so
+  far in the other three, where the follower that took over hadn't copied anything yet. With the
+  idempotent settings, three crashes lost nothing. That is documented behavior, not a bug, and
+  Kafka's own console consumer agrees with driftlab's count.
 
 Against kaf-relay, a program that keeps Kafka clusters in sync by copying topics, at v2.1.0
 (`2dcedd3`):
@@ -130,7 +138,8 @@ go test -C drivers/sarama -run TestRetryWaitsForSilentBroker -count=1 -v ./repro
 
 - [DESIGN.md](https://github.com/omkar619-dev/driftlab/blob/main/DESIGN.md): the principles, the
   history format, the checker's rules, every scenario and every result.
-- v1, the Go Kafka clients, is under way: franz-go and sarama are calibrated, and a relay driver
-  tests programs that copy topics between clusters. kafka-go and confluent-kafka-go come next.
+- v1, the Go Kafka clients, is under way: franz-go and sarama are calibrated, sarama's fault table
+  is done, with its idempotent settings and with its defaults, and a relay driver tests programs
+  that copy topics between clusters. kafka-go and confluent-kafka-go come next.
 
 Apache-2.0.
