@@ -527,6 +527,25 @@ lose the few messages acknowledged in the leader's last milliseconds, each a `lo
 settings, which wait for every in-sync copy, nothing acknowledged should be lost. The meta line
 marks a live fault, along with the interval the run used.
 
+**kafka-go.** `drivers/kafkago` tests segmentio's kafka-go the same way, with franz-go again as the
+witness. Its `Writer` has no idempotent producer: it never asks for a producer ID, so a retry after
+a lost reply can store a message twice, which its docs also say about a cancelled write. Its
+strongest setting is acknowledgements from every in-sync copy (`RequireAll`), the driver's default;
+`-acks one` asks for the leader alone, and `-acks none` keeps kafka-go's own default,
+`RequireNone`, which every `Writer` in its README uses and which asks for no acknowledgement at
+all. With none, Kafka sends no reply, so kafka-go has no offset to report, and the driver records
+each send as an `info`: whether it was stored is unknown, and the final read is the measure. The
+writer runs asynchronously, with a `Completion` callback that reports each batch's outcome and the
+offset of every message in it. Each message carries its value in `WriterData`, and a small
+balancer sends value v to partition (v-1) mod the partition count. Otherwise the writer keeps
+kafka-go's defaults: one batch at a time per partition, sent at 100 messages or after a second,
+with up to 10 attempts. The helper is a kafka-go `Reader` per partition, with the partition set and
+no group. kafka-go can't be calibrated the way franz-go and sarama were, on a fixed bug in an
+idempotent producer, because it has none, and its fixed bugs that lose data are in consumer
+groups, which v1 doesn't use, or in reading past compacted records, which v1 doesn't write.
+Instead it is checked on what Kafka documents: once the driver has `leader-kill-live`, `-acks one`
+must lose acknowledged messages and `-acks all` must not.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
@@ -910,6 +929,8 @@ driftlab/
 │   │   ├── go.mod
 │   │   ├── v1.20.6.mod
 │   │   └── repro1505/
+│   ├── kafkago/
+│   │   └── go.mod
 │   ├── relay/
 │   │   └── go.mod
 │   └── sarama/
@@ -945,6 +966,8 @@ driftlab/
 | `drivers/franzgo/go.mod` | pins franz-go v1.20.7 (the release that fixed issue 1217) |
 | `drivers/franzgo/v1.20.6.mod` | pins franz-go v1.20.6 (the last release before the fix), used via `-modfile` |
 | `drivers/franzgo/repro1505/` | a standalone reproducer for franz-go issue 1505, which needs no broker at all |
+| `drivers/kafkago/` | a separate module that writes through kafka-go's Writer and, with a helper, reads through its Reader, with franz-go v1.20.7 as the witness |
+| `drivers/kafkago/go.mod` | pins kafka-go v0.4.51 and franz-go v1.20.7 |
 | `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command and keeps it running as a supervisor would, writes into the source, can freeze or cut the copy's followers and crash the program meanwhile, and reads the copy back |
 | `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
 | `drivers/sarama/` | a separate module that writes through sarama's idempotent producer, or with `-defaults` its default one, and, with a helper, reads through its partition consumer, with franz-go v1.20.7 as the witness; it can cut the partition's followers off from its leader, freeze them, or kill the leader |
