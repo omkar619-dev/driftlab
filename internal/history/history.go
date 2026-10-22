@@ -51,7 +51,11 @@ type Meta struct {
 	Faults   []string        `json:"faults"`
 	Params   json.RawMessage `json:"params"`
 	Relay    bool            `json:"relay"`
-	Driftlab string          `json:"driftlab"`
+	// StartSeq is the stream sequence the consumer asked to start after,
+	// so the first message it wants is StartSeq+1. Zero means it asked for
+	// everything and nothing can be below its start.
+	StartSeq uint64 `json:"start_seq"`
+	Driftlab string `json:"driftlab"`
 }
 
 // Op is one operation. Drivers number values from 1 and JetStream numbers

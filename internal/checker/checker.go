@@ -39,6 +39,7 @@ const (
 	InconsistentOffsets Kind = "inconsistent-offsets"
 	NonmonotonicSend    Kind = "nonmonotonic-send"
 	NonmonotonicCopy    Kind = "nonmonotonic-copy"
+	BeforeStart         Kind = "before-start"
 )
 
 // Anomaly is one broken promise, with the history indexes that prove it.
@@ -131,6 +132,7 @@ func Check(h *history.History) Result {
 		r.Anomalies = append(r.Anomalies, checkDuplicates(h.Ops, final, n)...)
 	}
 	r.Anomalies = append(r.Anomalies, checkPhantoms(h.Ops)...)
+	r.Anomalies = append(r.Anomalies, checkBeforeStart(h.Ops, h.Meta.StartSeq)...)
 	r.Reasons = append(checkFinalRead(h.Ops, final, n, relay), checkFaults(h)...)
 	// Both measurements match acks to deliveries by position, so relay runs
 	// go without them until they record deliveries that can be matched by
@@ -756,6 +758,65 @@ func measureLag(ops []history.Op) []Lag {
 			out[i].Value, out[i].Wait = op.Value, wait
 		}
 		seen[op.Process][p] = true
+	}
+	return out
+}
+
+// checkBeforeStart reports deliveries at or below the position the consumer
+// asked to start after. A consumer that asked only for new messages, or for a
+// start sequence or time, was never promised what came before it: those
+// messages are not late, they were never wanted.
+//
+// Every other check here asks about the sequence that arrived, so a reset that
+// forgets the start position and replays from the beginning passes all of them
+// - the replay is ordered, gapless and matches the stream. This is the only
+// check that asks whether the consumer wanted the messages at all.
+func checkBeforeStart(ops []history.Op, startSeq uint64) []Anomaly {
+	if startSeq == 0 {
+		return nil
+	}
+	type span struct {
+		a         *Anomaly
+		low, high uint64
+	}
+	spans := map[string]*span{}
+	var order []string
+	for _, op := range ops {
+		if op.F != history.Deliver || op.Type != history.OK {
+			continue
+		}
+		if op.StreamSeq == 0 || op.StreamSeq > startSeq {
+			continue
+		}
+		s, ok := spans[op.Process]
+		if !ok {
+			s = &span{
+				a:    &Anomaly{Kind: BeforeStart, Process: op.Process},
+				low:  op.StreamSeq,
+				high: op.StreamSeq,
+			}
+			spans[op.Process] = s
+			order = append(order, op.Process)
+		}
+		s.a.Ops = append(s.a.Ops, op.Index)
+		if op.StreamSeq < s.low {
+			s.low = op.StreamSeq
+		}
+		if op.StreamSeq > s.high {
+			s.high = op.StreamSeq
+		}
+	}
+	out := make([]Anomaly, 0, len(order))
+	for _, process := range order {
+		s := spans[process]
+		if s.low == s.high {
+			s.a.Msg = fmt.Sprintf("delivered stream_seq %d after asking to start at stream_seq %d",
+				s.low, startSeq+1)
+		} else {
+			s.a.Msg = fmt.Sprintf("delivered stream_seq %d to %d after asking to start at stream_seq %d",
+				s.low, s.high, startSeq+1)
+		}
+		out = append(out, *s.a)
 	}
 	return out
 }
