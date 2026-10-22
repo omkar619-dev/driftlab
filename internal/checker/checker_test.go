@@ -74,6 +74,10 @@ func TestCheckFixtures(t *testing.T) {
 		{"start-new-clean.jsonl", []string{
 			"verdict clean, 0 of 5 publishes unknown",
 		}},
+		{"start-new-fault.jsonl", []string{
+			"verdict clean, 0 of 5 publishes unknown",
+			"lag consumer: the longest wait from an ack to its delivery was 700ms (value 5)",
+		}},
 		{"before-start.jsonl", []string{
 			"verdict failed, 0 of 5 publishes unknown",
 			"before-start consumer ops=[10 11 12]: delivered stream_seq 1 to 3 after asking to start at stream_seq 4",

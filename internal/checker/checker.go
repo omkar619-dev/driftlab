@@ -138,7 +138,7 @@ func Check(h *history.History) Result {
 	// go without them until they record deliveries that can be matched by
 	// value.
 	if !relay {
-		r.Recoveries = measureRecovery(h.Ops, n)
+		r.Recoveries = measureRecovery(h.Ops, n, h.Meta.StartSeq)
 		r.Lags = measureLag(h.Ops)
 	}
 	for _, op := range h.Ops {
@@ -667,7 +667,7 @@ func checkPhantoms(ops []history.Op) []Anomaly {
 	return out
 }
 
-func measureRecovery(ops []history.Op, n numbering) []Recovery {
+func measureRecovery(ops []history.Op, n numbering, startSeq uint64) []Recovery {
 	end := -1
 	for i, op := range ops {
 		if op.Process == history.Nemesis && op.Type == history.OK {
@@ -693,9 +693,28 @@ func measureRecovery(ops []history.Op, n numbering) []Recovery {
 	if len(targets) == 0 {
 		return nil
 	}
+	// A consumer that asked to start after startSeq was promised nothing below
+	// it, so catching up means reaching the target from startSeq+1 rather than
+	// from the stream's own first position.
+	first := n.first()
+	if startSeq > 0 {
+		first = startSeq + 1
+	}
+	for p, t := range targets {
+		if t < first {
+			delete(targets, p)
+		}
+	}
+	// Every target sits below the consumer's start, so it was promised none of
+	// this and there is nothing to catch up to. Reporting here would call a
+	// correct consumer unrecovered, and one that wrongly replayed the start
+	// recovered - the reading is not just useless but inverted.
+	if len(targets) == 0 {
+		return nil
+	}
 	need := 0
 	for _, t := range targets {
-		need += int(t - n.first() + 1)
+		need += int(t - first + 1)
 	}
 
 	// For each consumer: its index in out, and which positions up to the
@@ -716,7 +735,9 @@ func measureRecovery(ops []history.Op, n numbering) []Recovery {
 		}
 		p, _ := op.Pos()
 		t, aimed := targets[p.Partition]
-		if out[i].Caught || !aimed || p.Offset > t {
+		// A delivery below the start is a before-start anomaly, not progress
+		// towards catching up, so it must not count here.
+		if out[i].Caught || !aimed || p.Offset > t || p.Offset < first {
 			continue
 		}
 		seen[op.Process][p] = true
