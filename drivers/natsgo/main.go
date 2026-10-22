@@ -53,6 +53,8 @@ const slowLatency = 25 * time.Second
 type scenario struct {
 	consumer bool
 	startNew bool
+	subDeath bool
+	subs     int
 	proxy    bool
 	stall    time.Duration
 	net      string
@@ -65,6 +67,7 @@ var scenarios = map[string]scenario{
 	"control":       {consumer: true},
 	"proxy-control": {consumer: true, proxy: true},
 	"start-new":     {consumer: true, startNew: true},
+	"sub-death":     {consumer: true, subDeath: true, subs: 50},
 	"slow-short":    {consumer: true, stall: 2 * time.Second},
 	"slow-long":     {consumer: true, stall: 8 * time.Second},
 	"net-slow":      {consumer: true, proxy: true, net: "slow", hold: 30 * time.Second},
@@ -86,6 +89,9 @@ type config struct {
 	hold            time.Duration
 	blockDisconnect time.Duration
 	prefix          uint64
+	subs            int
+	reconnects      int
+	reconnectGap    time.Duration
 }
 
 func main() {
@@ -94,11 +100,14 @@ func main() {
 	flag.StringVar(&c.helperURL, "helper-url", "nats://127.0.0.1:4223", "where the consumer connects in proxy scenarios: toxiproxy's helper-line")
 	flag.StringVar(&c.toxiproxy, "toxiproxy", "http://127.0.0.1:8474", "toxiproxy's HTTP API, used by proxy scenarios")
 	flag.StringVar(&c.container, "container", "driftlab-nats-1", "nats-server's docker container, which server scenarios pause or kill")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, proxy-control, start-new, slow-short, slow-long, net-slow, net-cut, server-pause or server-kill")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, proxy-control, start-new, sub-death, slow-short, slow-long, net-slow, net-cut, server-pause or server-kill")
 	flag.StringVar(&c.api, "api", "legacy", "consumer API: legacy (push) or jetstream (pull)")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish")
 	flag.IntVar(&c.pending, "pending", 20, "the consumer's tray size during a stall, in messages")
 	flag.Uint64Var(&c.prefix, "prefix", 10, "in start-new, how many messages are published before the consumer subscribes past them")
+	flag.IntVar(&c.subs, "subs", 0, "how many subscriptions to open; 0 means the scenario's own default, which is one")
+	flag.IntVar(&c.reconnects, "reconnects", 10, "in sub-death, how many times to force a reconnect")
+	flag.DurationVar(&c.reconnectGap, "reconnect-gap", 20*time.Millisecond, "in sub-death, the wait between reconnects; shorter than a consumer create is what lands a disconnect mid-create")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the consumer gets to catch up before the final read")
 	flag.DurationVar(&c.hold, "hold", 0, "how long a network or server fault lasts; 0 keeps the scenario's own")
 	flag.DurationVar(&c.blockDisconnect, "block-disconnect", 0, "how long the consumer's disconnect handler blocks after it records a drop, as a slow application handler would; 0 returns at once")
@@ -264,27 +273,43 @@ func publish(ctx context.Context, js jetstream.JetStream, rec *recorder, v uint6
 // caught up, and it stops when it has seen everything or the grace window
 // runs out.
 func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *recorder, c config, sc scenario) error {
-	// reached is the highest stream sequence delivered so far. Only atomic
-	// operations touch it: waitFor reads it from this goroutine, and onMsg
-	// can run on more than one goroutine, because the jetstream consumer
-	// starts a new subscription every time it resets.
-	var reached atomic.Uint64
 	gate := make(chan struct{})
 	var stalled sync.Once
-	onErr := func(err error) {
-		rec.op(op{Process: "consumer", Type: "info", F: "client-error", Error: err.Error()})
+	// One subscription is the default and keeps the process name "consumer",
+	// so every existing scenario's history is unchanged. Only sub-death opens
+	// more, because telling a dead subscription from a slow one needs a
+	// sibling that is still receiving.
+	subs := make([]*subscription, subCount(c, sc))
+	for i := range subs {
+		name := "consumer"
+		if len(subs) > 1 {
+			name = fmt.Sprintf("consumer-%d", i+1)
+		}
+		subs[i] = &subscription{name: name}
 	}
-	onMsg := func(data []byte, seq uint64) {
-		v, err := strconv.ParseUint(string(data), 10, 64)
-		if err != nil {
-			onErr(err)
-			return
+	// Each subscription records under its own name. Its reached counter is
+	// touched only atomically: waitForAll reads it from this goroutine, and
+	// onMsg can run on more than one, because the jetstream consumer starts a
+	// new subscription every time it resets.
+	handlers := func(s *subscription, first bool) (func([]byte, uint64), func(error)) {
+		onErr := func(err error) {
+			rec.op(op{Process: s.name, Type: "info", F: "client-error", Error: err.Error()})
 		}
-		rec.op(op{Process: "consumer", Type: "ok", F: "deliver", Value: v, StreamSeq: seq})
-		raise(&reached, seq)
-		if sc.stall > 0 {
-			stalled.Do(func() { <-gate })
+		onMsg := func(data []byte, seq uint64) {
+			v, err := strconv.ParseUint(string(data), 10, 64)
+			if err != nil {
+				onErr(err)
+				return
+			}
+			rec.op(op{Process: s.name, Type: "ok", F: "deliver", Value: v, StreamSeq: seq})
+			raise(&s.reached, seq)
+			// The stall models one blocked callback. Blocking every
+			// subscription would just be a stopped consumer.
+			if sc.stall > 0 && first {
+				stalled.Do(func() { <-gate })
+			}
 		}
+		return onMsg, onErr
 	}
 
 	// start-new publishes a prefix the consumer must never see, then subscribes
@@ -301,19 +326,21 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 	} else {
 		last = publish(ctx, js, rec, 1)
 	}
-	rec.op(op{Process: "consumer", Type: "invoke", F: "subscribe"})
-	var rd reader
-	var err error
-	if c.api == "jetstream" {
-		rd, err = subscribeJetStream(ctx, hc, c, sc, onMsg, onErr)
-	} else {
-		rd, err = subscribeLegacy(hc, c, sc, onMsg, onErr)
+	for i, s := range subs {
+		onMsg, onErr := handlers(s, i == 0)
+		rec.op(op{Process: s.name, Type: "invoke", F: "subscribe"})
+		var err error
+		if c.api == "jetstream" {
+			s.rd, err = subscribeJetStream(ctx, hc, c, sc, onMsg, onErr)
+		} else {
+			s.rd, err = subscribeLegacy(hc, c, sc, onMsg, onErr)
+		}
+		if err != nil {
+			rec.op(op{Process: s.name, Type: "info", F: "subscribe", Error: err.Error()})
+			return err
+		}
+		rec.op(op{Process: s.name, Type: "ok", F: "subscribe"})
 	}
-	if err != nil {
-		rec.op(op{Process: "consumer", Type: "info", F: "subscribe", Error: err.Error()})
-		return err
-	}
-	rec.op(op{Process: "consumer", Type: "ok", F: "subscribe"})
 	if sc.startNew {
 		// Waiting for a delivery would burn the whole grace: a correct consumer
 		// has nothing to deliver yet, and that is exactly the state the reset
@@ -325,15 +352,32 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 		waitConnected(hc, c.grace)
 		rec.op(op{Process: "nemesis", Type: "ok", F: "reconnect"})
 	} else {
-		waitFor(&reached, last, c.grace)
+		waitForAll(subs, last, c.grace)
+	}
+
+	// sub-death drops and remakes the connection repeatedly, with a gap
+	// shorter than a consumer create, so a disconnect lands while the reset
+	// from the previous one is still in flight. That is the case that used to
+	// kill a push ordered subscription for good, with no error raised to the
+	// caller. See drivers/natsgo/repro2201.
+	if sc.subDeath {
+		rec.op(op{Process: "nemesis", Type: "invoke", F: "reconnect"})
+		for range c.reconnects {
+			if err := hc.ForceReconnect(); err != nil {
+				return err
+			}
+			time.Sleep(c.reconnectGap)
+		}
+		waitConnected(hc, c.grace)
+		rec.op(op{Process: "nemesis", Type: "ok", F: "reconnect"})
 	}
 
 	// The 2107 trigger: a blocked callback while the flood arrives behind it,
 	// and, where the API has one, a tiny pending tray for the flood to overflow.
 	if sc.stall > 0 {
-		if rd.shrinkTray != nil {
+		if subs[0].rd.shrinkTray != nil {
 			rec.op(op{Process: "nemesis", Type: "invoke", F: "overflow"})
-			if err := rd.shrinkTray(); err != nil {
+			if err := subs[0].rd.shrinkTray(); err != nil {
 				return err
 			}
 		}
@@ -379,10 +423,17 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 		}
 	}
 
-	waitFor(&reached, last, c.grace)
+	waitForAll(subs, last, c.grace)
 	last = max(last, publish(ctx, js, rec, c.n+1))
-	waitFor(&reached, last, c.grace)
-	return rd.stop()
+	waitForAll(subs, last, c.grace)
+	// Stop them all before reporting, so one bad stop can't hide the rest.
+	var stopErr error
+	for _, s := range subs {
+		if err := s.rd.stop(); err != nil && stopErr == nil {
+			stopErr = err
+		}
+	}
+	return stopErr
 }
 
 // startNetFault breaks the consumer's line in the middle of the flood:
@@ -583,10 +634,43 @@ func waitConnected(nc *nats.Conn, limit time.Duration) {
 	}
 }
 
-// waitFor polls until the consumer has reached target or grace runs out.
-func waitFor(reached *atomic.Uint64, target uint64, grace time.Duration) {
+// subscription is one consumer's own state: the process name its operations
+// carry, how far it has got, and its reader.
+type subscription struct {
+	name    string
+	reached atomic.Uint64
+	rd      reader
+}
+
+// subCount is how many subscriptions to open: the flag when it is set, then
+// the scenario's own default, then one.
+func subCount(c config, sc scenario) int {
+	if c.subs > 0 {
+		return c.subs
+	}
+	if sc.subs > 0 {
+		return sc.subs
+	}
+	return 1
+}
+
+// waitForAll polls until every subscription has reached target or grace runs
+// out. A dead one never reaches it, so a run with deaths waits out the whole
+// grace. That is the point: the checker needs evidence that the subscription
+// had the time and still received nothing.
+func waitForAll(subs []*subscription, target uint64, grace time.Duration) {
 	deadline := time.Now().Add(grace)
-	for reached.Load() < target && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) {
+		behind := false
+		for _, s := range subs {
+			if s.reached.Load() < target {
+				behind = true
+				break
+			}
+		}
+		if !behind {
+			return
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -648,6 +732,7 @@ type metaLine struct {
 	Faults   []string `json:"faults,omitempty"`
 	Params   params   `json:"params"`
 	StartSeq uint64   `json:"start_seq,omitempty"`
+	Subs     int      `json:"subs,omitempty"`
 	Driftlab string   `json:"driftlab"`
 }
 
@@ -659,6 +744,8 @@ type params struct {
 	Hold            string `json:"hold,omitempty"`
 	Latency         string `json:"latency,omitempty"`
 	BlockDisconnect string `json:"block_disconnect,omitempty"`
+	Reconnects      int    `json:"reconnects,omitempty"`
+	ReconnectGap    string `json:"reconnect_gap,omitempty"`
 }
 
 // newMeta describes the run. A stall scenario declares the stall, and for
@@ -712,6 +799,14 @@ func newMeta(server string, c config, sc scenario) metaLine {
 		// the consumer's first wanted message is prefix+1.
 		m.Faults = []string{"reconnect"}
 		m.StartSeq = c.prefix
+	}
+	if sc.subDeath {
+		m.Faults = []string{"reconnect"}
+		m.Params.Reconnects = c.reconnects
+		m.Params.ReconnectGap = c.reconnectGap.String()
+	}
+	if sc.consumer {
+		m.Subs = subCount(c, sc)
 	}
 	return m
 }
