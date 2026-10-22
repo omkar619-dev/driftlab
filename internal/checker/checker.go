@@ -139,7 +139,7 @@ func Check(h *history.History) Result {
 	// value.
 	if !relay {
 		r.Recoveries = measureRecovery(h.Ops, n, h.Meta.StartSeq)
-		r.Lags = measureLag(h.Ops)
+		r.Lags = measureLag(h.Ops, h.Meta.StartSeq)
 	}
 	for _, op := range h.Ops {
 		if op.F != history.Publish {
@@ -752,7 +752,7 @@ func measureRecovery(ops []history.Op, n numbering, startSeq uint64) []Recovery 
 // measureLag finds, for each consumer, the acked message that waited longest
 // between its ack and the consumer's first delivery of it. Like
 // measureRecovery, it only reports on runs where a fault happened.
-func measureLag(ops []history.Op) []Lag {
+func measureLag(ops []history.Op, startSeq uint64) []Lag {
 	faulted := slices.ContainsFunc(ops, func(op history.Op) bool {
 		return op.Process == history.Nemesis && op.Type == history.OK
 	})
@@ -774,7 +774,13 @@ func measureLag(ops []history.Op) []Lag {
 		if op.F != history.Deliver {
 			continue
 		}
-		p, _ := op.Pos()
+		p, placed := op.Pos()
+		// A delivery below the consumer's start was never wanted, so the time
+		// from its ack to its arrival is the age of the replay, not the lag of
+		// the consumer. checkBeforeStart reports it as the fault it is.
+		if startSeq > 0 && placed && p.Offset <= startSeq {
+			continue
+		}
 		at, ok := acked[p]
 		if !ok || seen[op.Process][p] {
 			continue

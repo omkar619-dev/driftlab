@@ -82,6 +82,11 @@ func TestCheckFixtures(t *testing.T) {
 			"verdict failed, 0 of 5 publishes unknown",
 			"before-start consumer ops=[10 11 12]: delivered stream_seq 1 to 3 after asking to start at stream_seq 4",
 		}},
+		{"before-start-fault.jsonl", []string{
+			"verdict failed, 0 of 5 publishes unknown",
+			"before-start consumer ops=[12 13 14]: delivered stream_seq 1 to 3 after asking to start at stream_seq 4",
+			"lag consumer: the longest wait from an ack to its delivery was 700ms (value 5)",
+		}},
 		{"phantom.jsonl", []string{
 			"verdict failed, 0 of 3 publishes unknown",
 			"phantom consumer ops=[7 11]: value 2 appeared although its publish failed",
