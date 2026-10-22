@@ -343,8 +343,8 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 	} else {
 		last = publish(ctx, js, rec, 1)
 	}
-	for i, s := range subs {
-		onMsg, onErr := handlers(s, i == 0)
+	open := func(s *subscription, first bool) error {
+		onMsg, onErr := handlers(s, first)
 		rec.op(op{Process: s.name, Type: "invoke", F: "subscribe"})
 		var err error
 		if c.api == "jetstream" {
@@ -357,6 +357,12 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 			return err
 		}
 		rec.op(op{Process: s.name, Type: "ok", F: "subscribe"})
+		return nil
+	}
+	for i, s := range subs {
+		if err := open(s, i == 0); err != nil {
+			return err
+		}
 	}
 	if sc.startNew {
 		// Waiting for a delivery would burn the whole grace: a correct consumer
@@ -387,6 +393,17 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 		}
 		waitConnected(hc, c.grace)
 		rec.op(op{Process: "nemesis", Type: "ok", F: "reconnect"})
+		// A subscription opened after the storm cannot have been killed by it,
+		// so it witnesses by construction: whatever it goes on to receive
+		// proves the stream was still flowing and the client still working.
+		// Waiting for one of the 300 to survive is luck, and in practice every
+		// one of them dies, which leaves sub-death nothing to compare against
+		// and reduces the whole run to a list of stalls.
+		w := &subscription{name: "witness"}
+		if err := open(w, false); err != nil {
+			return err
+		}
+		subs = append(subs, w)
 	}
 
 	// The 2107 trigger: a blocked callback while the flood arrives behind it,
