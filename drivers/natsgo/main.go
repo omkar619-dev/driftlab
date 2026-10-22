@@ -314,7 +314,19 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 		return err
 	}
 	rec.op(op{Process: "consumer", Type: "ok", F: "subscribe"})
-	waitFor(&reached, last, c.grace)
+	if sc.startNew {
+		// Waiting for a delivery would burn the whole grace: a correct consumer
+		// has nothing to deliver yet, and that is exactly the state the reset
+		// mishandles.
+		rec.op(op{Process: "nemesis", Type: "invoke", F: "reconnect"})
+		if err := hc.ForceReconnect(); err != nil {
+			return err
+		}
+		waitConnected(hc, c.grace)
+		rec.op(op{Process: "nemesis", Type: "ok", F: "reconnect"})
+	} else {
+		waitFor(&reached, last, c.grace)
+	}
 
 	// The 2107 trigger: a blocked callback while the flood arrives behind it,
 	// and, where the API has one, a tiny pending tray for the flood to overflow.
@@ -330,7 +342,7 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 	tp := toxiproxy{api: c.toxiproxy}
 	netStarted := false
 	var serverDone chan error
-	for v := uint64(2); v <= c.n; v++ {
+	for v := firstRun; v <= c.n; v++ {
 		if sc.net != "" && v == c.n/2+1 {
 			if err := startNetFault(tp, rec, sc); err != nil {
 				return err
@@ -559,6 +571,16 @@ func subscribeJetStream(ctx context.Context, hc *nats.Conn, c config, sc scenari
 		return reader{}, err
 	}
 	return reader{stop: func() error { cc.Stop(); return nil }}, nil
+}
+
+// waitConnected polls until the connection is back or limit runs out. The
+// reset this scenario is about runs on CONNECTED, so the publishes must not
+// start before it.
+func waitConnected(nc *nats.Conn, limit time.Duration) {
+	deadline := time.Now().Add(limit)
+	for !nc.IsConnected() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // waitFor polls until the consumer has reached target or grace runs out.
