@@ -116,7 +116,7 @@ func Check(h *history.History) Result {
 	n := numbering{kafka: h.Kafka}
 	relay := h.Meta.Relay
 	final := readFinal(h.Ops)
-	r := Result{Anomalies: checkOrdered(h.Ops, n)}
+	r := Result{Anomalies: checkOrdered(h.Ops, n, h.Meta.StartSeq)}
 	r.Anomalies = append(r.Anomalies, checkSends(h.Ops, n)...)
 	if final != nil {
 		r.Anomalies = append(r.Anomalies, checkStalls(h.Ops, final, n)...)
@@ -295,12 +295,25 @@ type skip struct {
 	lo, hi  uint64 // the skipped offsets, inclusive
 }
 
-func checkOrdered(ops []history.Op, n numbering) []Anomaly {
+func checkOrdered(ops []history.Op, n numbering, startSeq uint64) []Anomaly {
+	// A consumer that asked to start after startSeq was promised nothing below
+	// it, so its first wanted position is startSeq+1 rather than the stream's
+	// own first. Without this a consumer that starts correctly looks like it
+	// skipped everything before it.
+	first := n.first()
+	if startSeq > 0 {
+		first = startSeq + 1
+	}
 	var out []Anomaly
 	var skips []skip
 	consumers := map[string]*consumer{}
 	for _, op := range ops {
 		if op.F != history.Deliver {
+			continue
+		}
+		// Deliveries below the start are checkBeforeStart's to report. Counting
+		// them here too would call one fault two things.
+		if startSeq > 0 && op.StreamSeq != 0 && op.StreamSeq <= startSeq {
 			continue
 		}
 		c := consumers[op.Process]
@@ -321,7 +334,7 @@ func checkOrdered(ops []history.Op, n numbering) []Anomaly {
 		c.seen[p] = op.Index
 		cur := c.cursors[p.Partition]
 		if cur == nil {
-			cur = &cursor{next: n.first(), lastOp: -1}
+			cur = &cursor{next: first, lastOp: -1}
 			c.cursors[p.Partition] = cur
 		}
 		switch {

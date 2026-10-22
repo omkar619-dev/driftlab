@@ -71,6 +71,9 @@ func TestCheckFixtures(t *testing.T) {
 			"verdict failed, 0 of 4 publishes unknown",
 			"lost-write producer ops=[5]: value 3 was acked at stream_seq 3 but is missing from the final read",
 		}},
+		{"start-new-clean.jsonl", []string{
+			"verdict clean, 0 of 5 publishes unknown",
+		}},
 		{"before-start.jsonl", []string{
 			"verdict failed, 0 of 5 publishes unknown",
 			"before-start consumer ops=[10 11 12]: delivered stream_seq 1 to 3 after asking to start at stream_seq 4",
