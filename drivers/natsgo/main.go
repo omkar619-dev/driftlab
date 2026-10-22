@@ -52,6 +52,7 @@ const slowLatency = 25 * time.Second
 // hold.
 type scenario struct {
 	consumer bool
+	startNew bool
 	proxy    bool
 	stall    time.Duration
 	net      string
@@ -63,6 +64,7 @@ var scenarios = map[string]scenario{
 	"publish-only":  {},
 	"control":       {consumer: true},
 	"proxy-control": {consumer: true, proxy: true},
+	"start-new":     {consumer: true, startNew: true},
 	"slow-short":    {consumer: true, stall: 2 * time.Second},
 	"slow-long":     {consumer: true, stall: 8 * time.Second},
 	"net-slow":      {consumer: true, proxy: true, net: "slow", hold: 30 * time.Second},
@@ -83,6 +85,7 @@ type config struct {
 	grace           time.Duration
 	hold            time.Duration
 	blockDisconnect time.Duration
+	prefix          uint64
 }
 
 func main() {
@@ -91,10 +94,11 @@ func main() {
 	flag.StringVar(&c.helperURL, "helper-url", "nats://127.0.0.1:4223", "where the consumer connects in proxy scenarios: toxiproxy's helper-line")
 	flag.StringVar(&c.toxiproxy, "toxiproxy", "http://127.0.0.1:8474", "toxiproxy's HTTP API, used by proxy scenarios")
 	flag.StringVar(&c.container, "container", "driftlab-nats-1", "nats-server's docker container, which server scenarios pause or kill")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, proxy-control, slow-short, slow-long, net-slow, net-cut, server-pause or server-kill")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, proxy-control, start-new, slow-short, slow-long, net-slow, net-cut, server-pause or server-kill")
 	flag.StringVar(&c.api, "api", "legacy", "consumer API: legacy (push) or jetstream (pull)")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish")
 	flag.IntVar(&c.pending, "pending", 20, "the consumer's tray size during a stall, in messages")
+	flag.Uint64Var(&c.prefix, "prefix", 10, "in start-new, how many messages are published before the consumer subscribes past them")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the consumer gets to catch up before the final read")
 	flag.DurationVar(&c.hold, "hold", 0, "how long a network or server fault lasts; 0 keeps the scenario's own")
 	flag.DurationVar(&c.blockDisconnect, "block-disconnect", 0, "how long the consumer's disconnect handler blocks after it records a drop, as a slow application handler would; 0 returns at once")
@@ -283,14 +287,27 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 		}
 	}
 
-	last := publish(ctx, js, rec, 1)
+	// start-new publishes a prefix the consumer must never see, then subscribes
+	// past it. Nothing is delivered before the reconnect below, which is the
+	// precondition for a reset that forgets its start position and recreates the
+	// consumer from the beginning of the stream.
+	firstRun := uint64(2)
+	var last uint64
+	if sc.startNew {
+		for v := uint64(1); v <= c.prefix; v++ {
+			last = publish(ctx, js, rec, v)
+		}
+		firstRun = c.prefix + 1
+	} else {
+		last = publish(ctx, js, rec, 1)
+	}
 	rec.op(op{Process: "consumer", Type: "invoke", F: "subscribe"})
 	var rd reader
 	var err error
 	if c.api == "jetstream" {
 		rd, err = subscribeJetStream(ctx, hc, c, sc, onMsg, onErr)
 	} else {
-		rd, err = subscribeLegacy(hc, c, onMsg, onErr)
+		rd, err = subscribeLegacy(hc, c, sc, onMsg, onErr)
 	}
 	if err != nil {
 		rec.op(op{Process: "consumer", Type: "info", F: "subscribe", Error: err.Error()})
@@ -479,10 +496,16 @@ type reader struct {
 // subscribeLegacy uses the legacy push ordered consumer, the API that KV
 // and Object Store watchers use. The server pushes messages at it, and
 // whatever doesn't fit its pending tray is dropped.
-func subscribeLegacy(hc *nats.Conn, c config, onMsg func([]byte, uint64), onErr func(error)) (reader, error) {
+func subscribeLegacy(hc *nats.Conn, c config, sc scenario, onMsg func([]byte, uint64), onErr func(error)) (reader, error) {
 	legacy, err := hc.JetStream()
 	if err != nil {
 		return reader{}, err
+	}
+	// start-new asks to begin past the prefix, so the consumer starts with
+	// nothing delivered and no position of its own to resume from.
+	opts := []nats.SubOpt{nats.OrderedConsumer()}
+	if sc.startNew {
+		opts = append(opts, nats.DeliverNew())
 	}
 	sub, err := legacy.Subscribe(subject, func(m *nats.Msg) {
 		md, err := m.Metadata()
@@ -491,7 +514,7 @@ func subscribeLegacy(hc *nats.Conn, c config, onMsg func([]byte, uint64), onErr 
 			return
 		}
 		onMsg(m.Data, md.Sequence.Stream)
-	}, nats.OrderedConsumer())
+	}, opts...)
 	if err != nil {
 		return reader{}, err
 	}
@@ -510,7 +533,11 @@ func subscribeJetStream(ctx context.Context, hc *nats.Conn, c config, sc scenari
 	if err != nil {
 		return reader{}, err
 	}
-	cons, err := hjs.OrderedConsumer(ctx, streamName, jetstream.OrderedConsumerConfig{})
+	oc := jetstream.OrderedConsumerConfig{}
+	if sc.startNew {
+		oc.DeliverPolicy = jetstream.DeliverNewPolicy
+	}
+	cons, err := hjs.OrderedConsumer(ctx, streamName, oc)
 	if err != nil {
 		return reader{}, err
 	}
@@ -598,6 +625,7 @@ type metaLine struct {
 	Scenario string   `json:"scenario"`
 	Faults   []string `json:"faults,omitempty"`
 	Params   params   `json:"params"`
+	StartSeq uint64   `json:"start_seq,omitempty"`
 	Driftlab string   `json:"driftlab"`
 }
 
@@ -656,6 +684,12 @@ func newMeta(server string, c config, sc scenario) metaLine {
 	if sc.server != "" {
 		m.Faults = []string{sc.server}
 		m.Params.Hold = sc.hold.String()
+	}
+	if sc.startNew {
+		// The stream is fresh, so the prefix occupies stream_seq 1..prefix and
+		// the consumer's first wanted message is prefix+1.
+		m.Faults = []string{"reconnect"}
+		m.StartSeq = c.prefix
 	}
 	return m
 }
