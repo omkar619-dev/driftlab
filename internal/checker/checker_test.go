@@ -78,6 +78,15 @@ func TestCheckFixtures(t *testing.T) {
 			"verdict clean, 0 of 5 publishes unknown",
 			"lag consumer: the longest wait from an ack to its delivery was 700ms (value 5)",
 		}},
+		{"sub-death.jsonl", []string{
+			"verdict failed, 0 of 5 publishes unknown",
+			"sub-death consumer-a ops=[12 16]: stopped at stream_seq 2 and received nothing more, while consumer-b went on to stream_seq 5",
+		}},
+		{"both-slow.jsonl", []string{
+			"verdict failed, 0 of 5 publishes unknown",
+			"stall consumer-a ops=[12 18]: had reached stream_seq 2 of 5 when the final read began",
+			"stall consumer-b ops=[13 18]: had reached stream_seq 2 of 5 when the final read began",
+		}},
 		{"before-start.jsonl", []string{
 			"verdict failed, 0 of 5 publishes unknown",
 			"before-start consumer ops=[10 11 12]: delivered stream_seq 1 to 3 after asking to start at stream_seq 4",

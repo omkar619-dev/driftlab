@@ -40,6 +40,7 @@ const (
 	NonmonotonicSend    Kind = "nonmonotonic-send"
 	NonmonotonicCopy    Kind = "nonmonotonic-copy"
 	BeforeStart         Kind = "before-start"
+	SubDeath            Kind = "sub-death"
 )
 
 // Anomaly is one broken promise, with the history indexes that prove it.
@@ -119,7 +120,11 @@ func Check(h *history.History) Result {
 	r := Result{Anomalies: checkOrdered(h.Ops, n, h.Meta.StartSeq)}
 	r.Anomalies = append(r.Anomalies, checkSends(h.Ops, n)...)
 	if final != nil {
-		r.Anomalies = append(r.Anomalies, checkStalls(h.Ops, final, n)...)
+		// sub-death runs first: a subscription it names is dead rather than
+		// merely behind, and checkStalls must not call the same fault a stall.
+		subDeaths, dead := checkSubDeath(h.Ops, final, n)
+		r.Anomalies = append(r.Anomalies, subDeaths...)
+		r.Anomalies = append(r.Anomalies, checkStalls(h.Ops, final, n, dead)...)
 		r.Anomalies = append(r.Anomalies, checkLostWrites(h.Ops, final, n, relay)...)
 		// A relay run's acks give positions in the source, and its final read
 		// gives positions in the copy, so the two can't be compared. The
@@ -430,7 +435,14 @@ type progress struct {
 	lastOp  int               // history index of its latest subscribe or delivery
 }
 
-func checkStalls(ops []history.Op, final *finalRead, n numbering) []Anomaly {
+// deadKey names one subscription's view of one partition, so a sub-death on
+// one partition does not silence a real stall on another.
+type deadKey struct {
+	process string
+	part    uint32
+}
+
+func checkStalls(ops []history.Op, final *finalRead, n numbering, dead map[deadKey]bool) []Anomaly {
 	consumers := map[string]*progress{}
 	var order []string
 	for _, op := range ops[:final.start] {
@@ -456,6 +468,10 @@ func checkStalls(ops []history.Op, final *finalRead, n numbering) []Anomaly {
 	for _, name := range order {
 		p := consumers[name]
 		for _, part := range final.partitions() {
+			// Already reported as dead, and dead outranks behind.
+			if dead[deadKey{process: name, part: part}] {
+				continue
+			}
 			end := final.tails[part]
 			got, ok := p.reached[part]
 			if ok && got >= end.offset {
@@ -859,4 +875,96 @@ func checkBeforeStart(ops []history.Op, startSeq uint64) []Anomaly {
 		out = append(out, *s.a)
 	}
 	return out
+}
+
+// checkSubDeath reports a subscription that stopped receiving for good while a
+// sibling kept going past where it stopped. It returns the anomalies and the
+// subscriptions it claimed, so checkStalls can leave those alone.
+//
+// checkStalls already reports a consumer that ended behind the stream, but
+// behind is not the same as dead: a slow consumer given more grace would catch
+// up. The sibling is the discriminator. If another subscription received past
+// this one's last position AFTER it went quiet, the stream was still flowing
+// and the client was still working, so the fault is this subscription's alone.
+//
+// That is the shape of an ordered-consumer reset losing a subscription for
+// good: it goes silent with no error while its siblings on the same connection
+// carry on. See drivers/natsgo/repro2201.
+func checkSubDeath(ops []history.Op, final *finalRead, n numbering) ([]Anomaly, map[deadKey]bool) {
+	type sub struct {
+		reached  map[uint32]uint64
+		lastTime time.Duration
+		lastOp   int
+	}
+	subs := map[string]*sub{}
+	var order []string
+	for _, op := range ops[:final.start] {
+		subscribed := op.F == history.Subscribe && op.Type == history.OK
+		delivered := op.F == history.Deliver && op.Type == history.OK
+		if !subscribed && !delivered {
+			continue
+		}
+		s := subs[op.Process]
+		if s == nil {
+			s = &sub{reached: map[uint32]uint64{}}
+			subs[op.Process] = s
+			order = append(order, op.Process)
+		}
+		s.lastOp, s.lastTime = op.Index, op.Time
+		if delivered {
+			p, _ := op.Pos()
+			if got, ok := s.reached[p.Partition]; !ok || p.Offset > got {
+				s.reached[p.Partition] = p.Offset
+			}
+		}
+	}
+	// With one subscription there is nothing to compare against, so dead and
+	// slow are indistinguishable and this says nothing.
+	if len(order) < 2 {
+		return nil, nil
+	}
+
+	dead := map[deadKey]bool{}
+	var out []Anomaly
+	for _, name := range order {
+		s := subs[name]
+		for _, part := range final.partitions() {
+			got := s.reached[part] // zero when it received nothing at all
+			if got >= final.tails[part].offset {
+				continue
+			}
+			// The witness: the furthest another subscription got on this
+			// partition after this one fell silent.
+			witness, at, witnessOp := "", uint64(0), 0
+			for _, op := range ops[:final.start] {
+				if op.F != history.Deliver || op.Type != history.OK || op.Process == name {
+					continue
+				}
+				p, _ := op.Pos()
+				if p.Partition != part || op.Time <= s.lastTime || p.Offset <= got {
+					continue
+				}
+				if witness == "" || p.Offset > at {
+					witness, at, witnessOp = op.Process, p.Offset, op.Index
+				}
+			}
+			// Nobody got further afterwards, so this one is behind, not dead.
+			if witness == "" {
+				continue
+			}
+			var msg string
+			if got == 0 {
+				msg = fmt.Sprintf("received nothing, while %s went on to %s",
+					witness, n.at(history.Pos{Partition: part, Offset: at}))
+			} else {
+				msg = fmt.Sprintf("stopped at %s and received nothing more, while %s went on to %s",
+					n.at(history.Pos{Partition: part, Offset: got}), witness,
+					n.at(history.Pos{Partition: part, Offset: at}))
+			}
+			dead[deadKey{process: name, part: part}] = true
+			out = append(out, Anomaly{Kind: SubDeath, Process: name,
+				Ops: []int{s.lastOp, witnessOp}, Msg: msg})
+		}
+	}
+	return out, dead
 }
