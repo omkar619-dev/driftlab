@@ -82,6 +82,21 @@ commits on either side of https://github.com/IBM/sarama/pull/3762: sending one m
 the commit before the fix lost two acknowledged messages in every run, and the one after it never
 did. All 36 runs came out as expected.
 
+A fourth calibration, on 2026-10-22, against a regression that never shipped. The first commit on
+https://github.com/nats-io/nats.go/pull/2201 recreates the push ordered consumer on reconnect and
+loses the position it was asked to start at: a consumer that subscribed past a 10-message prefix
+with `DeliverNew` was handed all 10 of them back after a single forced reconnect, in 5 runs out of
+5. The maintainer's next commit on the same branch named and fixed it. The branch's head is clean,
+and so are v1.53.1 and v1.54.0, 5 of 5 each, so the replay only ever existed between two commits of
+an unmerged branch. It is recorded here for what it took to see it: the replay is ordered, gapless
+and matches the stream, so every check driftlab had before it passed the run. It needed a new
+scenario, `start-new`, and a new anomaly, `before-start`, which asks whether the consumer wanted
+the messages at all rather than whether the sequence that arrived was consistent. All 25 runs came
+out as expected. The first two commits are no longer reachable from any branch, so the builds were
+`v1.54.1-0.20261022084953-e990cce972df`, which replays, and
+`v1.54.1-0.20261022084953-06c31058b7f5`, which does not; the head tested was
+`v1.54.1-0.20261022134643-fc1b9a9858c3`.
+
 ## The matrix
 
 `scripts/matrix.sh` runs 2 nats.go versions × 2 consumer APIs × 8 scenarios: a control, a control
