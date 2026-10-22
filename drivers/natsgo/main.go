@@ -444,9 +444,18 @@ func consume(ctx context.Context, hc *nats.Conn, js jetstream.JetStream, rec *re
 	last = max(last, publish(ctx, js, rec, c.n+1))
 	waitForAll(subs, last, c.grace)
 	// Stop them all before reporting, so one bad stop can't hide the rest.
+	// A subscription the library has already torn down answers with
+	// ErrBadSubscription, which is the fault sub-death is about rather than a
+	// failure to run the scenario: record it and carry on, or the run ends
+	// before its final read and there is nothing left to judge.
 	var stopErr error
 	for _, s := range subs {
-		if err := s.rd.stop(); err != nil && stopErr == nil {
+		err := s.rd.stop()
+		if err == nil {
+			continue
+		}
+		rec.op(op{Process: s.name, Type: "info", F: "unsubscribe", Error: err.Error()})
+		if !errors.Is(err, nats.ErrBadSubscription) && stopErr == nil {
 			stopErr = err
 		}
 	}
