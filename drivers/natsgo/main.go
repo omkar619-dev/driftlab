@@ -67,7 +67,7 @@ var scenarios = map[string]scenario{
 	"control":       {consumer: true},
 	"proxy-control": {consumer: true, proxy: true},
 	"start-new":     {consumer: true, startNew: true},
-	"sub-death":     {consumer: true, subDeath: true, subs: 50},
+	"sub-death":     {consumer: true, subDeath: true, subs: 300},
 	"slow-short":    {consumer: true, stall: 2 * time.Second},
 	"slow-long":     {consumer: true, stall: 8 * time.Second},
 	"net-slow":      {consumer: true, proxy: true, net: "slow", hold: 30 * time.Second},
@@ -198,8 +198,16 @@ func connectHelper(c config, sc scenario, rec *recorder) (*nats.Conn, error) {
 		url = c.helperURL
 	}
 	var overflowed sync.Once
+	// These are connection-level events, not any one subscription's. With a
+	// single subscription the name stays "consumer" so existing histories do
+	// not change; with more it would be a phantom consumer that never
+	// delivers anything.
+	clientName := "consumer"
+	if subCount(c, sc) > 1 {
+		clientName = "client"
+	}
 	onError := func(_ *nats.Conn, _ *nats.Subscription, err error) {
-		rec.op(op{Process: "consumer", Type: "info", F: "client-error", Error: err.Error()})
+		rec.op(op{Process: clientName, Type: "info", F: "client-error", Error: err.Error()})
 		if errors.Is(err, nats.ErrSlowConsumer) {
 			overflowed.Do(func() {
 				rec.op(op{Process: "nemesis", Type: "ok", F: "overflow"})
@@ -209,7 +217,7 @@ func connectHelper(c config, sc scenario, rec *recorder) (*nats.Conn, error) {
 	onDisconnect := func(_ *nats.Conn, err error) {
 		// Close reports a nil error; only a dropped connection is news.
 		if err != nil {
-			rec.op(op{Process: "consumer", Type: "info", F: "disconnect", Error: err.Error()})
+			rec.op(op{Process: clientName, Type: "info", F: "disconnect", Error: err.Error()})
 			// -block-disconnect plays a slow application handler; 0 doesn't
 			// sleep. nats.go runs a connection's callbacks one at a time,
 			// so anything it queues behind this one waits too.
@@ -217,13 +225,22 @@ func connectHelper(c config, sc scenario, rec *recorder) (*nats.Conn, error) {
 		}
 	}
 	onReconnect := func(_ *nats.Conn) {
-		rec.op(op{Process: "consumer", Type: "info", F: "reconnect"})
+		rec.op(op{Process: clientName, Type: "info", F: "reconnect"})
 	}
-	hc, err := nats.Connect(url,
+	opts := []nats.Option{
 		nats.ErrorHandler(onError),
 		nats.DisconnectErrHandler(onDisconnect),
 		nats.ReconnectHandler(onReconnect),
-	)
+	}
+	if sc.subDeath {
+		// repro2201's settings, and they are the fault. With the default
+		// two-second ReconnectWait the whole reconnect loop runs while the
+		// connection is already down, so the client comes back once and
+		// recreates every consumer with nothing competing: no create is ever
+		// in flight when the next disconnect lands, and the bug cannot appear.
+		opts = append(opts, nats.MaxReconnects(-1), nats.ReconnectWait(10*time.Millisecond))
+	}
+	hc, err := nats.Connect(url, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting the consumer to %s: %w", url, err)
 	}

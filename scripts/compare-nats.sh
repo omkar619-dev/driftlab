@@ -56,7 +56,7 @@ verdicts=(clean failed invalid "couldn't run")
 if [ -n "$tag" ]; then
 	echo "every run adds: $ARGS"
 fi
-printf '%-4s %-28s %-13s %-12s %-18s %s\n' run build scenario got recovery lag
+printf '%-4s %-28s %-13s %-12s %-7s %-18s %s\n' run build scenario got deaths recovery lag
 for run in $(seq "$runs"); do
 	for scenario in "${scenarios[@]}"; do
 		for bin in "$@"; do
@@ -78,14 +78,22 @@ for run in $(seq "$runs"); do
 			# faults ended", and the duration from "lag consumer: the longest
 			# wait from an ack to its delivery was 13.801s (value 3)". Runs
 			# without faults have neither.
-			line=$(grep '^recovery' "$out/$name.txt" 2>/dev/null)
+			# Recovery and lag are per consumer, so a run with many
+			# subscriptions prints one line each. Take the first and leave the
+			# rest in the .txt; without -m1 they spill over the table.
+			line=$(grep -m1 '^recovery' "$out/$name.txt" 2>/dev/null)
 			recovery=${line#*: }
 			recovery=${recovery% after the faults ended}
-			line=$(grep '^lag' "$out/$name.txt" 2>/dev/null)
+			line=$(grep -m1 '^lag' "$out/$name.txt" 2>/dev/null)
 			lag=${line#*was }
 			lag=${lag%% *}
+			# How many subscriptions died is the number sub-death runs are for.
+			deaths=$(grep -c '^sub-death' "$out/$name.txt" 2>/dev/null)
+			if [ "$deaths" = 0 ]; then
+				deaths=-
+			fi
 
-			printf '%-4s %-28s %-13s %-12s %-18s %s\n' "$run" "$build" "$scenario" "$got" "${recovery:--}" "${lag:--}"
+			printf '%-4s %-28s %-13s %-12s %-7s %-18s %s\n' "$run" "$build" "$scenario" "$got" "$deaths" "${recovery:--}" "${lag:--}"
 		done
 	done
 done
