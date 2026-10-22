@@ -97,6 +97,21 @@ out as expected. The first two commits are no longer reachable from any branch, 
 `v1.54.1-0.20261022084953-06c31058b7f5`, which does not; the head tested was
 `v1.54.1-0.20261022134643-fc1b9a9858c3`.
 
+A fifth calibration, on 2026-10-23, against another regression that never shipped. The first commit
+on https://github.com/nats-io/nats.go/pull/2201 recreates the push ordered consumer on reconnect,
+and a disconnect that lands while that create is in flight unsubscribes it for good: the
+subscription is gone until the process restarts, with no error raised to the caller. Driving 300
+subscriptions through 10 forced reconnects 20ms apart killed 278, 296 and 297 of them in three
+runs, each one reported with the sibling that carried on without it. The maintainer's next commit
+on the same branch names the disconnect retries among its fixes, and the branch's head and the
+release v1.54.0 are clean, 3 of 3 each. All 9 runs came out as expected. Seeing it at all needed a
+new anomaly, `sub-death`: `checkStalls` already reports a consumer that ended behind the stream,
+but behind is not dead, and a sibling that kept receiving past where this one stopped is what tells
+the two apart. It also needed a subscription opened after the storm to be that sibling, because in
+some runs every one of the 300 dies and nothing is left to compare against. The failing build was
+`v1.54.1-0.20261022084953-e990cce972df` and the head tested was
+`v1.54.1-0.20261022134643-fc1b9a9858c3`.
+
 ## The matrix
 
 `scripts/matrix.sh` runs 2 nats.go versions × 2 consumer APIs × 8 scenarios: a control, a control
