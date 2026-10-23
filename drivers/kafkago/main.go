@@ -4,10 +4,10 @@
 //
 // kafka-go does the writing and, in the scenarios with a helper, the reading
 // while the topic is written. Everything else goes through franz-go v1.20.7,
-// pinned in go.mod: creating the topic, finding the leader to kill, finding
-// where each partition ends, and the final read, so the witness is never the
-// thing being tested. franz-go's admin requests go through kmsg, as in
-// drivers/franzgo.
+// pinned in go.mod: creating the topic, finding the brokers to fault and
+// watching the in-sync set, finding where each partition ends, and the final
+// read, so the witness is never the thing being tested. franz-go's admin
+// requests go through kmsg, as in drivers/franzgo.
 package main
 
 import (
@@ -42,18 +42,21 @@ const replicas = 3
 // the topic through kafka-go while it is being written. A non-zero partitions
 // or n overrides the -partitions or -n flag, and a non-zero interval replaces
 // the pause after each value, 10 milliseconds otherwise. A fault, if set,
-// starts just before value faultAt is handed over and lasts hold: "kill"
-// kills the broker that leads partition 0 and then starts it again. A fault
-// always starts live, on a goroutine of its own, so the writer goes on while
-// docker acts on the broker: drivers/sarama found that pausing the writer for
-// docker gives the followers time to copy everything acknowledged, which
-// hides the loss acks one allows.
+// starts just before value faultAt is handed over and lasts hold: "cut" stops
+// brokers holding partition 0's other copies from fetching from it, "pause"
+// freezes them, and "kill" kills the broker that leads partition 0 and then
+// starts it again. A cut or a freeze hits the first followers of them, or all
+// of them when followers is 0. A fault always starts live, on a goroutine of
+// its own, so the writer goes on while docker acts on the broker:
+// drivers/sarama found that pausing the writer for docker gives the followers
+// time to copy everything acknowledged, which hides the loss acks one allows.
 type scenario struct {
 	consumer   bool
 	partitions int
 	n          uint64
 	interval   time.Duration
 	fault      string
+	followers  int
 	faultAt    uint64
 	hold       time.Duration
 }
@@ -76,10 +79,31 @@ type scenario struct {
 // a follower copied it is lost when the leader fails, so with -acks one the
 // run must lose acknowledged values, and with -acks all, which waits for
 // every in-sync copy, it must not.
+//
+// followers-pause, follower-pause and follower-cut are drivers/sarama's
+// scenarios of those names, each on a topic with one partition, a value every
+// 10 milliseconds and the helper reading. followers-pause freezes both
+// brokers that hold the partition's other copies for 25 seconds, and with the
+// controller quorum frozen too, nothing can take them out of the in-sync set.
+// follower-pause freezes one of them for 25 seconds, and the controller
+// fences it after the brokers' 9-second session timeout, or about 12 seconds
+// when it was the active controller. follower-cut cuts one of them off from
+// the leader for 50 seconds; it keeps checking in, so only the leader drops
+// it, once it has lagged for 30 seconds, 30 to 45 seconds in. Until then a
+// write with acks all can't be acknowledged. kafka-go asks the leader to wait
+// at most 5 seconds, half its 10-second write timeout, so the leader answers
+// REQUEST_TIMED_OUT, and kafka-go sends the same batch again. With no
+// producer ID, the leader can't tell it from a new batch and stores it again,
+// which Kafka's docs say a producer without idempotence may do when it
+// retries. So with -acks all each attempt should leave another copy of the
+// batch; with -acks none nothing waits and nothing is sent twice.
 var scenarios = map[string]scenario{
 	"publish-only":     {},
 	"control":          {consumer: true},
 	"leader-kill-live": {consumer: true, partitions: 1, n: 20000, interval: time.Millisecond, fault: "kill", faultAt: 501, hold: 20 * time.Second},
+	"followers-pause":  {consumer: true, partitions: 1, n: 4000, fault: "pause", faultAt: 501, hold: 25 * time.Second},
+	"follower-pause":   {consumer: true, partitions: 1, n: 4000, fault: "pause", followers: 1, faultAt: 501, hold: 25 * time.Second},
+	"follower-cut":     {consumer: true, partitions: 1, n: 6500, fault: "cut", followers: 1, faultAt: 501, hold: 50 * time.Second},
 }
 
 type config struct {
@@ -87,6 +111,8 @@ type config struct {
 	server     string
 	scenario   string
 	acks       string
+	nftImage   string
+	cutPort    int
 	n          uint64
 	partitions int
 	interval   time.Duration
@@ -97,12 +123,14 @@ func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control or leader-kill-live")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, leader-kill-live, followers-pause, follower-pause or follower-cut")
 	flag.StringVar(&c.acks, "acks", "all", "which copies acknowledge a write: all, every in-sync copy (the driver's default); one, the leader alone; or none, nothing at all (kafka-go's own default)")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish, unless the scenario sets it")
 	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic, unless the scenario sets it")
 	flag.DurationVar(&c.interval, "interval", 0, "the pause after handing each value to the writer; 0 keeps the scenario's own, or 10ms")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the helper gets to catch up before the final read")
+	flag.StringVar(&c.nftImage, "nft-image", "driftlab-nft", "the image the cut runs nft from, inside a broker's network (docker build -t driftlab-nft deploy/nft)")
+	flag.IntVar(&c.cutPort, "cut-port", 19092, "the port the brokers fetch from each other on, which the cut drops (deploy/kafka.yaml's INTERNAL listener)")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "kafkagodriver:", err)
@@ -142,7 +170,7 @@ func run(c config, out io.Writer) error {
 	ctx := context.Background()
 
 	// The witness's client, franz-go and never kafka-go. It creates the topic,
-	// waits for its leaders, finds the leader to kill and where each
+	// waits for its leaders, finds the brokers to fault and where each
 	// partition ends, and does the final read.
 	seeds := strings.Split(c.brokers, ",")
 	adm, err := kgo.NewClient(kgo.SeedBrokers(seeds...))
@@ -154,6 +182,11 @@ func run(c config, out io.Writer) error {
 	topic := fmt.Sprintf("driftlab-kafkago-%s-%d", c.scenario, time.Now().UnixMilli())
 	setup, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	// A broker that an earlier run froze and never thawed, because the run
+	// was stopped mid-freeze, doesn't answer, so a freeze run thaws any first.
+	if sc.fault == "pause" {
+		thawAll()
+	}
 	// A broker that an earlier run killed needs a few seconds after its
 	// restart to register again, and the topic can't get its copies without
 	// it.
@@ -166,6 +199,11 @@ func run(c config, out io.Writer) error {
 	if err := waitForLeaders(setup, adm, topic, partitions); err != nil {
 		return err
 	}
+	// A cut that an earlier run left behind would stall this run before its
+	// own fault starts, so a cut run clears any first.
+	if sc.fault == "cut" {
+		clearCuts(setup, adm, topic, c)
+	}
 
 	rec.writeMeta(newMeta(c, sc, topic, acks))
 	var h *helper
@@ -175,11 +213,11 @@ func run(c config, out io.Writer) error {
 	w := startWriter(seeds, rec, topic, acks)
 	var ft *activeFault
 	for v := uint64(1); v <= sc.n; v++ {
-		// The kill starts before this value is handed over and ends on its
+		// The fault starts before this value is handed over and ends on its
 		// own timer, because the stream goes on meanwhile.
-		if sc.fault == "kill" && v == sc.faultAt {
+		if sc.fault != "" && v == sc.faultAt {
 			ft = startLive(func() (*activeFault, error) {
-				return startKill(ctx, adm, rec, topic, sc.hold)
+				return startFault(ctx, adm, rec, topic, sc, c)
 			})
 		}
 		w.publish(v)
@@ -419,6 +457,19 @@ type activeFault struct {
 	err  error
 }
 
+// startFault puts the scenario's fault in place and returns it.
+func startFault(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, sc scenario, c config) (*activeFault, error) {
+	switch sc.fault {
+	case "cut":
+		return startCut(ctx, cl, rec, topic, sc.followers, sc.hold, c)
+	case "kill":
+		return startKill(ctx, cl, rec, topic, sc.hold)
+	case "pause":
+		return startPause(ctx, cl, rec, topic, sc.followers, sc.hold)
+	}
+	return nil, fmt.Errorf("unknown fault %q", sc.fault)
+}
+
 // startLive runs start on a goroutine of its own and returns at once, so the
 // writer goes on while docker acts on the broker. The fault it returns ends
 // when the started one does, and carries any error from starting it, which
@@ -436,6 +487,228 @@ func startLive(start func() (*activeFault, error)) *activeFault {
 		ft.err = started.err
 	}()
 	return ft
+}
+
+// startCut cuts the fetches of n of the brokers that hold partition 0's other
+// copies, or of all of them when n is 0, but never its leader's, and heals them
+// after hold on a goroutine of its own, because the stream goes on meanwhile.
+// watchISR notes when the in-sync set drops them. A cut broker stops copying
+// from the leader but keeps checking in with the controller and answering
+// clients, so it stays in the in-sync set until the leader drops it for
+// lagging, after 30 seconds. Until then the leader stores each batch but can't
+// count it as copied, and once the request's timeout runs out it answers
+// REQUEST_TIMED_OUT. The cut only counts as done if nft showed the drop rule in
+// every cut broker's network, and its ok records the partition's in-sync set as
+// the leader saw it just before the heal. Containers are named after the
+// brokers' node IDs, as deploy/kafka.yaml names them.
+func startCut(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, n int, hold time.Duration, c config) (*activeFault, error) {
+	leader, hit, err := followersOf(ctx, cl, topic)
+	if err != nil {
+		return nil, err
+	}
+	if n > 0 && n < len(hit) {
+		hit = hit[:n]
+	}
+	names := make([]string, len(hit))
+	for i, id := range hit {
+		names[i] = fmt.Sprintf("kafka-%d", id)
+	}
+	rec.op(op{Process: "nemesis", Type: "invoke", F: "cut", Detail: map[string]any{"leader": leader, "cut": names}})
+	began := time.Now()
+	for _, name := range names {
+		if _, err := nft(c, name, cutRules(c.cutPort), "-f", "-"); err != nil {
+			healCuts(c, names) // never leave one of them cut
+			return nil, fmt.Errorf("%w (is the image built? docker build -t %s deploy/nft)", err, c.nftImage)
+		}
+	}
+	took, checkErr := cutsInPlace(c, names)
+	ct := &activeFault{over: make(chan struct{})}
+	go func() {
+		defer close(ct.over)
+		end := time.Now().Add(hold)
+		watchISR(ctx, cl, rec, leader, topic, hit, began, end)
+		time.Sleep(time.Until(end))
+		isr, isrErr := leaderISR(ctx, cl, leader, topic)
+		// Heal whatever the check said, so a run never leaves brokers cut.
+		if err := healCuts(c, names); err != nil {
+			ct.err = err
+			return
+		}
+		if checkErr != nil {
+			ct.err = checkErr
+			return
+		}
+		if took {
+			var detail any
+			if isrErr == nil {
+				detail = map[string]any{"isr": isr}
+			}
+			rec.op(op{Process: "nemesis", Type: "ok", F: "cut", Detail: detail})
+		}
+	}()
+	return ct, nil
+}
+
+// cutTable is the nftables table the cut adds to a broker's network
+// namespace. Its one chain drops every packet the broker sends to the port
+// the brokers fetch from each other on, so it stops copying from the
+// leaders, while its traffic to the controllers and to clients carries on.
+// Deleting the table ends the cut.
+const cutTable = "driftlab"
+
+// cutRules is the cut's ruleset, in the form nft -f reads.
+func cutRules(port int) string {
+	return fmt.Sprintf("table inet %s {\n\tchain fetches {\n\t\ttype filter hook output priority 0; policy accept;\n\t\ttcp dport %d drop\n\t}\n}\n", cutTable, port)
+}
+
+// nft runs nft inside a broker container's network namespace, from a
+// throwaway container of the -nft-image image that joins that namespace with
+// the right to change its firewall. stdin, if not empty, is what nft reads.
+func nft(c config, name, stdin string, args ...string) (string, error) {
+	full := []string{"run", "--rm", "--network", "container:" + name, "--cap-add", "NET_ADMIN"}
+	if stdin != "" {
+		full = append(full, "-i")
+	}
+	full = append(full, c.nftImage, "nft")
+	return dockerIn(stdin, append(full, args...)...)
+}
+
+// cutsInPlace says whether nft shows the drop rule in every named broker's
+// network.
+func cutsInPlace(c config, names []string) (bool, error) {
+	rule := fmt.Sprintf("tcp dport %d drop", c.cutPort)
+	for _, name := range names {
+		out, err := nft(c, name, "", "list", "table", "inet", cutTable)
+		if err != nil {
+			return false, err
+		}
+		if !strings.Contains(out, rule) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// healCuts deletes the cut table from every named broker's network, and
+// returns the first error.
+func healCuts(c config, names []string) error {
+	var first error
+	for _, name := range names {
+		if _, err := nft(c, name, "", "delete", "table", "inet", cutTable); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// clearCuts deletes any cut an earlier run left behind on the topic's
+// brokers. It ignores errors, most of which mean there was no cut to
+// delete; a missing image shows up when the cut starts.
+func clearCuts(ctx context.Context, cl *kgo.Client, topic string, c config) {
+	leader, followers, err := followersOf(ctx, cl, topic)
+	if err != nil {
+		return
+	}
+	for _, id := range append(followers, leader) {
+		nft(c, fmt.Sprintf("kafka-%d", id), "", "delete", "table", "inet", cutTable)
+	}
+}
+
+// startPause freezes n of the brokers that hold partition 0's other copies, or
+// all of them when n is 0, with docker pause, but never its leader, and thaws
+// them after hold, on a goroutine of its own, because the stream goes on
+// meanwhile. With two of the three brokers frozen there is also no controller
+// quorum, so nothing can take them out of the in-sync set: the leader stores
+// each batch but can never get it copied. With one frozen, the controller
+// fences it, and watchISR notes when that drops it from the set. Unlike a cut
+// broker, a frozen one doesn't answer clients either. The freeze only counts as
+// done if docker showed every follower paused, and its ok records the
+// partition's in-sync set as the leader saw it just before the thaw. Containers
+// are named after the brokers' node IDs, as deploy/kafka.yaml names them.
+func startPause(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, n int, hold time.Duration) (*activeFault, error) {
+	leader, hit, err := followersOf(ctx, cl, topic)
+	if err != nil {
+		return nil, err
+	}
+	if n > 0 && n < len(hit) {
+		hit = hit[:n]
+	}
+	names := make([]string, len(hit))
+	for i, id := range hit {
+		names[i] = fmt.Sprintf("kafka-%d", id)
+	}
+	rec.op(op{Process: "nemesis", Type: "invoke", F: "pause", Detail: map[string]any{"leader": leader, "paused": names}})
+	began := time.Now()
+	if _, err := dockerIn("", append([]string{"pause"}, names...)...); err != nil {
+		dockerIn("", append([]string{"unpause"}, names...)...) // never leave one of them frozen
+		return nil, err
+	}
+	paused, checkErr := dockerIn("", append([]string{"inspect", "-f", "{{.State.Paused}}"}, names...)...)
+	ft := &activeFault{over: make(chan struct{})}
+	go func() {
+		defer close(ft.over)
+		end := time.Now().Add(hold)
+		watchISR(ctx, cl, rec, leader, topic, hit, began, end)
+		time.Sleep(time.Until(end))
+		isr, isrErr := leaderISR(ctx, cl, leader, topic)
+		// Thaw them whatever the check said, so a run never leaves brokers
+		// frozen.
+		if _, err := dockerIn("", append([]string{"unpause"}, names...)...); err != nil {
+			ft.err = err
+			return
+		}
+		if checkErr != nil {
+			ft.err = checkErr
+			return
+		}
+		if allTrue(paused, len(names)) {
+			var detail any
+			if isrErr == nil {
+				detail = map[string]any{"isr": isr}
+			}
+			rec.op(op{Process: "nemesis", Type: "ok", F: "pause", Detail: detail})
+		}
+	}()
+	return ft, nil
+}
+
+// watchISR asks the leader every 250 milliseconds for partition 0's in-sync
+// set, until none of the faulted brokers is in it or end passes, and records
+// an info the first time none is, with how long after began, when the fault
+// was invoked: from then on the leader counts a write as copied without them,
+// so the partition takes writes again. When two followers are frozen, the
+// controller quorum goes with them, and the set never shrinks.
+func watchISR(ctx context.Context, cl *kgo.Client, rec *recorder, leader int32, topic string, faulted []int32, began, end time.Time) {
+	for time.Now().Before(end) {
+		isr, err := leaderISR(ctx, cl, leader, topic)
+		if err == nil && !slices.ContainsFunc(faulted, func(id int32) bool { return slices.Contains(isr, id) }) {
+			rec.op(op{Process: "nemesis", Type: "info", F: "isr", Detail: map[string]any{"isr": isr, "after": time.Since(began).Round(time.Millisecond).String()}})
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// thawAll unpauses every broker in deploy/kafka.yaml. It ignores errors,
+// which mostly mean the broker wasn't paused.
+func thawAll() {
+	for id := 1; id <= replicas; id++ {
+		dockerIn("", "unpause", fmt.Sprintf("kafka-%d", id))
+	}
+}
+
+// allTrue says whether docker inspect printed "true" once per container.
+func allTrue(out string, n int) bool {
+	fields := strings.Fields(out)
+	if n == 0 || len(fields) != n {
+		return false
+	}
+	for _, f := range fields {
+		if f != "true" {
+			return false
+		}
+	}
+	return true
 }
 
 // startKill kills the broker that leads partition 0 with docker kill, the
@@ -542,6 +815,31 @@ func isrOf(ctx context.Context, cl *kgo.Client, topic string) ([]int32, error) {
 		}
 	}
 	return nil, fmt.Errorf("no partition 0 of %s", topic)
+}
+
+// leaderISR asks partition 0's leader directly which replicas are in its
+// in-sync set, and gives the request two seconds.
+func leaderISR(ctx context.Context, cl *kgo.Client, leader int32, topic string) ([]int32, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req := kmsg.NewPtrMetadataRequest()
+	t := kmsg.NewMetadataRequestTopic()
+	t.Topic = kmsg.StringPtr(topic)
+	req.Topics = append(req.Topics, t)
+	resp, err := cl.Broker(int(leader)).Request(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	mr, ok := resp.(*kmsg.MetadataResponse)
+	if !ok || len(mr.Topics) != 1 {
+		return nil, fmt.Errorf("broker %d gave an unexpected answer about %s", leader, topic)
+	}
+	for _, p := range mr.Topics[0].Partitions {
+		if p.Partition == 0 {
+			return p.ISR, nil
+		}
+	}
+	return nil, fmt.Errorf("broker %d knows no partition 0 of %s", leader, topic)
 }
 
 // followersOf asks which broker leads partition 0 of the topic, and which

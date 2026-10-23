@@ -555,6 +555,15 @@ and the values behind it wait in the queue. It hears of the new leader only at i
 refresh, which comes at a random moment within 6 seconds of the last one; a failed write doesn't
 bring it forward.
 
+**kafka-go's freezes and cuts.** The kafka-go driver also runs sarama's `followers-pause`,
+`follower-pause` and `follower-cut`, with the fault started live like its kill. With `-acks all`,
+kafka-go asks the leader to wait at most 5 seconds, half its 10-second write timeout, for every
+in-sync copy. While a frozen or cut follower still counts as in sync, the leader answers
+REQUEST_TIMED_OUT, and kafka-go sends the same batch again. Given no producer ID, the leader can't
+tell it from a new batch and stores it again, which Kafka's docs say a producer without idempotence
+may do when it retries. So each attempt should leave one more copy of the batch, a `duplicate` for
+every value in it. With `-acks none`, nothing waits and nothing is sent twice.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
