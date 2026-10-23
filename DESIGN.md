@@ -750,6 +750,61 @@ the fault:
   was no leader: 780 to 1,505 of 3,000 in `leader-kill`, and 6,758 to 11,205 of 20,000 in
   `leader-kill-live`. They are `info`, unknown, and in the runs checked none of them landed.
 
+## kafka-go results
+
+kafka-go's table ran on v0.4.51 against apache/kafka 4.3.1, each fault on a one-partition topic with
+a solo helper reading, once with acknowledgements from every in-sync copy (`-acks all`), its
+strongest setting, and once with its own default, no acknowledgement at all (`-acks none`). The runs
+took place on 2026-10-23, at driver commits `a782401` (`leader-kill-live`) and `e4a9566` (the
+freezes and the cut). A wait is the longest from handing a value over to its acknowledgement, for
+the writer, or to its delivery, for the reader:
+
+| Scenario | Every in-sync copy (`all`) | kafka-go's default (`none`) |
+|---|---|---|
+| `leader-kill-live` | clean ×3; the writer waited 9.4 to 14.9 s | clean ×3, since nothing was acknowledged; **200, 700 and 700 values reported sent were never stored** |
+| `followers-pause` | **failed ×3**: one batch of 98 or 99 values stored 5 times; the writer waited 25.3 s | clean ×3; the writer never waited, the reader waited 25.3 s |
+| `follower-pause` | **failed ×3**: one batch stored twice; the writer waited 9.0 to 9.7 s | clean ×3; the writer never waited, the reader waited 8.3 to 12.9 s |
+| `follower-cut` | **failed ×3**: one batch stored 8 times; the writer waited 41.4 to 44.4 s | clean ×3; the writer never waited, the reader waited 37.6 to 43.7 s |
+
+- **The settings check passed.** `leader-kill-live` also ran five times with the leader's
+  acknowledgement alone (`-acks one`). One run lost acknowledged values, all 500 written so far: the
+  follower that took over had copied nothing, about 0.6 seconds after the topic was created, as in
+  three of sarama's five losses. One of the `all` runs met the same empty follower and lost nothing
+  acknowledged: the leader can't acknowledge what only it holds, so it acknowledged nothing before
+  the kill, and the writer waited 9.4 seconds for the new leader, which stored everything but the
+  one batch that failed with an error. Same cluster state, opposite outcomes, as Kafka documents. In
+  the run that lost them, the follower's broker log shows it had set up copying within 7
+  milliseconds of the topic's creation, but never fetched the partition before the leader died; why
+  isn't known. The other four runs lost nothing, and no run lost a batch acknowledged in the
+  leader's last milliseconds, as sarama did twice, most likely because kafka-go sends one batch of
+  about 100 values every 100 milliseconds here, so the leader rarely holds an acknowledged batch no
+  follower has yet.
+- **The strongest setting stores a batch again whenever a follower holds up the copy.** kafka-go has
+  no idempotent producer. With `all` it asks the leader to wait at most 5 seconds, half its
+  10-second write timeout, for every in-sync copy, and while a frozen or cut follower still counted
+  as in sync, the leader answered REQUEST_TIMED_OUT and kafka-go sent the same batch again, which
+  the leader, given no producer ID, stored again. Each run stored exactly one batch more than once,
+  the first one sent after the fault began, once per attempt: 5 times through a 25-second freeze of
+  both followers, twice before a frozen follower was fenced after 9.1 to 9.6 seconds, and 8 times, 8
+  of kafka-go's 10 attempts, before a cut one was dropped after 41.1 to 44.5 seconds. The values
+  behind it waited in kafka-go's queue and were stored once. Kafka's docs say a producer without
+  idempotence may write duplicates when it retries; sarama's idempotent settings came through the
+  same rows clean.
+- **The default loses writes it reports as sent.** With `none`, the default of every `Writer` in
+  kafka-go's README, kafka-go counts a batch as sent once it is written to the connection. In each
+  leader crash two batches, 200 values, were reported sent and never stored, and in the two runs
+  where the follower that took over had copied nothing, values 1 to 500 as well. The checker can't
+  call them lost, since nothing promised them; the count comes from comparing what was handed over
+  with the final read. Kafka's docs say a producer with `acks=0` won't generally know of any
+  failures. Kafka's own Java producer has waited for every in-sync copy, with idempotence, by
+  default since Kafka 3.0 (KIP-679).
+- **Failed sends are few, and every one was reported.** In the crashes kafka-go gave up on 100 to
+  200 sends whatever the setting, against sarama's 6,758 to 11,205: it retries only the batch at the
+  head of the partition's queue, 10 times over about 7 seconds, while the values behind it wait.
+  Each failed with "connection refused" from the dead leader's address, and none was stored.
+- **The settings decide who waits, as with sarama.** With `all` the writer waited out each fault;
+  with `none` it never waited, and the reader waited about as long instead.
+
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -1026,8 +1081,9 @@ driftlab/
   commits on either side of sarama PR 3762 (see sarama calibration results), and the freeze runs
   of its table gave a fourth upstream report, sarama issue 3843 (see the metadata stall). sarama's
   table was done on 2026-10-21, with the idempotent settings and with its defaults (see sarama
-  results). kafka-go and confluent-kafka-go come next, and the version ends with the published
-  table.
+  results), and kafka-go's on 2026-10-23, with acknowledgements from every in-sync copy and with its
+  default of none, after a settings check in place of a calibration (see kafka-go results).
+  confluent-kafka-go comes next, and the version ends with the published table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 

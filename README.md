@@ -61,6 +61,25 @@ Against sarama, another Go client for Kafka, at v1.61.1:
   idempotent settings, three crashes lost nothing. That is documented behavior, not a bug, and
   Kafka's own console consumer agrees with driftlab's count.
 
+Against kafka-go, segmentio's Go client for Kafka, at v0.4.51:
+
+- **With its default settings, a leader crash loses messages kafka-go reported as sent, with no
+  error.** By default kafka-go's `Writer` asks for no acknowledgement at all, as every `Writer` in
+  its README does, so it counts a batch as sent once it is written to the connection. In three
+  leader crashes during steady writing, 200, 700 and 700 values were reported sent and never
+  stored; in the two 700 runs, the follower that took over hadn't copied anything yet. Kafka
+  documents this for `acks=0`: the producer won't generally know of any failures.
+- **With its strongest settings, a follower that holds up the copy makes it store a batch again and
+  again.** kafka-go has no idempotent producer. Waiting for every in-sync copy, it gives the leader
+  5 seconds, then sends the batch again, and the leader stores it again: one batch was stored 5
+  times while both followers were frozen for 25 seconds, twice before a frozen follower was
+  dropped, and 8 times before a cut-off one was. Nothing acknowledged was lost. Kafka documents
+  duplicates on retry for a producer without idempotence, and sarama's idempotent settings came
+  through the same faults clean.
+
+Both are documented behavior, not bugs. Kafka's own Java producer has waited for every in-sync
+copy, with idempotence, by default since Kafka 3.0.
+
 Against kaf-relay, a program that keeps Kafka clusters in sync by copying topics, at v2.1.0
 (`2dcedd3`):
 
@@ -80,7 +99,9 @@ calibrated the same way, on https://github.com/twmb/franz-go/issues/1217: franz-
 and v1.20.7 passes, and all 12 calibration runs came out as expected. sarama was calibrated on the
 commits on either side of https://github.com/IBM/sarama/pull/3762: sending one message per request,
 the commit before the fix lost two acknowledged messages in every run, and the one after it never
-did. All 36 runs came out as expected.
+did. All 36 runs came out as expected. kafka-go has no idempotent producer to calibrate on, so it
+was checked on what Kafka documents instead: waiting for the leader alone, a leader crash lost
+acknowledged messages in one run of five, and waiting for every in-sync copy, in none of three.
 
 A fourth calibration, on 2026-10-22, against a regression that never shipped. The first commit on
 https://github.com/nats-io/nats.go/pull/2201 recreates the push ordered consumer on reconnect and
@@ -168,8 +189,9 @@ go test -C drivers/sarama -run TestRetryWaitsForSilentBroker -count=1 -v ./repro
 
 - [DESIGN.md](https://github.com/omkar619-dev/driftlab/blob/main/DESIGN.md): the principles, the
   history format, the checker's rules, every scenario and every result.
-- v1, the Go Kafka clients, is under way: franz-go and sarama are calibrated, sarama's fault table
-  is done, with its idempotent settings and with its defaults, and a relay driver tests programs
-  that copy topics between clusters. kafka-go and confluent-kafka-go come next.
+- v1, the Go Kafka clients, is under way: franz-go and sarama are calibrated and kafka-go is
+  checked, sarama's and kafka-go's fault tables are done, each with its strongest settings and with
+  its defaults, and a relay driver tests programs that copy topics between clusters.
+  confluent-kafka-go comes next.
 
 Apache-2.0.
