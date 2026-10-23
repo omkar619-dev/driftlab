@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -135,9 +136,9 @@ func run(c config, out io.Writer) error {
 		w.publish(v)
 		time.Sleep(c.interval)
 	}
-	last := w.close()
+	w.close()
 	if h != nil {
-		h.waitFor(last, c.grace)
+		h.waitForEnd(ctx, adm, topic, partitions, c.grace)
 		h.stop()
 	}
 	return finalRead(ctx, adm, seeds, rec, topic, partitions)
@@ -171,15 +172,12 @@ type writer struct {
 	w    *kafka.Writer
 	rec  *recorder
 	acks kafka.RequiredAcks
-
-	mu   sync.Mutex
-	last map[int32]int64 // partition -> the highest offset acknowledged so far
 }
 
 // startWriter makes the writer. kafka-go's Writer connects on its first
 // message.
 func startWriter(seeds []string, rec *recorder, topic string, acks kafka.RequiredAcks) *writer {
-	wr := &writer{rec: rec, acks: acks, last: map[int32]int64{}}
+	wr := &writer{rec: rec, acks: acks}
 	wr.w = &kafka.Writer{
 		Addr:         kafka.TCP(seeds...),
 		Topic:        topic,
@@ -221,25 +219,16 @@ func (wr *writer) completed(msgs []kafka.Message, err error) {
 		default:
 			p, o := int32(m.Partition), m.Offset
 			wr.rec.op(op{Process: "producer", Type: "ok", F: "publish", Value: v, Partition: &p, Offset: &o})
-			wr.mu.Lock()
-			if got, ok := wr.last[p]; !ok || o > got {
-				wr.last[p] = o
-			}
-			wr.mu.Unlock()
 		}
 	}
 }
 
 // close flushes what the writer still holds and waits for its last
-// Completion calls, which Close blocks on. It returns the highest offset
-// acknowledged in each partition.
-func (wr *writer) close() map[int32]int64 {
+// Completion calls, which Close blocks on.
+func (wr *writer) close() {
 	if err := wr.w.Close(); err != nil {
 		wr.rec.op(op{Process: "producer", Type: "info", F: "client-error", Error: err.Error()})
 	}
-	wr.mu.Lock()
-	defer wr.mu.Unlock()
-	return wr.last
 }
 
 // byValue is a kafka-go Balancer that sends value v to partition (v-1) mod
@@ -315,23 +304,43 @@ func (h *helper) deliver(rec *recorder, r *kafka.Reader) {
 	}
 }
 
-// waitFor waits until the helper has delivered, in every partition, the last
-// offset the writer saw acknowledged, or until grace runs out. It only
-// decides when the final read starts; whether the helper got there is the
-// checker's call. With acks none nothing was acknowledged, so it returns at
-// once.
-func (h *helper) waitFor(last map[int32]int64, grace time.Duration) {
-	deadline := time.Now().Add(grace)
-	for !h.reachedAll(last) && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+// waitForEnd waits until the helper has delivered every partition up to
+// where the witness says it ends, or until grace runs out. It waits on the
+// log, not on acknowledgements: the checker holds the helper to everything
+// the final read finds, acknowledged or not, and with acks none nothing is
+// acknowledged. It asks again once the helper is there, and returns only
+// when the ends haven't moved: with acks one or none, Close can return
+// before every copy has the last batch, and until they do, the end a
+// consumer sees falls short of it. It only decides when the final read
+// starts; whether the helper got there is the checker's call.
+func (h *helper) waitForEnd(ctx context.Context, cl *kgo.Client, topic string, partitions int32, grace time.Duration) {
+	ctx, cancel := context.WithTimeout(ctx, grace)
+	defer cancel()
+	var prev map[int32]int64 // the ends the helper was last found to have reached
+	for {
+		ends, err := endOffsets(ctx, cl, topic, partitions)
+		if err == nil && h.reachedEnds(ends) {
+			if maps.Equal(ends, prev) {
+				return
+			}
+			prev = ends
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 
-func (h *helper) reachedAll(last map[int32]int64) bool {
+// reachedEnds says whether the helper has delivered the last offset of every
+// partition, the one before its end. An empty partition has nothing to
+// deliver.
+func (h *helper) reachedEnds(ends map[int32]int64) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for p, o := range last {
-		if got, ok := h.reached[p]; !ok || got < o {
+	for p, end := range ends {
+		if got, ok := h.reached[p]; end > 0 && (!ok || got < end-1) {
 			return false
 		}
 	}

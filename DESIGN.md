@@ -540,11 +540,15 @@ offset of every message in it. Each message carries its value in `WriterData`, a
 balancer sends value v to partition (v-1) mod the partition count. Otherwise the writer keeps
 kafka-go's defaults: one batch at a time per partition, sent at 100 messages or after a second,
 with up to 10 attempts. The helper is a kafka-go `Reader` per partition, with the partition set and
-no group. kafka-go can't be calibrated the way franz-go and sarama were, on a fixed bug in an
-idempotent producer, because it has none, and its fixed bugs that lose data are in consumer
-groups, which v1 doesn't use, or in reading past compacted records, which v1 doesn't write.
-Instead it is checked on what Kafka documents: once the driver has `leader-kill-live`, `-acks one`
-must lose acknowledged messages and `-acks all` must not.
+no group. Before the final read, the driver waits for the helper to reach the end of every
+partition, as the witness sees it. Its first version waited for the last acknowledged offset
+instead, so with none it didn't wait at all, and the checker reported a stall in all three
+partitions: the helper had read one message of the 100 when the final read began. kafka-go can't be
+calibrated the way franz-go and sarama were, on a fixed bug in an idempotent producer, because it
+has none, and its fixed bugs that lose data are in consumer groups, which v1 doesn't use, or in
+reading past compacted records, which v1 doesn't write. Instead it is checked on what Kafka
+documents: once the driver has `leader-kill-live`, `-acks one` must lose acknowledged messages and
+`-acks all` must not.
 
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
