@@ -547,8 +547,13 @@ partitions: the helper had read one message of the 100 when the final read began
 calibrated the way franz-go and sarama were, on a fixed bug in an idempotent producer, because it
 has none, and its fixed bugs that lose data are in consumer groups, which v1 doesn't use, or in
 reading past compacted records, which v1 doesn't write. Instead it is checked on what Kafka
-documents: once the driver has `leader-kill-live`, `-acks one` must lose acknowledged messages and
-`-acks all` must not.
+documents, with the driver's own `leader-kill-live`, which works as drivers/sarama's does, with the
+kill always started live: `-acks one` must lose acknowledged messages and `-acks all` must not.
+While the partition has no leader, kafka-go retries the batch at the head of the partition's queue
+when the error looks temporary, up to 10 times and at most a second apart, about 7 seconds in all,
+and the values behind it wait in the queue. It hears of the new leader only at its next metadata
+refresh, which comes at a random moment within 6 seconds of the last one; a failed write doesn't
+bring it forward.
 
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is

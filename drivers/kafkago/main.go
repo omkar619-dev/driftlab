@@ -4,12 +4,14 @@
 //
 // kafka-go does the writing and, in the scenarios with a helper, the reading
 // while the topic is written. Everything else goes through franz-go v1.20.7,
-// pinned in go.mod: creating the topic, finding where each partition ends,
-// and the final read, so the witness is never the thing being tested.
-// franz-go's admin requests go through kmsg, as in drivers/franzgo.
+// pinned in go.mod: creating the topic, finding the leader to kill, finding
+// where each partition ends, and the final read, so the witness is never the
+// thing being tested. franz-go's admin requests go through kmsg, as in
+// drivers/franzgo.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,7 +20,9 @@ import (
 	"io"
 	"maps"
 	"os"
+	"os/exec"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,18 +40,46 @@ const replicas = 3
 
 // scenario describes one experiment. With consumer set, a solo helper reads
 // the topic through kafka-go while it is being written. A non-zero partitions
-// or n overrides the -partitions or -n flag.
+// or n overrides the -partitions or -n flag, and a non-zero interval replaces
+// the pause after each value, 10 milliseconds otherwise. A fault, if set,
+// starts just before value faultAt is handed over and lasts hold: "kill"
+// kills the broker that leads partition 0 and then starts it again. A fault
+// always starts live, on a goroutine of its own, so the writer goes on while
+// docker acts on the broker: drivers/sarama found that pausing the writer for
+// docker gives the followers time to copy everything acknowledged, which
+// hides the loss acks one allows.
 type scenario struct {
 	consumer   bool
 	partitions int
 	n          uint64
+	interval   time.Duration
+	fault      string
+	faultAt    uint64
+	hold       time.Duration
 }
 
 // publish-only writes the topic and reads it back with the witness alone;
 // control adds the helper.
+//
+// leader-kill-live is drivers/sarama's scenario of that name: a value every
+// millisecond, 20,000 of them, to a topic with one partition, which the
+// helper reads the whole time. Just before value 501, docker kills the broker
+// that leads the partition, the way a crash would, and starts it again 20
+// seconds later. The controller only notices after the brokers' 9-second
+// session timeout, and then picks a new leader from the in-sync set. Until
+// kafka-go hears of it, it retries the batch at the head of the partition's
+// queue when the error looks temporary, up to 10 times and at most a second
+// apart, about 7 seconds in all, while the values behind it wait in the
+// queue. It refreshes its map of the cluster at a random moment within 6
+// seconds of the last refresh, and a failed write doesn't bring that forward.
+// Kafka's docs say that with acks one, a write the leader acknowledged before
+// a follower copied it is lost when the leader fails, so with -acks one the
+// run must lose acknowledged values, and with -acks all, which waits for
+// every in-sync copy, it must not.
 var scenarios = map[string]scenario{
-	"publish-only": {},
-	"control":      {consumer: true},
+	"publish-only":     {},
+	"control":          {consumer: true},
+	"leader-kill-live": {consumer: true, partitions: 1, n: 20000, interval: time.Millisecond, fault: "kill", faultAt: 501, hold: 20 * time.Second},
 }
 
 type config struct {
@@ -65,11 +97,11 @@ func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only or control")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control or leader-kill-live")
 	flag.StringVar(&c.acks, "acks", "all", "which copies acknowledge a write: all, every in-sync copy (the driver's default); one, the leader alone; or none, nothing at all (kafka-go's own default)")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish, unless the scenario sets it")
 	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic, unless the scenario sets it")
-	flag.DurationVar(&c.interval, "interval", 10*time.Millisecond, "the pause after handing each value to the writer")
+	flag.DurationVar(&c.interval, "interval", 0, "the pause after handing each value to the writer; 0 keeps the scenario's own, or 10ms")
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the helper gets to catch up before the final read")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
@@ -93,6 +125,12 @@ func run(c config, out io.Writer) error {
 	if sc.n == 0 {
 		sc.n = c.n
 	}
+	if c.interval == 0 {
+		c.interval = sc.interval
+	}
+	if c.interval == 0 {
+		c.interval = 10 * time.Millisecond
+	}
 	if sc.n < 1 {
 		return errors.New("-n must be at least 1")
 	}
@@ -104,8 +142,8 @@ func run(c config, out io.Writer) error {
 	ctx := context.Background()
 
 	// The witness's client, franz-go and never kafka-go. It creates the topic,
-	// waits for its leaders, finds where each partition ends, and does the
-	// final read.
+	// waits for its leaders, finds the leader to kill and where each
+	// partition ends, and does the final read.
 	seeds := strings.Split(c.brokers, ",")
 	adm, err := kgo.NewClient(kgo.SeedBrokers(seeds...))
 	if err != nil {
@@ -116,6 +154,9 @@ func run(c config, out io.Writer) error {
 	topic := fmt.Sprintf("driftlab-kafkago-%s-%d", c.scenario, time.Now().UnixMilli())
 	setup, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	// A broker that an earlier run killed needs a few seconds after its
+	// restart to register again, and the topic can't get its copies without
+	// it.
 	if err := waitForBrokers(setup, adm, replicas); err != nil {
 		return err
 	}
@@ -132,11 +173,25 @@ func run(c config, out io.Writer) error {
 		h = startHelper(seeds, rec, topic, partitions)
 	}
 	w := startWriter(seeds, rec, topic, acks)
+	var ft *activeFault
 	for v := uint64(1); v <= sc.n; v++ {
+		// The kill starts before this value is handed over and ends on its
+		// own timer, because the stream goes on meanwhile.
+		if sc.fault == "kill" && v == sc.faultAt {
+			ft = startLive(func() (*activeFault, error) {
+				return startKill(ctx, adm, rec, topic, sc.hold)
+			})
+		}
 		w.publish(v)
 		time.Sleep(c.interval)
 	}
 	w.close()
+	if ft != nil {
+		<-ft.over
+		if ft.err != nil {
+			return ft.err
+		}
+	}
 	if h != nil {
 		h.waitForEnd(ctx, adm, topic, partitions, c.grace)
 		h.stop()
@@ -357,6 +412,187 @@ func (h *helper) stop() {
 	h.wg.Wait()
 }
 
+// activeFault is a fault in place. over closes once it has ended, with err
+// set if something went wrong.
+type activeFault struct {
+	over chan struct{}
+	err  error
+}
+
+// startLive runs start on a goroutine of its own and returns at once, so the
+// writer goes on while docker acts on the broker. The fault it returns ends
+// when the started one does, and carries any error from starting it, which
+// the run then reports once the writer is done.
+func startLive(start func() (*activeFault, error)) *activeFault {
+	ft := &activeFault{over: make(chan struct{})}
+	go func() {
+		defer close(ft.over)
+		started, err := start()
+		if err != nil {
+			ft.err = err
+			return
+		}
+		<-started.over
+		ft.err = started.err
+	}()
+	return ft
+}
+
+// startKill kills the broker that leads partition 0 with docker kill, the
+// way a crash would, and starts it again after hold, on a goroutine of its
+// own, because the stream goes on meanwhile. The kill only counts if docker
+// shows the broker stopped and the cluster then gives partition 0 a new
+// leader. Its ok comes when that leader shows up, the moment the partition
+// can be used again, so a helper's recovery is measured from there, and it
+// records how long the election took. The broker comes back as a follower,
+// and the fault only ends once it is back in the in-sync set, so the next
+// run starts with every broker; an info line says how long that took.
+// Containers are named after the brokers' node IDs, as deploy/kafka.yaml
+// names them.
+func startKill(ctx context.Context, cl *kgo.Client, rec *recorder, topic string, hold time.Duration) (*activeFault, error) {
+	leader, _, err := followersOf(ctx, cl, topic)
+	if err != nil {
+		return nil, err
+	}
+	name := fmt.Sprintf("kafka-%d", leader)
+	rec.op(op{Process: "nemesis", Type: "invoke", F: "kill", Detail: map[string]any{"leader": leader, "killed": name}})
+	killed := time.Now()
+	if _, err := dockerIn("", "kill", name); err != nil {
+		dockerIn("", "start", name) // never leave it down
+		return nil, err
+	}
+	running, checkErr := dockerIn("", "inspect", "-f", "{{.State.Running}}", name)
+	ft := &activeFault{over: make(chan struct{})}
+	go func() {
+		defer close(ft.over)
+		next, after, found := waitForNewLeader(ctx, cl, topic, leader, killed, killed.Add(hold))
+		if checkErr == nil && running == "false" && found {
+			rec.op(op{Process: "nemesis", Type: "ok", F: "kill", Detail: map[string]any{"new_leader": next, "after": after.Round(time.Millisecond).String()}})
+		}
+		// Start it again whatever the checks said, so a run never leaves a
+		// broker down.
+		time.Sleep(time.Until(killed.Add(hold)))
+		if _, err := dockerIn("", "start", name); err != nil {
+			ft.err = err
+			return
+		}
+		if checkErr != nil {
+			ft.err = checkErr
+			return
+		}
+		back := waitForISR(ctx, cl, topic, leader, time.Minute)
+		rec.op(op{Process: "nemesis", Type: "info", F: "restart", Detail: map[string]any{"restarted": name, "back_in_sync_after": back}})
+	}()
+	return ft, nil
+}
+
+// waitForNewLeader asks every 250 milliseconds which broker leads partition
+// 0, until one other than old does or deadline passes. It returns that
+// leader and how long after killed it showed up.
+func waitForNewLeader(ctx context.Context, cl *kgo.Client, topic string, old int32, killed, deadline time.Time) (int32, time.Duration, bool) {
+	for time.Now().Before(deadline) {
+		if leader, err := leaderOf(ctx, cl, topic); err == nil && leader >= 0 && leader != old {
+			return leader, time.Since(killed), true
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return -1, 0, false
+}
+
+// waitForISR asks every 250 milliseconds for partition 0's in-sync set,
+// until it includes broker id or limit passes, and says how long that took.
+func waitForISR(ctx context.Context, cl *kgo.Client, topic string, id int32, limit time.Duration) string {
+	start := time.Now()
+	for time.Since(start) < limit {
+		if isr, err := isrOf(ctx, cl, topic); err == nil && slices.Contains(isr, id) {
+			return time.Since(start).Round(time.Millisecond).String()
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return "not within " + limit.String()
+}
+
+// leaderOf asks which broker leads partition 0, and gives the request two
+// seconds, so a broker that doesn't answer can't hold up the next try.
+func leaderOf(ctx context.Context, cl *kgo.Client, topic string) (int32, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	leader, _, err := followersOf(ctx, cl, topic)
+	return leader, err
+}
+
+// isrOf asks for partition 0's in-sync set, and gives the request two
+// seconds.
+func isrOf(ctx context.Context, cl *kgo.Client, topic string) ([]int32, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req := kmsg.NewPtrMetadataRequest()
+	t := kmsg.NewMetadataRequestTopic()
+	t.Topic = kmsg.StringPtr(topic)
+	req.Topics = append(req.Topics, t)
+	resp, err := req.RequestWith(ctx, cl)
+	if err != nil {
+		return nil, err
+	}
+	for _, rt := range resp.Topics {
+		for _, p := range rt.Partitions {
+			if p.Partition == 0 {
+				return p.ISR, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("no partition 0 of %s", topic)
+}
+
+// followersOf asks which broker leads partition 0 of the topic, and which
+// brokers hold its other copies.
+func followersOf(ctx context.Context, cl *kgo.Client, topic string) (int32, []int32, error) {
+	req := kmsg.NewPtrMetadataRequest()
+	t := kmsg.NewMetadataRequestTopic()
+	t.Topic = kmsg.StringPtr(topic)
+	req.Topics = append(req.Topics, t)
+	resp, err := req.RequestWith(ctx, cl)
+	if err != nil {
+		return 0, nil, fmt.Errorf("finding the followers of %s: %w", topic, err)
+	}
+	if len(resp.Topics) != 1 {
+		return 0, nil, fmt.Errorf("finding the followers of %s: got %d topics back", topic, len(resp.Topics))
+	}
+	if err := kerr.ErrorForCode(resp.Topics[0].ErrorCode); err != nil {
+		return 0, nil, fmt.Errorf("finding the followers of %s: %w", topic, err)
+	}
+	for _, p := range resp.Topics[0].Partitions {
+		if p.Partition != 0 {
+			continue
+		}
+		var followers []int32
+		for _, id := range p.Replicas {
+			if id != p.Leader {
+				followers = append(followers, id)
+			}
+		}
+		return p.Leader, followers, nil
+	}
+	return 0, nil, fmt.Errorf("topic %s has no partition 0", topic)
+}
+
+// dockerIn runs one docker command with stdin, if not empty, as its input,
+// and returns what it printed. It gives up after 30 seconds, so a docker
+// daemon that hangs can't hang the run.
+func dockerIn(stdin string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, bytes.TrimSpace(out))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // waitForBrokers waits until the cluster lists at least want brokers as
 // alive. The metadata request asks about no topics, only brokers, and a
 // broker that is down or fenced isn't listed.
@@ -538,14 +774,15 @@ type op struct {
 }
 
 type metaLine struct {
-	Type     string `json:"type"`
-	Driver   string `json:"driver"`
-	Client   string `json:"client"`
-	API      string `json:"api,omitempty"`
-	Server   string `json:"server"`
-	Scenario string `json:"scenario"`
-	Params   params `json:"params"`
-	Driftlab string `json:"driftlab"`
+	Type     string   `json:"type"`
+	Driver   string   `json:"driver"`
+	Client   string   `json:"client"`
+	API      string   `json:"api,omitempty"`
+	Server   string   `json:"server"`
+	Scenario string   `json:"scenario"`
+	Faults   []string `json:"faults,omitempty"`
+	Params   params   `json:"params"`
+	Driftlab string   `json:"driftlab"`
 }
 
 type params struct {
@@ -556,6 +793,8 @@ type params struct {
 	Settings   string `json:"settings"`
 	Acks       int16  `json:"acks"`
 	Async      bool   `json:"async"`
+	Hold       string `json:"hold,omitempty"`
+	Live       bool   `json:"live,omitempty"`
 	Witness    string `json:"witness"`
 }
 
@@ -564,7 +803,10 @@ type params struct {
 // for, with "defaults" for kafka-go's own default of none, that it writes
 // asynchronously, which it always does here, and the franz-go the witness
 // used. A run with a helper also says how it consumes: "direct" means
-// partitions assigned by the driver, with no group.
+// partitions assigned by the driver, with no group. A kill run declares the
+// kill, which completes once the partition has a new leader, and says the
+// fault started live, as every fault does here. If a declared fault leaves
+// no evidence, the checker calls the run invalid instead of clean.
 func newMeta(c config, sc scenario, topic string, acks kafka.RequiredAcks) metaLine {
 	client, witness, rev := provenance()
 	settings := "acks-" + c.acks
@@ -591,6 +833,11 @@ func newMeta(c config, sc scenario, topic string, acks kafka.RequiredAcks) metaL
 	}
 	if sc.consumer {
 		m.API = "direct"
+	}
+	if sc.fault != "" {
+		m.Faults = []string{sc.fault}
+		m.Params.Hold = sc.hold.String()
+		m.Params.Live = true
 	}
 	return m
 }
