@@ -564,6 +564,26 @@ tell it from a new batch and stores it again, which Kafka's docs say a producer 
 may do when it retries. So each attempt should leave one more copy of the batch, a `duplicate` for
 every value in it. With `-acks none`, nothing waits and nothing is sent twice.
 
+**confluent-kafka-go.** `drivers/confluent` tests Confluent's Go client the same way, with franz-go
+again as the witness. confluent-kafka-go wraps librdkafka, Kafka's client library in C, and links in
+a copy built for the platform, so the driver is built with cgo and needs a C compiler. Each
+confluent-kafka-go release carries the librdkafka release of the same number, and the meta line
+records the librdkafka that ran. `-settings` picks the producer's settings. `idempotent`, the
+driver's default, turns on librdkafka's idempotent producer, whose docs promise that "the producer
+will ensure that messages are successfully produced exactly once and in the original produce order".
+`defaults` keeps librdkafka's own settings, which already wait for every in-sync copy but aren't
+idempotent: a failed message is retried for up to 5 minutes, with up to a million requests in
+flight, and librdkafka's docs say retrying may then reorder messages. `acks-one` asks for the
+leader's acknowledgement alone, without idempotence, for the settings check. Each message carries
+its value in `Opaque`, and its delivery report, on the producer's events channel, gives its position
+or its error. The helper is a confluent-kafka-go consumer assigned every partition from the first
+offset; confluent-kafka-go won't make a consumer without a group id, but an assigned consumer never
+joins the group, and it commits nothing. confluent-kafka-go is checked the way kafka-go is, on what
+Kafka documents. The last fix for lost data in librdkafka's idempotent producer, in librdkafka 1.9.0
+in 2022, needs a restarting broker to report an existing topic as missing; whether Kafka 4.3.1's
+brokers ever do that is still to be tried. The fixes since, in 2.3.0 and 2.5.0, turned fatal errors
+into retries, with nothing lost or written twice.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
@@ -998,6 +1018,8 @@ driftlab/
 │   │   ├── go.mod
 │   │   ├── v1.53.1.mod
 │   │   └── repro2180/
+│   ├── confluent/
+│   │   └── go.mod
 │   ├── franzgo/
 │   │   ├── go.mod
 │   │   ├── v1.20.6.mod
@@ -1035,6 +1057,8 @@ driftlab/
 | `drivers/natsgo/go.mod` | pins nats.go v1.54.0 (the fixed release) |
 | `drivers/natsgo/v1.53.1.mod` | pins nats.go v1.53.1 (the last buggy release), used via `-modfile` |
 | `drivers/natsgo/repro2180/` | a standalone reproducer for nats.go issue 2180, which needs only nats-server |
+| `drivers/confluent/` | a separate module that writes through confluent-kafka-go's producer, idempotent unless `-settings` says otherwise, and, with a helper, reads through its consumer, with franz-go v1.20.7 as the witness; built with cgo |
+| `drivers/confluent/go.mod` | pins confluent-kafka-go v2.16.0, which carries librdkafka 2.16.0, and franz-go v1.20.7 |
 | `drivers/franzgo/` | a separate module that talks to Kafka through franz-go and writes a history to stdout |
 | `drivers/franzgo/go.mod` | pins franz-go v1.20.7 (the release that fixed issue 1217) |
 | `drivers/franzgo/v1.20.6.mod` | pins franz-go v1.20.6 (the last release before the fix), used via `-modfile` |
