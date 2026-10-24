@@ -584,6 +584,19 @@ in 2022, needs a restarting broker to report an existing topic as missing; wheth
 brokers ever do that is still to be tried. The fixes since, in 2.3.0 and 2.5.0, turned fatal errors
 into retries, with nothing lost or written twice.
 
+**confluent-kafka-go's faults.** The confluent-kafka-go driver runs the same four fault rows as
+kafka-go's, `leader-kill-live`, `followers-pause`, `follower-pause` and `follower-cut`, each started
+live. librdkafka asks the leader to wait up to 30 seconds for every in-sync copy, longer than either
+freeze holds anything up, but not always as long as the cut, which only ends when the leader drops
+the follower, 30 to 45 seconds in. A request still waiting after 30 seconds is answered
+REQUEST_TIMED_OUT, and librdkafka sends its batch again. Without idempotence the leader stores the
+resent batch again, after messages sent since, so with `defaults` every request that timed out
+before the follower was dropped should leave a `duplicate`, and a `nonmonotonic-send` where its
+acknowledgement lands after later messages'. The idempotent producer numbers its batches, so the
+leader should keep one copy of each. In `leader-kill-live`, librdkafka should find the new leader
+within about a second of the election, since it asks again every 100 milliseconds or more, and since
+it keeps retrying a message for up to 5 minutes, it should give up on none.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
