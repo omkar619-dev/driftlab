@@ -842,6 +842,66 @@ the writer, or to its delivery, for the reader:
 - **The settings decide who waits, as with sarama.** With `all` the writer waited out each fault;
   with `none` it never waited, and the reader waited about as long instead.
 
+## confluent-kafka-go results
+
+confluent-kafka-go's table ran on v2.16.0, with librdkafka 2.16.0, against apache/kafka 4.3.1, each
+fault on a one-partition topic with a solo helper reading, once with librdkafka's idempotent
+producer (`-settings idempotent`) and once with librdkafka's own defaults (`-settings defaults`),
+which wait for every in-sync copy but aren't idempotent. The runs took place on 2026-10-24, at
+driver commit `d49d476`, and `388d245` for the idempotent `follower-cut`, whose first runs the
+checker couldn't read (see below). A wait is the longest from handing a value over to its
+acknowledgement:
+
+| Scenario | Idempotent | librdkafka's defaults |
+|---|---|---|
+| `leader-kill-live` | clean ×3; the writer waited 9.6 to 15.3 s | clean ×2, **failed ×1**: a batch of 5 values stored twice; the writer waited 9.0 to 11.0 s |
+| `followers-pause` | clean ×3; the writer waited 25.2 s | clean ×3; the writer waited 25.2 s |
+| `follower-pause` | clean ×3; the writer waited 8.5 to 9.2 s | clean ×3; the writer waited 8.2 to 14.6 s |
+| `follower-cut` | clean ×3, with one message a run acknowledged without an offset and stored once; the writer waited 32.3 to 41.8 s | **failed ×3**: one value stored twice and one `nonmonotonic-send` each; the writer waited 33.8 to 45.0 s |
+
+- **The settings check passed.** `leader-kill-live` also ran five times with the leader's
+  acknowledgement alone (`-settings acks-one`). Three runs lost acknowledged values: 5 in one, the
+  leader's last few milliseconds of batches, which librdkafka sends every 5 milliseconds, and 531
+  and 527 in two where the follower that took over had copied nothing, as in sarama's and kafka-go's
+  runs. The idempotent producer and librdkafka's defaults, which both wait for every in-sync copy,
+  lost none, though four of their six runs met the same empty follower: nothing was acknowledged
+  until a copy existed.
+- **The idempotent producer kept its promise in every row.** Every message was stored exactly once
+  and in order. Its 30-second wait for the copies outlasts both freezes, and in the cut the one
+  request held past it was stored once: librdkafka counted it as stored when the request behind it
+  was acknowledged (see below).
+- **librdkafka's defaults store a resent batch twice.** Without idempotence, the request the broker
+  held past the 30 seconds in `follower-cut` was answered REQUEST_TIMED_OUT and sent again, and the
+  leader stored it again, after messages sent since: one value twice and one `nonmonotonic-send` in
+  every run. Only one, because a broker reads one request at a time from a connection
+  (`SocketServer.scala` mutes the connection until it has replied), so the requests behind it waited
+  unread and never timed out. In one crash, a batch of 5 the old leader had copied but not
+  acknowledged was sent to the new leader and stored twice. librdkafka's docs say retrying may
+  reorder messages unless idempotence is on, and Kafka's say a producer without it may write
+  duplicates when it retries. kafka-go, which waits 5 seconds, stored a batch 5 and 2 times in the
+  freezes and 8 times in the cut.
+- **No send failed.** librdkafka keeps retrying a message for up to 5 minutes, so every value in
+  every run was acknowledged in the end, against sarama's 6,758 to 11,205 failed sends in
+  `leader-kill-live` and kafka-go's 100 to 200.
+- **A message can be acknowledged without an offset.** In the idempotent `follower-cut` runs, the
+  request holding the first message after the cut took hold timed out after 30 seconds, and the next
+  one, queued behind it, was acknowledged when the follower was dropped. The broker accepts an
+  idempotent producer's batches only in order, so librdkafka counts the earlier message as stored
+  too, an implicit acknowledgement in its source, and reports it delivered with offset -1001: it
+  never got that request's reply. The first driver wrote -1001 into the history as the position,
+  which the checker refused; the driver now records such a report as an `info`. The message was in
+  the final read exactly once in every run.
+- **The 2022 fix can't be a calibration here.** The last data-loss fix in librdkafka's idempotent
+  producer, in 1.9.0 in 2022, is for messages reported delivered but thrown away as duplicates,
+  after a restarting broker reported an existing topic as missing and the producer forgot its
+  sequence numbers. A Kafka 4.3.1 broker opens its client listeners only after it has caught up with
+  the cluster's metadata and been unfenced (`BrokerServer.scala`), so it can't report an existing
+  topic as missing, and a batch whose sequence number doesn't follow the producer's last one is
+  refused as out of order unless it repeats one of the last 5 batches (`ProducerAppendInfo.java`).
+  Built against confluent-kafka-go 1.8.2 and 1.9.0, both would come out clean for want of the
+  trigger, so the pair wasn't run, and confluent-kafka-go is checked on Kafka's documented loss
+  instead, like kafka-go.
+
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -1123,8 +1183,10 @@ driftlab/
   of its table gave a fourth upstream report, sarama issue 3843 (see the metadata stall). sarama's
   table was done on 2026-10-21, with the idempotent settings and with its defaults (see sarama
   results), and kafka-go's on 2026-10-23, with acknowledgements from every in-sync copy and with its
-  default of none, after a settings check in place of a calibration (see kafka-go results).
-  confluent-kafka-go comes next, and the version ends with the published table.
+  default of none, after a settings check in place of a calibration (see kafka-go results), and
+  confluent-kafka-go's on 2026-10-24, with its idempotent producer and with librdkafka's defaults,
+  after the same check (see confluent-kafka-go results). franz-go's fault rows come next, and the
+  version ends with the published table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 
