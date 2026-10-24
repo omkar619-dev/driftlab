@@ -595,7 +595,11 @@ before the follower was dropped should leave a `duplicate`, and a `nonmonotonic-
 acknowledgement lands after later messages'. The idempotent producer numbers its batches, so the
 leader should keep one copy of each. In `leader-kill-live`, librdkafka should find the new leader
 within about a second of the election, since it asks again every 100 milliseconds or more, and since
-it keeps retrying a message for up to 5 minutes, it should give up on none.
+it keeps retrying a message for up to 5 minutes, it should give up on none. In the first
+`follower-cut` runs with the idempotent producer, librdkafka reported some messages delivered but
+with no offset, its -1001, and the checker refused those histories, rightly, since a position can't
+be negative. The driver now records such a report as an `info`, because an acknowledgement in the
+history needs its position.
 
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is

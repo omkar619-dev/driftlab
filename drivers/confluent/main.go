@@ -309,10 +309,13 @@ func (wr *writer) publish(topic *string, partitions int32, v uint64) {
 // reports records every delivery report until Close closes the Events
 // channel. A report with an error is an info, not a fail: librdkafka gives up
 // on a message after retrying it, and an attempt that timed out may still
-// have been stored. Otherwise it is an ok, with the partition and offset the
-// message was stored at. A kafka.Error on the channel is the client's own,
-// not one message's, and is recorded as a client-error; a fatal one means the
-// producer can't go on.
+// have been stored. A report with no error but no offset either, librdkafka's
+// -1001, says the message was delivered but not where, and an ok needs the
+// position from its ack, so it is an info too, with that said in its error.
+// Otherwise it is an ok, with the partition and offset the message was stored
+// at. A kafka.Error on the channel is the client's own, not one message's,
+// and is recorded as a client-error; a fatal one means the producer can't go
+// on.
 func (wr *writer) reports() {
 	defer close(wr.done)
 	for ev := range wr.p.Events() {
@@ -321,6 +324,10 @@ func (wr *writer) reports() {
 			v, _ := e.Opaque.(uint64)
 			if e.TopicPartition.Error != nil {
 				wr.rec.op(op{Process: "producer", Type: "info", F: "publish", Value: v, Error: e.TopicPartition.Error.Error()})
+				continue
+			}
+			if e.TopicPartition.Offset < 0 {
+				wr.rec.op(op{Process: "producer", Type: "info", F: "publish", Value: v, Error: fmt.Sprintf("reported delivered, with no offset (%d)", int64(e.TopicPartition.Offset))})
 				continue
 			}
 			p, o := e.TopicPartition.Partition, int64(e.TopicPartition.Offset)
