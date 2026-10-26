@@ -601,6 +601,20 @@ with no offset, its -1001, and the checker refused those histories, rightly, sin
 be negative. The driver now records such a report as an `info`, because an acknowledgement in the
 history needs its position.
 
+**franz-go's fault table.** `drivers/franzgo/faults`, a second command in the franz-go module, runs
+the same rows for franz-go: `publish-only`, `control`, `leader-kill-live`, `followers-pause`,
+`follower-pause` and `follower-cut`. franz-go's defaults are already its strongest settings,
+idempotent with acknowledgements from every in-sync copy, so it gets one column. Its writer hands
+each record to `Produce` and records the outcome from the record's promise, writing asynchronously
+like the other drivers; `drivers/franzgo`'s writer waits for each send, because the 1217 calibration
+needed a deadline on every send, and that driver and its scenarios are unchanged. A failed record is
+a `fail`, as in `drivers/franzgo`: franz-go fails an idempotent record only when it knows it was not
+written. franz-go asks the leader to wait up to 10 seconds for every in-sync copy, so each
+slow-follower row can time a request out, and as an idempotent producer it resends it with the same
+sequence numbers, which the leader should recognise. In `leader-kill-live` it asks for fresh
+metadata at most every 5 seconds, and once 10,000 records are buffered `Produce` waits, so the
+writer itself pauses during the election.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
@@ -1100,6 +1114,7 @@ driftlab/
 │   ├── franzgo/
 │   │   ├── go.mod
 │   │   ├── v1.20.6.mod
+│   │   ├── faults/
 │   │   └── repro1505/
 │   ├── kafkago/
 │   │   └── go.mod
@@ -1140,6 +1155,7 @@ driftlab/
 | `drivers/franzgo/go.mod` | pins franz-go v1.20.7 (the release that fixed issue 1217) |
 | `drivers/franzgo/v1.20.6.mod` | pins franz-go v1.20.6 (the last release before the fix), used via `-modfile` |
 | `drivers/franzgo/repro1505/` | a standalone reproducer for franz-go issue 1505, which needs no broker at all |
+| `drivers/franzgo/faults/` | a second command in the franz-go module that runs the fault table's rows with franz-go's default settings, writing asynchronously like the other Kafka drivers |
 | `drivers/kafkago/` | a separate module that writes through kafka-go's Writer and, with a helper, reads through its Reader, with franz-go v1.20.7 as the witness |
 | `drivers/kafkago/go.mod` | pins kafka-go v0.4.51 and franz-go v1.20.7 |
 | `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command and keeps it running as a supervisor would, writes into the source, can freeze or cut the copy's followers and crash the program meanwhile, and reads the copy back |
