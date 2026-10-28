@@ -612,8 +612,21 @@ a `fail`, as in `drivers/franzgo`: franz-go fails an idempotent record only when
 written. franz-go asks the leader to wait up to 10 seconds for every in-sync copy, so each
 slow-follower row can time a request out, and as an idempotent producer it resends it with the same
 sequence numbers, which the leader should recognise. In `leader-kill-live` it asks for fresh
-metadata at most every 5 seconds, and once 10,000 records are buffered `Produce` waits, so the
-writer itself pauses during the election.
+metadata at most every 5 seconds, and `Produce` waits while franz-go's buffer is full, so the
+writer itself can pause during the election.
+
+**franz-go's latest release.** The fault table runs on two franz-go releases: v1.20.7, the one the
+calibration needs, and v1.22.2, the latest, tagged on 2026-10-13, through `v1.22.2.mod`. v1.22.2
+declares Go 1.26 and needs `kmsg` v1.15.0, so unlike the calibration pair the two builds differ in
+more than franz-go; the table measures each release as it ships. Three changes since v1.20.7 touch
+these rows. v1.21.7 resends a request answered REQUEST_TIMED_OUT after its backoff, where v1.20.7
+first waited for fresh metadata. v1.22.1 raises the buffer from 10,000 records to 50,000, more than
+`leader-kill-live` writes, so with v1.22.2 the writer shouldn't pause. And v1.22.2 fixes
+https://github.com/twmb/franz-go/issues/1484, a follow-up to 1217: when a deadline or a retry limit
+failed a batch that the broker had stored but answered NOT_LEADER_OR_FOLLOWER, as an old leader
+answers the requests still waiting on it when leadership moves, franz-go gave the batch's sequence
+numbers to the next one, which the new leader then acknowledged without storing. These rows never
+fail a record, so they can't show that bug; a calibration on it comes later.
 
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
@@ -1114,6 +1127,7 @@ driftlab/
 │   ├── franzgo/
 │   │   ├── go.mod
 │   │   ├── v1.20.6.mod
+│   │   ├── v1.22.2.mod
 │   │   ├── faults/
 │   │   └── repro1505/
 │   ├── kafkago/
@@ -1154,6 +1168,7 @@ driftlab/
 | `drivers/franzgo/` | a separate module that talks to Kafka through franz-go and writes a history to stdout |
 | `drivers/franzgo/go.mod` | pins franz-go v1.20.7 (the release that fixed issue 1217) |
 | `drivers/franzgo/v1.20.6.mod` | pins franz-go v1.20.6 (the last release before the fix), used via `-modfile` |
+| `drivers/franzgo/v1.22.2.mod` | pins franz-go v1.22.2 (the latest release) for the fault table, used via `-modfile` |
 | `drivers/franzgo/repro1505/` | a standalone reproducer for franz-go issue 1505, which needs no broker at all |
 | `drivers/franzgo/faults/` | a second command in the franz-go module that runs the fault table's rows with franz-go's default settings, writing asynchronously like the other Kafka drivers |
 | `drivers/kafkago/` | a separate module that writes through kafka-go's Writer and, with a helper, reads through its Reader, with franz-go v1.20.7 as the witness |

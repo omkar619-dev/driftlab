@@ -75,7 +75,9 @@ type scenario struct {
 // 9-second session timeout. franz-go retries a record without limit, and asks
 // for fresh metadata when a write fails, at most every 5 seconds, so it should
 // find the new leader within 5 seconds of the election. Meanwhile records pile
-// up, and once 10,000 are buffered Produce waits, so the writer pauses too.
+// up, and Produce waits while franz-go's buffer is full: 10,000 records up to
+// v1.22.0, about 10 seconds of this stream, so the writer can pause too, and
+// 50,000 from v1.22.1, more than the run writes.
 //
 // followers-pause freezes both brokers that hold the partition's other copies
 // for 25 seconds. follower-pause freezes one of them for 25 seconds, and the
@@ -233,8 +235,9 @@ func run(c config, out io.Writer) error {
 // every in-sync copy, retried without limit, batched after at most 10
 // milliseconds. Produce only buffers a record; franz-go sends it in the
 // background and calls the record's promise with its position or its error,
-// which records the outcome. Once 10,000 records are buffered, Produce waits
-// for room, franz-go's default.
+// which records the outcome. Once the buffer is full, Produce waits for room:
+// franz-go's default buffer holds 10,000 records up to v1.22.0 and 50,000 from
+// v1.22.1.
 type writer struct {
 	cl  *kgo.Client
 	rec *recorder
