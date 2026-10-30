@@ -1,9 +1,10 @@
 # driftlab: design
 
-> Status: last updated 2026-10-14. v0 is done: the checker, and one system (NATS JetStream, Go
+> Status: last updated 2026-10-30. v0 is done: the checker, and one system (NATS JetStream, Go
 > client) under stall, network and server faults. The calibration matrix reproduces, and weekend 3
-> produced two upstream reports (see Weekend 3 results). v1, the Go Kafka clients, has a working
-> franz-go witness, and its calibration pair reproduces (see v1 calibration results).
+> produced two upstream reports (see Weekend 3 results). v1, the Go Kafka clients, has every client
+> calibrated or checked and all four fault tables done (see sarama, kafka-go, confluent-kafka-go and
+> franz-go results); the published table across them comes next.
 
 ## What driftlab is
 
@@ -929,6 +930,59 @@ acknowledgement:
   trigger, so the pair wasn't run, and confluent-kafka-go is checked on Kafka's documented loss
   instead, like kafka-go.
 
+## franz-go results
+
+franz-go's table ran against apache/kafka 4.3.1, each fault on a one-partition topic with a solo
+helper reading, with franz-go's defaults, which are already its strongest settings: an idempotent
+producer that waits for every in-sync copy. It ran on two releases, both built with Go 1.26.5:
+v1.22.2, the latest, on 2026-10-28 at driver commit `2b4c977`, and v1.20.7, the one the
+calibration needs, on 2026-10-26 at `23dc68a`. A wait is the longest from handing a value over to
+its acknowledgement:
+
+| Scenario | franz-go v1.22.2 | franz-go v1.20.7 |
+|---|---|---|
+| `leader-kill-live` | clean ×3; the writer waited 10.7 to 15.1 s | clean ×3; the writer waited 11.0 to 14.5 s, and in two runs `Produce` took no value for 3.4 s |
+| `followers-pause` | clean ×3; the writer waited 25.2 to 25.3 s | clean ×3; the writer waited 25.2 s |
+| `follower-pause` | clean ×3; the writer waited 8.7 to 12.0 s | clean ×3; the writer waited 9.2 to 11.2 s |
+| `follower-cut` | clean ×3; the writer waited 31.9 to 40.1 s | clean ×3; the writer waited 30.9 to 39.2 s |
+
+- **The defaults kept every promise on both releases.** Every message was stored exactly once and
+  in order in all 24 runs, and no send failed, as with librdkafka, against sarama's 6,758 to 11,205
+  failed sends in `leader-kill-live` and kafka-go's 100 to 200. A request the leader holds past
+  franz-go's 10-second wait, as it did in every `followers-pause` and `follower-cut` run and in
+  four of the six `follower-pause` runs, is answered REQUEST_TIMED_OUT and sent again with the same
+  sequence numbers, and the leader kept one copy each time, where kafka-go's resends were stored up
+  to 8 times. No settings check was needed: the calibration on franz-go issue 1217 already showed
+  the harness catching franz-go losing an acknowledged write (see v1 calibration results).
+- **Two crashes met the empty follower and lost nothing.** In `leader-kill-live` runs 1 and 3 on
+  v1.22.2, nothing had been acknowledged when the leader died, about 0.6 seconds after the topic
+  was created: a follower still counted as in sync hadn't copied anything yet, the state in which
+  sarama, kafka-go and librdkafka, waiting for the leader alone, lost every message written so far.
+  Waiting for every in-sync copy, franz-go had acknowledged nothing it could lose, and the new
+  leader stored every value once. With nothing acknowledged before the fault, the checker has no
+  recovery time to report for those two runs.
+- **On v1.20.7 the writer stopped for 3.4 seconds when the buffer filled.** In `leader-kill-live`
+  runs 1 and 2, `Produce` took no value for 3.36 seconds, from 11.3 and 11.1 seconds into the
+  fault: 10,000 values were waiting for acknowledgements, franz-go's default buffer was full, and
+  `Produce` blocks until there is room, as its docs say. It took values again as soon as the new
+  leader's first acknowledgements came back. In run 3 they came back at 11.0 seconds, before the
+  buffer filled. v1.22.1 raised the buffer to 50,000 records, and on v1.22.2 the writer never
+  paused for more than 0.02 seconds, while 8,789 to 12,760 values a run waited more than a second
+  for their acknowledgement. Nothing was lost either way: the stop is in the caller, not in the
+  data.
+- **The reader came back 17 to 18 seconds after the kill, however long the election took.** The
+  new leader was seen 9.9 to 11.3 seconds after the kill on v1.22.2 and 9.0 to 11.1 on v1.20.7, and
+  acknowledgements came back 0.25 to 3.4 seconds after that, and 2.0 to 3.6. The helper's
+  deliveries resumed 17.1 to 18.2 seconds after the kill on v1.22.2, and 17.6 to 18.4 on v1.20.7,
+  and the checker's lag, from an acknowledgement to its delivery, peaked at 2.3 to 8.1 seconds a
+  run. Why isn't known yet; the published table compares every client's reader before calling it
+  anything.
+- **v1.22.2's other changes had nothing to act on here.** In the slow-follower rows the writer
+  waited until Kafka dropped the follower or the freeze ended, on both releases, and no client can
+  shorten that, so v1.21.7's quicker resend of a timed-out request made no visible difference. And
+  no record failed, so the 1484 fix had nothing to do (see franz-go's latest release); a
+  calibration on it comes later.
+
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -1216,8 +1270,9 @@ driftlab/
   results), and kafka-go's on 2026-10-23, with acknowledgements from every in-sync copy and with its
   default of none, after a settings check in place of a calibration (see kafka-go results), and
   confluent-kafka-go's on 2026-10-24, with its idempotent producer and with librdkafka's defaults,
-  after the same check (see confluent-kafka-go results). franz-go's fault rows come next, and the
-  version ends with the published table.
+  after the same check (see confluent-kafka-go results), and franz-go's on 2026-10-28, with its
+  defaults on v1.22.2, its latest release, two days after a first run on v1.20.7 (see franz-go
+  results). The version ends with the published table.
 
 ## Beyond v0 (one line each, so v0 stays small)
 

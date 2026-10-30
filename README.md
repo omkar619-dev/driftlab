@@ -29,12 +29,20 @@ Against nats.go, the Go client for NATS JetStream, at v1.53.1 and v1.54.0:
   out for itself, so it takes 30 seconds, not 10, to notice a silent line.**
   https://github.com/nats-io/nats.go/issues/2181 (reported 2026-10-12). Fixed by
   https://github.com/nats-io/nats.go/pull/2182, which driftlab checked too. It was merged on
-  2026-10-19, after v1.54.0, so it isn't in a release yet.
+  2026-10-19 and shipped in v1.55.0 on 2026-10-23.
 
 Neither loses or duplicates a message.
 
 Against franz-go, the Go client for Kafka:
 
+- **Its default settings stored every message exactly once and in order, through every fault, on
+  v1.22.2, its latest release, and on v1.20.7.** franz-go's defaults are already its strongest: an
+  idempotent producer that waits for every in-sync copy. No send failed in 24 runs, and two leader
+  crashes that came before a follower had copied anything lost nothing; with the other three
+  clients, waiting for the leader alone, the same state lost every message written so far. On
+  v1.20.7 a full buffer made `Produce` stop taking values for 3.4 seconds in two of three leader
+  crashes, as franz-go documents; v1.22.1 raised the buffer from 10,000 records to 50,000, and on
+  v1.22.2 the writer never paused.
 - **A request doesn't return when its context ends while another request to the same broker is
   still dialing.** It waits for that dial to give up, 10 seconds by default. It surfaced in the
   kaf-relay runs below, where a call with a 1-second timeout took 10 seconds, and
@@ -51,7 +59,9 @@ Against sarama, another Go client for Kafka, at v1.61.1:
   for 60 seconds, it asked the frozen broker in 4 of 6 runs, and each of those resumed about 24
   seconds after the partition did, without losing a message. `drivers/sarama/repro3843`
   reproduces it with mock brokers. https://github.com/IBM/sarama/issues/3843 (reported
-  2026-10-20), not yet confirmed by the maintainers.
+  2026-10-20). A maintainer suggested copying the Java client, which refreshes metadata before a
+  retry only when the error says it is stale, and https://github.com/IBM/sarama/pull/3849 does
+  that; it is waiting for review.
 - **With its default settings, a leader crash loses acknowledged messages.** By default sarama
   waits only for the partition's leader to store a write, which Kafka documents can lose messages
   the leader acknowledged if it dies before a follower copies them; Kafka's own Java producer has
@@ -208,9 +218,8 @@ go test -C drivers/sarama -run TestRetryWaitsForSilentBroker -count=1 -v ./repro
 - [DESIGN.md](https://github.com/omkar619-dev/driftlab/blob/main/DESIGN.md): the principles, the
   history format, the checker's rules, every scenario and every result.
 - v1, the Go Kafka clients, is under way: franz-go and sarama are calibrated, kafka-go and
-  confluent-kafka-go are checked, the fault tables of sarama, kafka-go and confluent-kafka-go are
-  done, each with its strongest settings and with its defaults, and a relay driver tests programs
-  that copy topics between clusters. franz-go's fault rows come next, then the table across all
-  four clients.
+  confluent-kafka-go are checked, and the fault tables of all four are done, each with its
+  strongest settings and with its defaults, which for franz-go are the same, and a relay driver
+  tests programs that copy topics between clusters. The table across all four clients comes next.
 
 Apache-2.0.
