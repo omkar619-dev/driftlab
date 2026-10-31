@@ -132,6 +132,14 @@ type scenario struct {
 // it, dies with it. In leader-kill the writer has paused for docker by then,
 // so everything acknowledged has been copied.
 //
+// leader-kill-steady is leader-kill-live with the kill just before value
+// 5,001, about 6 seconds in. leader-kill-live's comes about 0.6 seconds after
+// the topic is created, and in three of its five runs with -defaults the
+// follower that took over had copied nothing yet, so the run lost every
+// value written so far. By value 5,001 the followers have long been copying,
+// so with -defaults the crash can take only what the leader acknowledged in
+// its last few milliseconds, and with the idempotent settings nothing.
+//
 // With -defaults, every scenario writes with sarama's default producer
 // settings instead of the idempotent ones; see producerConfig.
 var scenarios = map[string]scenario{
@@ -142,6 +150,7 @@ var scenarios = map[string]scenario{
 	"followers-cut-single": {partitions: 1, n: 3200, timeout: 2 * time.Second, maxMessages: 1, fault: "cut", faultAt: 201, hold: 20 * time.Second, expectTimeout: true},
 	"leader-kill":          {consumer: true, partitions: 1, n: 3000, fault: "kill", faultAt: 501, hold: 20 * time.Second},
 	"leader-kill-live":     {consumer: true, partitions: 1, n: 20000, interval: time.Millisecond, fault: "kill", faultAt: 501, hold: 20 * time.Second, live: true},
+	"leader-kill-steady":   {consumer: true, partitions: 1, n: 20000, interval: time.Millisecond, fault: "kill", faultAt: 5001, hold: 20 * time.Second, live: true},
 	"followers-pause":      {consumer: true, partitions: 1, n: 4000, fault: "pause", faultAt: 501, hold: 25 * time.Second},
 	"follower-pause":       {consumer: true, partitions: 1, n: 4000, fault: "pause", followers: 1, faultAt: 501, hold: 25 * time.Second},
 	"follower-cut":         {consumer: true, partitions: 1, n: 6500, fault: "cut", followers: 1, faultAt: 501, hold: 50 * time.Second},
@@ -168,7 +177,7 @@ func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control, followers-cut, followers-cut-single, leader-kill, leader-kill-live, followers-pause, follower-pause or follower-cut")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, timeout-control, followers-cut, followers-cut-single, leader-kill, leader-kill-live, leader-kill-steady, followers-pause, follower-pause or follower-cut")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish, unless the scenario sets it")
 	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic, unless the scenario sets it")
 	flag.DurationVar(&c.interval, "interval", 0, "the pause after handing each value to the producer; 0 keeps the scenario's own, or 10ms")

@@ -78,6 +78,16 @@ type scenario struct {
 // values the leader acknowledged before a follower copied them; with the
 // idempotent producer it must not.
 //
+// leader-kill-steady, also in drivers/sarama, drivers/kafkago and
+// drivers/franzgo/faults, is the same crash just before value 5,001, about 6
+// seconds in. leader-kill-live's comes about 0.6 seconds after the topic is
+// created, often before a follower has copied anything, and then acks-one
+// loses every value written so far, while the other settings, which wait for
+// every in-sync copy, have acknowledged nothing they could lose. By value
+// 5,001 the followers have long been copying, so acks-one can lose only what
+// the leader acknowledged in its last few milliseconds, and the other
+// settings must lose nothing they acknowledged.
+//
 // followers-pause freezes both brokers that hold the partition's other copies
 // for 25 seconds. follower-pause freezes one of them for 25 seconds, and the
 // controller fences it after 9 to 12 seconds. follower-cut cuts one of them
@@ -93,12 +103,13 @@ type scenario struct {
 // numbers its batches, so the leader should recognise a resent one and keep a
 // single copy.
 var scenarios = map[string]scenario{
-	"publish-only":     {},
-	"control":          {consumer: true},
-	"leader-kill-live": {consumer: true, partitions: 1, n: 20000, interval: time.Millisecond, fault: "kill", faultAt: 501, hold: 20 * time.Second},
-	"followers-pause":  {consumer: true, partitions: 1, n: 4000, fault: "pause", faultAt: 501, hold: 25 * time.Second},
-	"follower-pause":   {consumer: true, partitions: 1, n: 4000, fault: "pause", followers: 1, faultAt: 501, hold: 25 * time.Second},
-	"follower-cut":     {consumer: true, partitions: 1, n: 6500, fault: "cut", followers: 1, faultAt: 501, hold: 50 * time.Second},
+	"publish-only":       {},
+	"control":            {consumer: true},
+	"leader-kill-live":   {consumer: true, partitions: 1, n: 20000, interval: time.Millisecond, fault: "kill", faultAt: 501, hold: 20 * time.Second},
+	"leader-kill-steady": {consumer: true, partitions: 1, n: 20000, interval: time.Millisecond, fault: "kill", faultAt: 5001, hold: 20 * time.Second},
+	"followers-pause":    {consumer: true, partitions: 1, n: 4000, fault: "pause", faultAt: 501, hold: 25 * time.Second},
+	"follower-pause":     {consumer: true, partitions: 1, n: 4000, fault: "pause", followers: 1, faultAt: 501, hold: 25 * time.Second},
+	"follower-cut":       {consumer: true, partitions: 1, n: 6500, fault: "cut", followers: 1, faultAt: 501, hold: 50 * time.Second},
 }
 
 type config struct {
@@ -118,7 +129,7 @@ func main() {
 	var c config
 	flag.StringVar(&c.brokers, "brokers", "127.0.0.1:29092,127.0.0.1:39092,127.0.0.1:49092", "Kafka brokers to start from, comma separated")
 	flag.StringVar(&c.server, "server", "apache/kafka:4.3.1", "the broker image, recorded in the meta line (deploy/kafka.yaml pins it)")
-	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, leader-kill-live, followers-pause, follower-pause or follower-cut")
+	flag.StringVar(&c.scenario, "scenario", "control", "publish-only, control, leader-kill-live, leader-kill-steady, followers-pause, follower-pause or follower-cut")
 	flag.StringVar(&c.settings, "settings", "idempotent", "the producer's settings: idempotent, librdkafka's idempotent producer (the driver's default); defaults, librdkafka's own, which wait for every in-sync copy but aren't idempotent; or acks-one, the leader's acknowledgement alone and no idempotence, for the settings check")
 	flag.Uint64Var(&c.n, "n", 100, "number of messages to publish, unless the scenario sets it")
 	flag.IntVar(&c.partitions, "partitions", 3, "number of partitions in the run's topic, unless the scenario sets it")

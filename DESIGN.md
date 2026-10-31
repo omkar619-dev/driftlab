@@ -629,6 +629,19 @@ answers the requests still waiting on it when leadership moves, franz-go gave th
 numbers to the next one, which the new leader then acknowledged without storing. These rows never
 fail a record, so they can't show that bug; a calibration on it comes later.
 
+**The steady kill.** In `leader-kill-live` the kill comes about 0.6 seconds after the topic is
+created, often before a follower has started copying, though every copy of a new partition counts
+as in sync from the start. Waiting for every in-sync copy, the leader then can't acknowledge
+anything: counted on 2026-10-31, nothing was acknowledged before the kill in 11 of the 24 such
+runs, so the crash had nothing acknowledged to lose. With the leader's acknowledgement alone, the
+follower that takes over can hold none of the values written so far, and 6 of the 15 such runs
+lost all of them. Those runs test a crash just after a topic is created, not one during steady
+writing. `leader-kill-steady`, in all four Kafka drivers, is the same crash just before value
+5,001, about 6 seconds in, when the followers have long been copying. Waiting for every in-sync
+copy, each run should acknowledge values before the kill and lose none of them; with the leader's
+acknowledgement alone, it can lose only what the leader acknowledged in its last few milliseconds.
+`leader-kill-live` stays as it is, and so do its results.
+
 **Consumer groups.** A group member that takes over a partition starts from the group's committed
 offset, so messages the previous owner received but hadn't committed arrive again. That is
 at-least-once delivery, documented and legal, and Jepsen's own checker allows poll skips and
