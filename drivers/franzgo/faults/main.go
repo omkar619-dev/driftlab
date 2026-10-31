@@ -107,6 +107,10 @@ type config struct {
 	partitions int
 	interval   time.Duration
 	grace      time.Duration
+
+	// Settings of the helper's client alone, for experiments on how it reads.
+	helperMinAge time.Duration
+	helperLog    bool
 }
 
 func main() {
@@ -120,6 +124,8 @@ func main() {
 	flag.DurationVar(&c.grace, "grace", 10*time.Second, "how long the helper gets to catch up before the final read")
 	flag.StringVar(&c.nftImage, "nft-image", "driftlab-nft", "the image the cut runs nft from, inside a broker's network (docker build -t driftlab-nft deploy/nft)")
 	flag.IntVar(&c.cutPort, "cut-port", 19092, "the port the brokers fetch from each other on, which the cut drops (deploy/kafka.yaml's INTERNAL listener)")
+	flag.DurationVar(&c.helperMinAge, "helper-metadata-min-age", 0, "the least time between the helper's metadata refreshes, franz-go's MetadataMinAge; 0 keeps franz-go's default, 5s")
+	flag.BoolVar(&c.helperLog, "helper-log", false, "write the helper's franz-go log, at info level, to stderr, each line led by the seconds since the history began")
 	flag.Parse()
 	if err := run(c, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "franzfaults:", err)
@@ -149,6 +155,12 @@ func run(c config, out io.Writer) error {
 	}
 	if sc.partitions < 1 {
 		return errors.New("-partitions must be at least 1")
+	}
+	if c.helperMinAge < 0 {
+		return errors.New("-helper-metadata-min-age can't be negative")
+	}
+	if !sc.consumer && (c.helperMinAge > 0 || c.helperLog) {
+		return fmt.Errorf("scenario %s has no helper for -helper-metadata-min-age or -helper-log to change", c.scenario)
 	}
 	partitions := int32(sc.partitions)
 	rec := newRecorder(out)
@@ -193,7 +205,7 @@ func run(c config, out io.Writer) error {
 	rec.writeMeta(newMeta(c, sc, topic))
 	var h *helper
 	if sc.consumer {
-		if h, err = startHelper(seeds, rec, topic, partitions); err != nil {
+		if h, err = startHelper(seeds, rec, topic, partitions, c.helperMinAge, c.helperLog); err != nil {
 			return err
 		}
 	}
@@ -303,14 +315,30 @@ type helper struct {
 
 // startHelper starts the helper. It records subscribe around creating the
 // client, because with its partitions given up front, franz-go starts
-// fetching as soon as the client exists.
-func startHelper(seeds []string, rec *recorder, topic string, partitions int32) (*helper, error) {
+// fetching as soon as the client exists. A non-zero minAge sets the least
+// time between the client's metadata refreshes, 5 seconds by default. With
+// logs set, the client writes its log, at info level, to stderr, each line
+// led by the seconds since the history began, the clock time_ns counts on,
+// so its lines can be set against the history's.
+func startHelper(seeds []string, rec *recorder, topic string, partitions int32, minAge time.Duration, logs bool) (*helper, error) {
 	start := map[int32]kgo.Offset{}
 	for p := int32(0); p < partitions; p++ {
 		start[p] = kgo.NewOffset().AtStart()
 	}
+	opts := []kgo.Opt{kgo.SeedBrokers(seeds...), kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: start})}
+	if minAge > 0 {
+		opts = append(opts, kgo.MetadataMinAge(minAge))
+	}
+	if logs {
+		// A copy of the history's start, taken before the client's
+		// goroutines exist, so they never touch the recorder.
+		began := rec.start
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelInfo, func() string {
+			return fmt.Sprintf("%.3f ", time.Since(began).Seconds())
+		})))
+	}
 	rec.op(op{Process: "consumer", Type: "invoke", F: "subscribe"})
-	cl, err := kgo.NewClient(kgo.SeedBrokers(seeds...), kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: start}))
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1051,6 +1079,9 @@ type params struct {
 	Hold       string `json:"hold,omitempty"`
 	Live       bool   `json:"live,omitempty"`
 	Witness    string `json:"witness"`
+
+	// HelperMinAge is the helper's metadata min age, when a run sets it.
+	HelperMinAge string `json:"helper_metadata_min_age,omitempty"`
 }
 
 // newMeta describes the run, including the topic, so the evidence can be
@@ -1061,7 +1092,8 @@ type params struct {
 // group. A fault run declares its fault, which completes once it has fully
 // taken hold, and says it started live, as every fault does here. If a
 // declared fault leaves no evidence, the checker calls the run invalid
-// instead of clean.
+// instead of clean. A run that sets the helper's metadata min age records
+// it, since the helper then isn't on franz-go's defaults.
 func newMeta(c config, sc scenario, topic string) metaLine {
 	client, rev := provenance()
 	m := metaLine{
@@ -1089,6 +1121,9 @@ func newMeta(c config, sc scenario, topic string) metaLine {
 		m.Faults = []string{sc.fault}
 		m.Params.Hold = sc.hold.String()
 		m.Params.Live = true
+	}
+	if c.helperMinAge > 0 {
+		m.Params.HelperMinAge = c.helperMinAge.String()
 	}
 	return m
 }
