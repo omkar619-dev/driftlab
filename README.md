@@ -49,6 +49,14 @@ Against franz-go, the Go client for Kafka:
   `drivers/franzgo/repro1505` reproduces it with no broker at all.
   https://github.com/twmb/franz-go/issues/1505 (reported 2026-10-17), not yet confirmed by the
   maintainer.
+- **After a leader crash, the reader found the new leader up to 5 seconds later than it could.**
+  After a failed fetch, franz-go asks for fresh metadata, but drops the request if its last refresh
+  finished less than 5 seconds before. Once the retry waits reach their 5-second cap, every second
+  request lands a few milliseconds inside that limit and is dropped, so the reader refreshes every
+  10 seconds instead of 5. With the defaults it came back 17 to 18 seconds after the kill in all
+  nine leader crashes; with the limit lowered to 4.5 seconds it came back 2 to 3 seconds after the
+  election, but a request was again dropped at the new line.
+  https://github.com/twmb/franz-go/issues/1531 (reported 2026-10-31).
 
 Against sarama, another Go client for Kafka, at v1.61.1:
 

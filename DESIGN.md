@@ -960,7 +960,9 @@ its acknowledgement:
   sarama, kafka-go and librdkafka, waiting for the leader alone, lost every message written so far.
   Waiting for every in-sync copy, franz-go had acknowledged nothing it could lose, and the new
   leader stored every value once. With nothing acknowledged before the fault, the checker has no
-  recovery time to report for those two runs.
+  recovery time to report for those two runs. Four of the six v1.22.2 runs on 2026-10-31, described
+  below, met it too, while none of the three on v1.20.7 did; whether the release or the cluster
+  makes that difference isn't known yet.
 - **On v1.20.7 the writer stopped for 3.4 seconds when the buffer filled.** In `leader-kill-live`
   runs 1 and 2, `Produce` took no value for 3.36 seconds, from 11.3 and 11.1 seconds into the
   fault: 10,000 values were waiting for acknowledgements, franz-go's default buffer was full, and
@@ -975,8 +977,22 @@ its acknowledgement:
   acknowledgements came back 0.25 to 3.4 seconds after that, and 2.0 to 3.6. The helper's
   deliveries resumed 17.1 to 18.2 seconds after the kill on v1.22.2, and 17.6 to 18.4 on v1.20.7,
   and the checker's lag, from an acknowledgement to its delivery, peaked at 2.3 to 8.1 seconds a
-  run. Why isn't known yet; the published table compares every client's reader before calling it
-  anything.
+  run. The slow part was the reader's client, not the cluster, as the next bullet shows.
+- **franz-go dropped every second metadata request the reader sent, by a few milliseconds.** After
+  a failed fetch, franz-go asks for fresh metadata, then waits before fetching again, 5 seconds once
+  the waits reach their cap. It drops the request if its last refresh finished less than
+  `MetadataMinAge`, 5 seconds by default, before, and that refresh had finished a few milliseconds
+  after the previous request. So once the waits were capped, every second request was dropped, and
+  the reader refreshed every 10 seconds instead of every 5. Three more `leader-kill-live` runs on
+  2026-10-31, on v1.22.2 at driver commit `b5b30dd` and built with Go 1.26.10, logged the helper's
+  client with `-helper-log`. In each, a refresh came 7.4 to 8.3 seconds after the kill, before the
+  election; the failed fetch exactly 5.00 seconds later brought no refresh; and the next refresh,
+  10.0 seconds after the first, found the new leader. The first delivery followed 0.01 to 0.02
+  seconds later, 17.4 to 18.3 seconds after the kill. Three runs with
+  `-helper-metadata-min-age 4.5s` brought the helper back 1.7 to 3.1 seconds after the election,
+  12.6 to 15.7 seconds after the kill, but in one of them a request came 4.51 seconds after a
+  refresh and was dropped at the new line: a lower setting moves the miss instead of removing it.
+  Reported as https://github.com/twmb/franz-go/issues/1531.
 - **v1.22.2's other changes had nothing to act on here.** In the slow-follower rows the writer
   waited until Kafka dropped the follower or the freeze ended, on both releases, and no client can
   shorten that, so v1.21.7's quicker resend of a timed-out request made no visible difference. And
