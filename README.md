@@ -37,7 +37,7 @@ Against franz-go, the Go client for Kafka:
 
 - **Its default settings stored every message exactly once and in order, through every fault, on
   v1.22.2, its latest release, and on v1.20.7.** franz-go's defaults are already its strongest: an
-  idempotent producer that waits for every in-sync copy. No send failed in 24 runs, and two leader
+  idempotent producer that waits for every in-sync copy. No send failed in 27 runs, and two leader
   crashes that came before a follower had copied anything lost nothing; with the other three
   clients, waiting for the leader alone, the same state lost every message written so far. On
   v1.20.7 a full buffer made `Produce` stop taking values for 3.4 seconds in two of three leader
@@ -47,15 +47,17 @@ Against franz-go, the Go client for Kafka:
   still dialing.** It waits for that dial to give up, 10 seconds by default. It surfaced in the
   kaf-relay runs below, where a call with a 1-second timeout took 10 seconds, and
   `drivers/franzgo/repro1505` reproduces it with no broker at all.
-  https://github.com/twmb/franz-go/issues/1505 (reported 2026-10-17), not yet confirmed by the
-  maintainer.
+  https://github.com/twmb/franz-go/issues/1505 (reported 2026-10-17). The maintainer opened a fix
+  the same day, https://github.com/twmb/franz-go/pull/1506, which driftlab checked: with it the
+  call returns at its own deadline, and franz-go's fault table came through clean. It isn't merged
+  yet.
 - **After a leader crash, the reader found the new leader up to 5 seconds later than it could.**
   After a failed fetch, franz-go asks for fresh metadata, but drops the request if its last refresh
   finished less than 5 seconds before. Once the retry waits reach their 5-second cap, every second
   request lands a few milliseconds inside that limit and is dropped, so the reader refreshes every
   10 seconds instead of 5. With the defaults it came back 17 to 18 seconds after the kill in all
-  nine leader crashes; with the limit lowered to 4.5 seconds it came back 2 to 3 seconds after the
-  election, but a request was again dropped at the new line.
+  twelve leader crashes, three of them during steady writing; with the limit lowered to 4.5 seconds
+  it came back 2 to 3 seconds after the election, but a request was again dropped at the new line.
   https://github.com/twmb/franz-go/issues/1531 (reported 2026-10-31).
 
 Against sarama, another Go client for Kafka, at v1.61.1:
@@ -73,10 +75,12 @@ Against sarama, another Go client for Kafka, at v1.61.1:
 - **With its default settings, a leader crash loses acknowledged messages.** By default sarama
   waits only for the partition's leader to store a write, which Kafka documents can lose messages
   the leader acknowledged if it dies before a follower copies them; Kafka's own Java producer has
-  waited for every in-sync copy by default since Kafka 3.0. In five leader crashes during steady
-  writing, every run lost acknowledged messages: one in two runs, and all 521 to 526 written so
-  far in the other three, where the follower that took over hadn't copied anything yet. With the
-  idempotent settings, three crashes lost nothing. That is documented behavior, not a bug, and
+  waited for every in-sync copy by default since Kafka 3.0. In five leader crashes about 0.6
+  seconds after the topic was created, every run lost acknowledged messages: one in two runs, and
+  all 521 to 526 written so far in the other three, where the follower that took over hadn't
+  copied anything yet. In three crashes during steady writing, one run lost the last two messages
+  the leader acknowledged, 42 and 43 milliseconds after the kill began, and two lost nothing. With
+  the idempotent settings, six crashes lost nothing. That is documented behavior, not a bug, and
   Kafka's own console consumer agrees with driftlab's count.
 
 Against kafka-go, segmentio's Go client for Kafka, at v0.4.51:
@@ -84,9 +88,10 @@ Against kafka-go, segmentio's Go client for Kafka, at v0.4.51:
 - **With its default settings, a leader crash loses messages kafka-go reported as sent, with no
   error.** By default kafka-go's `Writer` asks for no acknowledgement at all, as every `Writer` in
   its README does, so it counts a batch as sent once it is written to the connection. In three
-  leader crashes during steady writing, 200, 700 and 700 values were reported sent and never
-  stored; in the two 700 runs, the follower that took over hadn't copied anything yet. Kafka
-  documents this for `acks=0`: the producer won't generally know of any failures.
+  leader crashes just after the topic was created, 200, 700 and 700 values were reported sent and
+  never stored; in the two 700 runs, the follower that took over hadn't copied anything yet. In
+  three during steady writing it was 300 every time, the first three batches sent after the crash
+  began. Kafka documents this for `acks=0`: the producer won't generally know of any failures.
 - **With its strongest settings, a follower that holds up the copy makes it store a batch again and
   again.** kafka-go has no idempotent producer. Waiting for every in-sync copy, it gives the leader
   5 seconds, then sends the batch again, and the leader stores it again: one batch was stored 5
@@ -104,14 +109,32 @@ Against confluent-kafka-go, Confluent's Go client for Kafka, at v2.16.0 with lib
   twice.** By default librdkafka waits for every in-sync copy, so no crash lost an acknowledged
   message, but it isn't idempotent. A request the broker held past librdkafka's 30-second wait was
   sent again and stored again, out of order after messages sent since, in all three runs where a
-  follower was cut off from the leader, and a batch of 5 was stored twice in one of three leader
-  crashes. librdkafka's docs say retrying may reorder messages unless idempotence is on.
+  follower was cut off from the leader, and a batch of 5 or 6 values was stored twice in three of
+  six leader crashes. librdkafka's docs say retrying may reorder messages unless idempotence is on.
 - **Its idempotent producer stored every message exactly once and in order, through every fault.**
   In the cut, one message a run came back delivered but without an offset: its request had timed
   out, and librdkafka counted it as stored because the next request, which the broker could only
   accept after it, was acknowledged. It was stored, once, every time.
 
 The first is documented behavior, not a bug.
+
+The four Kafka clients side by side, each through the same five faults on the same three-broker
+cluster. A cell is three runs, or five for sarama's defaults in the first crash:
+
+| Client and settings | Leader crash just after the topic is created | Leader crash during steady writing | Both followers frozen | One follower frozen | One follower cut off |
+|---|---|---|---|---|---|
+| franz-go v1.22.2, its defaults | clean | clean | clean | clean | clean |
+| sarama v1.61.1, idempotent | clean | clean | clean | clean | clean |
+| sarama v1.61.1, its defaults | **lost acknowledged messages, 5 of 5** | **lost acknowledged messages, 1 of 3** | clean | clean | clean |
+| kafka-go v0.4.51, `all` | clean | clean | **stored a batch again, 3 of 3** | **stored a batch again, 3 of 3** | **stored a batch again, 3 of 3** |
+| kafka-go v0.4.51, its default `none` | **values sent, never stored, 3 of 3** | **values sent, never stored, 3 of 3** | clean | clean | clean |
+| confluent-kafka-go v2.16.0, idempotent | clean | clean | clean | clean | clean |
+| confluent-kafka-go v2.16.0, its defaults | **stored a batch twice, 1 of 3** | **stored a batch twice, 2 of 3** | clean | clean | **stored a message twice, 3 of 3** |
+
+franz-go's defaults are already its strongest settings, so it has one row. Slow recovery isn't in
+the table: sarama's idempotent producer can wait out its 30-second read timeout on a frozen broker,
+and franz-go's reader came back after a leader crash up to 5 seconds later than it could, both
+above.
 
 Against kaf-relay, a program that keeps Kafka clusters in sync by copying topics, at v2.1.0
 (`2dcedd3`):
@@ -225,9 +248,9 @@ go test -C drivers/sarama -run TestRetryWaitsForSilentBroker -count=1 -v ./repro
 
 - [DESIGN.md](https://github.com/omkar619-dev/driftlab/blob/main/DESIGN.md): the principles, the
   history format, the checker's rules, every scenario and every result.
-- v1, the Go Kafka clients, is under way: franz-go and sarama are calibrated, kafka-go and
+- v1, the Go Kafka clients, is done: franz-go and sarama are calibrated, kafka-go and
   confluent-kafka-go are checked, and the fault tables of all four are done, each with its
-  strongest settings and with its defaults, which for franz-go are the same, and a relay driver
-  tests programs that copy topics between clusters. The table across all four clients comes next.
+  strongest settings and with its defaults, which for franz-go are the same, and summed up in the
+  table above. A relay driver tests programs that copy topics between clusters.
 
 Apache-2.0.

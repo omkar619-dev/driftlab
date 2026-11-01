@@ -1,10 +1,11 @@
 # driftlab: design
 
-> Status: last updated 2026-10-30. v0 is done: the checker, and one system (NATS JetStream, Go
+> Status: last updated 2026-11-02. v0 is done: the checker, and one system (NATS JetStream, Go
 > client) under stall, network and server faults. The calibration matrix reproduces, and weekend 3
-> produced two upstream reports (see Weekend 3 results). v1, the Go Kafka clients, has every client
-> calibrated or checked and all four fault tables done (see sarama, kafka-go, confluent-kafka-go and
-> franz-go results); the published table across them comes next.
+> produced two upstream reports (see Weekend 3 results). v1, the Go Kafka clients, is done: every
+> client calibrated or checked, all four fault tables run, with a leader crash during steady
+> writing added to each (see sarama, kafka-go, confluent-kafka-go and franz-go results), and the
+> table across the four published in README.md.
 
 ## What driftlab is
 
@@ -753,6 +754,9 @@ commits `6604a58` to `3ca91b6`:
   own, a request with a 1-second deadline returns after 1 second; sent 200 milliseconds after one
   with a 15-second deadline whose dial hangs, it returns after 9.8 seconds, when that dial gives
   up. The same on v1.20.6 and v1.22.2. Reported as https://github.com/twmb/franz-go/issues/1505.
+  The maintainer opened a fix the same day, https://github.com/twmb/franz-go/pull/1506. At its
+  commit `477f464` the second request returns after 1.00 second, at its own deadline, and
+  franz-go's fault table came through the fix clean (see franz-go results).
 - **kaf-relay survives franz-go issue 1217.** In `relay-pause` the trigger fired on v1.20.6, with
   three timed-out writes per run, but kaf-relay retries exactly the records that failed, and
   v1.20.6 rewinds a failed batch's sequence numbers, so the retry carried the same numbers and the
@@ -781,13 +785,14 @@ sarama's table ran on v1.61.1 against apache/kafka 4.3.1, each fault on a one-pa
 a solo helper reading, once with the idempotent settings and once with sarama's own defaults
 (`-defaults`). The runs took place from 2026-10-19 to 2026-10-21, at driver commits `93188d0`
 (`leader-kill`), `c9d4441` (`followers-pause`), `3a3342f` (`follower-pause` and `follower-cut`),
-`ccf3e42` (the defaults) and `bf77e5f` (`leader-kill-live`). Times are measured from the start of
-the fault:
+`ccf3e42` (the defaults) and `bf77e5f` (`leader-kill-live`), and on 2026-10-31 at `92d1fdc`
+(`leader-kill-steady`). Times are measured from the start of the fault:
 
 | Scenario | Idempotent settings | sarama's defaults |
 |---|---|---|
 | `leader-kill` | clean ×3; acknowledgements stopped for 9.2 to 14.0 s | clean ×3; acknowledgements stopped for 10.4 to 16.4 s |
 | `leader-kill-live` | clean ×3 | **failed ×5**: 1, 526, 1, 524 and 521 acknowledged messages lost |
+| `leader-kill-steady` | clean ×3 | clean ×2, **failed ×1**: 2 acknowledged messages lost |
 | `followers-pause` | clean ×3; the writer waited 25.2 s, the whole freeze | clean ×3; the writer never waited, the reader waited 25.2 s |
 | `follower-pause` | clean ×3; the writer waited 7.8 to 9.3 s, or 25.2 s in one run (the metadata stall) | clean ×3; the writer never waited, the reader waited 8.0 to 10.1 s |
 | `follower-cut` | clean ×3; the writer waited 34.6 to 40.1 s | clean ×3; the writer never waited, the reader waited 30.8 to 40.2 s |
@@ -820,13 +825,25 @@ the fault:
   This is what Kafka documents for `acks=1`, not a sarama bug, but it is sarama's default: Kafka's
   Java producer has defaulted to acknowledgements from every in-sync copy, with idempotence, since
   Kafka 3.0 (KIP-679).
+- **During steady writing the defaults lost only the leader's last acknowledgements.** In the three
+  `leader-kill-steady` runs every follower had long been copying, and each run had 5,002 messages
+  acknowledged before the kill began. One run lost two messages, values 5035 and 5036, which the
+  leader acknowledged 42 and 43 milliseconds after the kill began, the last it acknowledged before
+  it died; the other two lost nothing. The idempotent settings lost nothing in any of their three.
 - **The harness hid it at first.** The defaults' `leader-kill` runs lost nothing, because the driver
   started every fault on its main loop and stopped writing while docker acted, so by the time the
   leader died, everything it had acknowledged had been copied. `leader-kill-live` starts the kill on
   a goroutine of its own and writes a value every millisecond (see the live kill).
-- **Failed sends aren't losses.** In every kill run sarama gave up on the sends it made while there
-  was no leader: 780 to 1,505 of 3,000 in `leader-kill`, and 6,758 to 11,205 of 20,000 in
-  `leader-kill-live`. They are `info`, unknown, and in the runs checked none of them landed.
+- **Failed sends aren't losses, and one of them was stored.** In every kill run sarama gave up on
+  the sends it made while there was no leader: 780 to 1,505 of 3,000 in `leader-kill`, 6,758 to
+  11,205 of 20,000 in `leader-kill-live`, and 6,846 to 8,809 in `leader-kill-steady`. They are
+  `info`, unknown, and in the runs checked none of them landed but one. In `leader-kill-steady`
+  run 3 with the idempotent settings, sarama reported value 5037 failed 0.43 seconds after the kill
+  began, with "connection refused" from the dead leader's address, yet the final read has it once,
+  right after 5036: the old leader had stored it and a follower had copied it, but its reply never
+  reached sarama. sarama's 3 retries, 100 milliseconds apart, end long before a new leader is
+  picked, so an application that resends what sarama reports as failed would store a message like
+  that twice.
 
 ## kafka-go results
 
@@ -834,12 +851,14 @@ kafka-go's table ran on v0.4.51 against apache/kafka 4.3.1, each fault on a one-
 a solo helper reading, once with acknowledgements from every in-sync copy (`-acks all`), its
 strongest setting, and once with its own default, no acknowledgement at all (`-acks none`). The runs
 took place on 2026-10-23, at driver commits `a782401` (`leader-kill-live`) and `e4a9566` (the
-freezes and the cut). A wait is the longest from handing a value over to its acknowledgement, for
-the writer, or to its delivery, for the reader:
+freezes and the cut), and on 2026-10-31 at `92d1fdc` (`leader-kill-steady`). A wait is the longest
+from handing a value over to its acknowledgement, for the writer, or to its delivery, for the
+reader:
 
 | Scenario | Every in-sync copy (`all`) | kafka-go's default (`none`) |
 |---|---|---|
 | `leader-kill-live` | clean ×3; the writer waited 9.4 to 14.9 s | clean ×3, since nothing was acknowledged; **200, 700 and 700 values reported sent were never stored** |
+| `leader-kill-steady` | clean ×3; the writer waited 11.7 to 15.7 s | clean ×3, since nothing was acknowledged; **300 values reported sent were never stored, in every run** |
 | `followers-pause` | **failed ×3**: one batch of 98 or 99 values stored 5 times; the writer waited 25.3 s | clean ×3; the writer never waited, the reader waited 25.3 s |
 | `follower-pause` | **failed ×3**: one batch stored twice; the writer waited 9.0 to 9.7 s | clean ×3; the writer never waited, the reader waited 8.3 to 12.9 s |
 | `follower-cut` | **failed ×3**: one batch stored 8 times; the writer waited 41.4 to 44.4 s | clean ×3; the writer never waited, the reader waited 37.6 to 43.7 s |
@@ -856,7 +875,8 @@ the writer, or to its delivery, for the reader:
   isn't known. The other four runs lost nothing, and no run lost a batch acknowledged in the
   leader's last milliseconds, as sarama did twice, most likely because kafka-go sends one batch of
   about 100 values every 100 milliseconds here, so the leader rarely holds an acknowledged batch no
-  follower has yet.
+  follower has yet. In `leader-kill-steady` the three `-acks one` runs lost nothing either: each had
+  5,000 values acknowledged before the kill, and the final read had every one of them.
 - **The strongest setting stores a batch again whenever a follower holds up the copy.** kafka-go has
   no idempotent producer. With `all` it asks the leader to wait at most 5 seconds, half its
   10-second write timeout, for every in-sync copy, and while a frozen or cut follower still counted
@@ -870,12 +890,13 @@ the writer, or to its delivery, for the reader:
   same rows clean.
 - **The default loses writes it reports as sent.** With `none`, the default of every `Writer` in
   kafka-go's README, kafka-go counts a batch as sent once it is written to the connection. In each
-  leader crash two batches, 200 values, were reported sent and never stored, and in the two runs
-  where the follower that took over had copied nothing, values 1 to 500 as well. The checker can't
-  call them lost, since nothing promised them; the count comes from comparing what was handed over
-  with the final read. Kafka's docs say a producer with `acks=0` won't generally know of any
-  failures. Kafka's own Java producer has waited for every in-sync copy, with idempotence, by
-  default since Kafka 3.0 (KIP-679).
+  `leader-kill-live` crash two batches, 200 values, were reported sent and never stored, and in the
+  two runs where the follower that took over had copied nothing, values 1 to 500 as well. In each
+  `leader-kill-steady` crash it was three batches, values 5001 to 5300, the first 300 handed over
+  after the kill began, and nothing before them. The checker can't call them lost, since nothing
+  promised them; the count comes from comparing what was handed over with the final read. Kafka's
+  docs say a producer with `acks=0` won't generally know of any failures. Kafka's own Java producer
+  has waited for every in-sync copy, with idempotence, by default since Kafka 3.0 (KIP-679).
 - **Failed sends are few, and every one was reported.** In the crashes kafka-go gave up on 100 to
   200 sends whatever the setting, against sarama's 6,758 to 11,205: it retries only the batch at the
   head of the partition's queue, 10 times over about 7 seconds, while the values behind it wait.
@@ -890,12 +911,13 @@ fault on a one-partition topic with a solo helper reading, once with librdkafka'
 producer (`-settings idempotent`) and once with librdkafka's own defaults (`-settings defaults`),
 which wait for every in-sync copy but aren't idempotent. The runs took place on 2026-10-24, at
 driver commit `d49d476`, and `388d245` for the idempotent `follower-cut`, whose first runs the
-checker couldn't read (see below). A wait is the longest from handing a value over to its
-acknowledgement:
+checker couldn't read (see below), and `leader-kill-steady` on 2026-10-31 at `92d1fdc`. A wait is
+the longest from handing a value over to its acknowledgement:
 
 | Scenario | Idempotent | librdkafka's defaults |
 |---|---|---|
 | `leader-kill-live` | clean ×3; the writer waited 9.6 to 15.3 s | clean ×2, **failed ×1**: a batch of 5 values stored twice; the writer waited 9.0 to 11.0 s |
+| `leader-kill-steady` | clean ×3; the writer waited 10.4 to 14.1 s | clean ×1, **failed ×2**: batches of 5 and 6 values stored twice; the writer waited 10.1 to 12.5 s |
 | `followers-pause` | clean ×3; the writer waited 25.2 s | clean ×3; the writer waited 25.2 s |
 | `follower-pause` | clean ×3; the writer waited 8.5 to 9.2 s | clean ×3; the writer waited 8.2 to 14.6 s |
 | `follower-cut` | clean ×3, with one message a run acknowledged without an offset and stored once; the writer waited 32.3 to 41.8 s | **failed ×3**: one value stored twice and one `nonmonotonic-send` each; the writer waited 33.8 to 45.0 s |
@@ -906,7 +928,8 @@ acknowledgement:
   and 527 in two where the follower that took over had copied nothing, as in sarama's and kafka-go's
   runs. The idempotent producer and librdkafka's defaults, which both wait for every in-sync copy,
   lost none, though four of their six runs met the same empty follower: nothing was acknowledged
-  until a copy existed.
+  until a copy existed. In `leader-kill-steady` the three `acks-one` runs lost nothing: 4,996 to
+  5,001 values a run were acknowledged before the kill, and the final read had every one of them.
 - **The idempotent producer kept its promise in every row.** Every message was stored exactly once
   and in order. Its 30-second wait for the copies outlasts both freezes, and in the cut the one
   request held past it was stored once: librdkafka counted it as stored when the request behind it
@@ -916,11 +939,13 @@ acknowledgement:
   leader stored it again, after messages sent since: one value twice and one `nonmonotonic-send` in
   every run. Only one, because a broker reads one request at a time from a connection
   (`SocketServer.scala` mutes the connection until it has replied), so the requests behind it waited
-  unread and never timed out. In one crash, a batch of 5 the old leader had copied but not
-  acknowledged was sent to the new leader and stored twice. librdkafka's docs say retrying may
-  reorder messages unless idempotence is on, and Kafka's say a producer without it may write
-  duplicates when it retries. kafka-go, which waits 5 seconds, stored a batch 5 and 2 times in the
-  freezes and 8 times in the cut.
+  unread and never timed out. In one `leader-kill-live` crash, and in two of the three
+  `leader-kill-steady` ones, a batch the old leader had copied but not acknowledged was sent to the
+  new leader and stored twice: 5 values in the first, then values 5029 to 5033 and 5032 to 5037,
+  with the second copies right after the first. librdkafka's docs say retrying may reorder messages
+  unless idempotence is on, and Kafka's say a producer without it may write duplicates when it
+  retries. kafka-go, which waits 5 seconds, stored a batch 5 and 2 times in the freezes and 8 times
+  in the cut.
 - **No send failed.** librdkafka keeps retrying a message for up to 5 minutes, so every value in
   every run was acknowledged in the end, against sarama's 6,758 to 11,205 failed sends in
   `leader-kill-live` and kafka-go's 100 to 200.
@@ -949,18 +974,20 @@ franz-go's table ran against apache/kafka 4.3.1, each fault on a one-partition t
 helper reading, with franz-go's defaults, which are already its strongest settings: an idempotent
 producer that waits for every in-sync copy. It ran on two releases, both built with Go 1.26.5:
 v1.22.2, the latest, on 2026-10-28 at driver commit `2b4c977`, and v1.20.7, the one the
-calibration needs, on 2026-10-26 at `23dc68a`. A wait is the longest from handing a value over to
+calibration needs, on 2026-10-26 at `23dc68a`. `leader-kill-steady` ran on v1.22.2 alone, on
+2026-10-31 at `92d1fdc`, built with Go 1.26.10. A wait is the longest from handing a value over to
 its acknowledgement:
 
 | Scenario | franz-go v1.22.2 | franz-go v1.20.7 |
 |---|---|---|
 | `leader-kill-live` | clean ×3; the writer waited 10.7 to 15.1 s | clean ×3; the writer waited 11.0 to 14.5 s, and in two runs `Produce` took no value for 3.4 s |
+| `leader-kill-steady` | clean ×3; the writer waited 14.7 to 14.9 s | not run |
 | `followers-pause` | clean ×3; the writer waited 25.2 to 25.3 s | clean ×3; the writer waited 25.2 s |
 | `follower-pause` | clean ×3; the writer waited 8.7 to 12.0 s | clean ×3; the writer waited 9.2 to 11.2 s |
 | `follower-cut` | clean ×3; the writer waited 31.9 to 40.1 s | clean ×3; the writer waited 30.9 to 39.2 s |
 
 - **The defaults kept every promise on both releases.** Every message was stored exactly once and
-  in order in all 24 runs, and no send failed, as with librdkafka, against sarama's 6,758 to 11,205
+  in order in all 27 runs, and no send failed, as with librdkafka, against sarama's 6,758 to 11,205
   failed sends in `leader-kill-live` and kafka-go's 100 to 200. A request the leader holds past
   franz-go's 10-second wait, as it did in every `followers-pause` and `follower-cut` run and in
   four of the six `follower-pause` runs, is answered REQUEST_TIMED_OUT and sent again with the same
@@ -990,7 +1017,13 @@ its acknowledgement:
   acknowledgements came back 0.25 to 3.4 seconds after that, and 2.0 to 3.6. The helper's
   deliveries resumed 17.1 to 18.2 seconds after the kill on v1.22.2, and 17.6 to 18.4 on v1.20.7,
   and the checker's lag, from an acknowledgement to its delivery, peaked at 2.3 to 8.1 seconds a
-  run. The slow part was the reader's client, not the cluster, as the next bullet shows.
+  run. The three `leader-kill-steady` runs, with 4,991 to 5,001 values acknowledged before the
+  kill, showed the same: the new leader was seen 9.8 to 11.1 seconds after the kill, and
+  acknowledgements came back 3.6 to 5.1 seconds after that, later than in `leader-kill-live`, for
+  reasons not yet looked into; the helper's deliveries resumed 17.4 to 18.0 seconds after the
+  kill, 6.8 to 7.6 after the election and 2.6 to 3.2 after the writer's first acknowledgement. No
+  other client's reader trailed its own writer by more than 1.5 seconds in those runs. The slow
+  part was the reader's client, not the cluster, as the next bullet shows.
 - **franz-go dropped every second metadata request the reader sent, by a few milliseconds.** After
   a failed fetch, franz-go asks for fresh metadata, then waits before fetching again, 5 seconds once
   the waits reach their cap. It drops the request if its last refresh finished less than
@@ -1011,6 +1044,15 @@ its acknowledgement:
   shorten that, so v1.21.7's quicker resend of a timed-out request made no visible difference. And
   no record failed, so the 1484 fix had nothing to do (see franz-go's latest release); a
   calibration on it comes later.
+- **The fix for issue 1505 came through the table clean.** On 2026-10-31 the four rows ran again,
+  three times each, against https://github.com/twmb/franz-go/pull/1506 at its commit `477f464`,
+  built from `v1.22.2.mod` with that commit in place of v1.22.2. All 12 runs were clean and no
+  send failed. The writer waited 11.3 to 14.4 seconds in `leader-kill-live`, 25.2 to 25.3 in
+  `followers-pause` and 7.7 to 12.5 in `follower-pause`, close to v1.22.2's 10.7 to 15.1, 25.2 to
+  25.3 and 8.7 to 12.0. In `follower-cut` it waited 40.7 to 43.7 seconds, against 31.9 to 40.1,
+  but only because Kafka dropped the cut follower later, 41.1 to 43.9 seconds in against 32.3 to
+  40.4, and acknowledgements resumed as soon as it did. The reader still came back 17.2 to 18.4
+  seconds after the kill: the fix doesn't touch issue 1531.
 
 ## History format (the wire contract)
 
@@ -1287,7 +1329,7 @@ driftlab/
   a slow line and a cut line, docker pause and kill for the server, the lag measurement, and the
   32-run matrix. It found the first things nobody had reported: nats.go issues 2180 and 2181 (see
   Weekend 3 results).
-- **v1 (started 2026-10-13; the Go Kafka clients):** the three-broker cluster in
+- **v1 (done 2026-11-02, started 2026-10-13; the Go Kafka clients):** the three-broker cluster in
   `deploy/kafka.yaml`, explored by hand, and the decisions in v1 design. First exit reached on
   2026-10-14: the calibration pair reproduces, with franz-go v1.20.6 failing and v1.20.7 passing
   in all 12 runs (see v1 calibration results). The relay driver followed, and its first target,
@@ -1301,7 +1343,10 @@ driftlab/
   confluent-kafka-go's on 2026-10-24, with its idempotent producer and with librdkafka's defaults,
   after the same check (see confluent-kafka-go results), and franz-go's on 2026-10-28, with its
   defaults on v1.22.2, its latest release, two days after a first run on v1.20.7 (see franz-go
-  results). The version ends with the published table.
+  results), where the reader's late return after a leader crash gave a fifth upstream report,
+  franz-go issue 1531. On 2026-10-31 every client also ran a leader crash during steady writing
+  (see the steady kill), and on 2026-11-02 the table across the four went into README.md, which
+  ends the version.
 
 ## Beyond v0 (one line each, so v0 stays small)
 
