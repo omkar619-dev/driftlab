@@ -6,7 +6,8 @@
 > client calibrated or checked, all four fault tables run, with a leader crash during steady
 > writing added to each (see sarama, kafka-go, confluent-kafka-go and franz-go results), and the
 > table across the four published in README.md. The first ledger, Blnk, has been probed: a
-> transaction it answered `QUEUED` can be lost when its API server stops (see Blnk results).
+> transaction it answered `QUEUED` can be lost when its API server stops, and two smaller bugs
+> came up on the way (see Blnk results).
 
 ## What driftlab is
 
@@ -1065,10 +1066,12 @@ caller it recorded really is recorded. Blnk is driftlab's first ledger, and thes
 Python probes, standard library only, before a Blnk driver or ledger checks exist. They work from
 outside, through Blnk's API and docker, and read the ledger straight from Postgres.
 
-`deploy/blnk.yaml` runs Blnk v0.15.7, the latest release (tagged 2026-10-24), with Postgres 16 and
-Redis 7.2.4, in a compose project of its own. Its container names start with `blnk-`, no restart
-policy is set, so only a probe restarts what it stopped, and the API is published on the machine
-itself; `deploy/blnk.json` leaves the API's authentication off, as Blnk's default does.
+`deploy/blnk.yaml` runs Blnk v0.15.7, the latest release when these runs began (tagged
+2026-10-24; v0.15.8 followed on 2026-11-02 and changes only how held transfers expire), with
+Postgres 16 and Redis 7.2.4, in a compose project of its own. Its container names start with
+`blnk-`, no restart policy is set, so only a probe restarts what it stopped, and the API is
+published on the machine itself; `deploy/blnk.json` leaves the API's authentication off, as
+Blnk's default does.
 `scripts/blnk-smoke.py` checks a fresh stack with two queued transfers and the balances adding up
 to zero. It also shows how Blnk records a queued transaction: the row saved at queue time stays
 `QUEUED`, and the worker applies a copy of it whose reference ends in `_q`.
@@ -1126,15 +1129,30 @@ with 8 GB that also runs other services, so the rates are this machine's:
 - **The money was right every time.** Every balance matched the transfers applied to it, the total
   never changed, and no transfer was applied twice. The damage is to completeness: a caller holds
   a `201` and a transaction ID for a transfer the ledger has no record of.
-- **Two side findings, not losses.** Under load the background save sometimes deadlocked in
-  Postgres with the worker's batch update of the balances: 41 times in the 800-a-second run, which
-  had exactly 41 transfers applied straight from the queue with no `QUEUED` row, Blnk's fallback
-  when that save fails (transaction_queue.go L173–182). And the worker's batching, on by default,
-  kept picking up transfers already applied, failed the batch and redid it one transfer at a time:
-  about 15,300 "reference has already been used" refusals for 16,000 transfers, which is why
-  catching up took tens of seconds.
+- **Deadlocks between Blnk's own statements, not a loss.** Under load the background save
+  deadlocked in Postgres with the worker's batch update of the balances: 146 times across the rate
+  runs, 43 of them at 800 a second. Postgres aborted the save 132 times and the update 14 times.
+  An aborted save falls back to queueing the transfer anyway (transaction_queue.go L173–182), so it
+  was applied with no `QUEUED` row: 41 times at 800 a second. The cause is a Postgres detail.
+  `blnk.balances` has a `BEFORE UPDATE` trigger, and with one, Postgres locks the row before the
+  trigger runs and picks the lock by the columns the update names in `SET`, not by the values it
+  changes. Blnk's balance update names `currency`, part of the unique constraint
+  `unique_indicator_currency`, so it takes `FOR UPDATE`, the one row lock that the inserts'
+  foreign-key checks (`FOR KEY SHARE`) wait for; without `currency` in `SET` it would take
+  `FOR NO KEY UPDATE`, which they don't. `scripts/blnk-pg-lockdemo.sh` shows this on plain
+  Postgres 16 with two small tables.
+- **Batches built around work already done, not a loss either.** The worker's batching, on by
+  default, starts a batch from one queued transfer and adds others on the same balances. It skips
+  the others that are already applied, but not the one it starts from, which an earlier batch has
+  often applied already as one of its others. The batch then fails on that transfer's own
+  reference, and the worker tries the same batch a second time before it drops the task. At 800 a
+  second, 29,598 batches failed this way, from the tasks of 14,803 of the 16,000 transfers, while
+  654 batches worked and applied 15,970 transactions. Nothing wrong was written; how much this
+  slows the worker wasn't measured.
 
-Reported as https://github.com/blnkfinance/blnk/issues/418 on 2026-11-02, with the reproduction.
+Reported as https://github.com/blnkfinance/blnk/issues/418 on 2026-11-02, with the reproduction;
+the deadlocks went in as https://github.com/blnkfinance/blnk/issues/422, with the lock demo, and
+the batching as https://github.com/blnkfinance/blnk/issues/421, the same day.
 Next for ledgers: a Blnk driver that writes a history, ledger checks (a transaction answered and
 never recorded, one applied twice, a balance that doesn't match its transactions, a total that
 changed, a balance below zero without an overdraft), and a calibration on
@@ -1368,7 +1386,8 @@ driftlab/
     ├── blnk-probe-queued.py
     ├── blnk-probe-recheck.py
     ├── blnk-probe-rate.py
-    └── blnk-repro-queued-loss.py
+    ├── blnk-repro-queued-loss.py
+    └── blnk-pg-lockdemo.sh
 ```
 
 | Path | What it is |
@@ -1415,6 +1434,7 @@ driftlab/
 | `scripts/blnk-probe-recheck.py` | sorts a run of `blnk-probe-queued.py` again against the database as it is now |
 | `scripts/blnk-probe-rate.py` | queues transfers at a fixed rate between many balances, measures how far the saves fall behind the answers, and can kill the API server halfway |
 | `scripts/blnk-repro-queued-loss.py` | the short reproduction posted as Blnk issue 418, using only Blnk's API and docker |
+| `scripts/blnk-pg-lockdemo.sh` | the script posted with Blnk issue 422: on plain Postgres 16, a `BEFORE UPDATE` trigger makes an update that names a unique column in `SET` block foreign-key checks, even when the value doesn't change |
 
 ## Milestones
 
@@ -1450,8 +1470,9 @@ driftlab/
   ends the version.
 - **v2 (started 2026-11-02; ledgers):** Blnk v0.15.7 on the New PC, probed from outside with
   Python scripts before a driver exists. A transaction answered `QUEUED` can be lost when the API
-  server stops, reported as Blnk issue 418 (see Blnk results). The version ends with a Blnk driver
-  and ledger checks, calibrated on Blnk issue 408.
+  server stops, reported as Blnk issue 418; deadlocks and wasted batches came up on the way,
+  reported as 422 and 421 (see Blnk results). The version ends with a Blnk driver and ledger
+  checks, calibrated on Blnk issue 408.
 
 ## Beyond v0 (one line each, so v0 stays small)
 

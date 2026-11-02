@@ -158,9 +158,23 @@ Against Blnk, an open-source double-entry ledger for fintech products, at v0.15.
   at 400 and up to 6,011 at full speed, while every balance stayed consistent with the transfers
   that were applied. `scripts/blnk-repro-queued-loss.py` reproduces it.
   https://github.com/blnkfinance/blnk/issues/418 (reported 2026-11-02).
+- **Under load, its balance updates deadlock with its own transaction inserts.** A
+  `BEFORE UPDATE` trigger on the balances makes Postgres pick a row lock by the columns an update
+  names, not the values it changes, and Blnk's update names `currency`, which is in a unique
+  constraint. So each update takes the strongest row lock, the one the inserts' foreign-key checks
+  wait for. Postgres broke 146 such deadlocks in the rate runs; when it aborted the insert, Blnk
+  applied the transfer anyway, without its `QUEUED` record, 41 times at 800 a second.
+  `scripts/blnk-pg-lockdemo.sh` shows the lock on plain Postgres 16.
+  https://github.com/blnkfinance/blnk/issues/422 (reported 2026-11-02).
+- **Its batching mostly redoes work that's already done.** A batch starts from one queued transfer
+  and checks the others it adds, but not that one, which an earlier batch has often applied
+  already; the batch then fails on its reference and is tried once more. At 800 transfers a
+  second, 29,598 batches failed this way against 654 that worked. Nothing wrong was written.
+  https://github.com/blnkfinance/blnk/issues/421 (reported 2026-11-02).
 
-These runs used Python probes in `scripts/`, before a Blnk driver exists; the driver, the ledger
-checks and a calibration come next.
+All three are reported upstream and not yet confirmed by the maintainers. These runs used Python
+probes in `scripts/`, before a Blnk driver exists; the driver, the ledger checks and a calibration
+come next.
 
 Before any of that counted, driftlab was calibrated on a known, fixed bug,
 https://github.com/nats-io/nats.go/issues/2107. It fails v1.53.1 exactly as the issue describes,
@@ -263,6 +277,12 @@ The one for Blnk 418 needs Python 3 and docker, with Blnk running from `deploy/b
 ```bash
 docker compose -f deploy/blnk.yaml up -d
 python3 scripts/blnk-repro-queued-loss.py --container blnk-server
+```
+
+The one for Blnk 422 needs only docker; it starts a throwaway Postgres 16 and removes it after:
+
+```bash
+bash scripts/blnk-pg-lockdemo.sh
 ```
 
 ## More
