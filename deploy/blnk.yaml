@@ -1,0 +1,74 @@
+# Blnk, the open-source ledger, for driftlab's ledger runs: its API server, its
+# transaction worker, Redis for the queue and the balance locks, and Postgres for
+# the ledger itself, in a compose project of its own.
+#
+#   docker compose -f deploy/blnk.yaml up -d
+#
+# BLNK_IMAGE picks the release: 0.15.7 by default, 0.15.6 for the calibration on
+# Blnk issue 408. Releases don't share a database, so switch with
+# `docker compose -f deploy/blnk.yaml down -v` first, which deletes the ledger.
+#
+# Container names start with blnk-, so a fault can name what it hits, and no
+# restart policy is set, so only the driver restarts a container it stopped.
+# Only the API is published, and only on this machine.
+name: blnk
+
+services:
+  blnk-server:
+    image: ${BLNK_IMAGE:-jerryenebeli/blnk:0.15.7}
+    container_name: blnk-server
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["blnk migrate up && blnk start"]
+    ports:
+      - "127.0.0.1:5001:5001"
+    volumes:
+      - ./blnk.json:/blnk.json:ro
+    depends_on:
+      blnk-postgres:
+        condition: service_healthy
+      blnk-redis:
+        condition: service_healthy
+    # Healthy once the migrations ran and the API answers with the database up.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5001/health"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+
+  # The worker starts after the server, so the tables it needs exist.
+  blnk-worker:
+    image: ${BLNK_IMAGE:-jerryenebeli/blnk:0.15.7}
+    container_name: blnk-worker
+    entrypoint: ["blnk", "workers"]
+    volumes:
+      - ./blnk.json:/blnk.json:ro
+    depends_on:
+      blnk-server:
+        condition: service_healthy
+
+  blnk-redis:
+    image: redis:7.2.4
+    container_name: blnk-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  blnk-postgres:
+    image: postgres:16
+    container_name: blnk-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: blnk
+    volumes:
+      - blnk_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "blnk"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  blnk_pg_data:

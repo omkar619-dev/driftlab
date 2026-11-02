@@ -148,6 +148,20 @@ Against kaf-relay, a program that keeps Kafka clusters in sync by copying topics
 
 Both are reported upstream and not yet confirmed by the maintainers.
 
+Against Blnk, an open-source double-entry ledger for fintech products, at v0.15.7:
+
+- **A transaction it answered `201 QUEUED` can be lost, with no error, when its API server stops.**
+  Blnk's docs say it saves a queued transaction and then answers; in fact it answers first and
+  saves in the background, so a crash or a restart loses whatever is still waiting, and queue
+  recovery can't find it. On a 4-core test machine the saves fell behind the answers from 200
+  transfers a second, and stopping or killing the server lost 246 transfers at 100 a second, 851
+  at 400 and up to 6,011 at full speed, while every balance stayed consistent with the transfers
+  that were applied. `scripts/blnk-repro-queued-loss.py` reproduces it.
+  https://github.com/blnkfinance/blnk/issues/418 (reported 2026-11-02).
+
+These runs used Python probes in `scripts/`, before a Blnk driver exists; the driver, the ledger
+checks and a calibration come next.
+
 Before any of that counted, driftlab was calibrated on a known, fixed bug,
 https://github.com/nats-io/nats.go/issues/2107. It fails v1.53.1 exactly as the issue describes,
 with 80 messages never delivered, and it passes v1.54.0, which has the fix. The Kafka side was
@@ -244,6 +258,13 @@ The one for sarama 3843 is a test with mock brokers, and it fails while the bug 
 go test -C drivers/sarama -run TestRetryWaitsForSilentBroker -count=1 -v ./repro3843
 ```
 
+The one for Blnk 418 needs Python 3 and docker, with Blnk running from `deploy/blnk.yaml`:
+
+```bash
+docker compose -f deploy/blnk.yaml up -d
+python3 scripts/blnk-repro-queued-loss.py --container blnk-server
+```
+
 ## More
 
 - [DESIGN.md](https://github.com/omkar619-dev/driftlab/blob/main/DESIGN.md): the principles, the
@@ -252,5 +273,6 @@ go test -C drivers/sarama -run TestRetryWaitsForSilentBroker -count=1 -v ./repro
   confluent-kafka-go are checked, and the fault tables of all four are done, each with its
   strongest settings and with its defaults, which for franz-go are the same, and summed up in the
   table above. A relay driver tests programs that copy topics between clusters.
+- v2, ledgers, has started with Blnk: probed so far, with a driver and ledger checks next.
 
 Apache-2.0.

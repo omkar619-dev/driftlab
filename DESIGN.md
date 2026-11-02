@@ -5,7 +5,8 @@
 > produced two upstream reports (see Weekend 3 results). v1, the Go Kafka clients, is done: every
 > client calibrated or checked, all four fault tables run, with a leader crash during steady
 > writing added to each (see sarama, kafka-go, confluent-kafka-go and franz-go results), and the
-> table across the four published in README.md.
+> table across the four published in README.md. The first ledger, Blnk, has been probed: a
+> transaction it answered `QUEUED` can be lost when its API server stops (see Blnk results).
 
 ## What driftlab is
 
@@ -1054,6 +1055,92 @@ its acknowledgement:
   40.4, and acknowledgements resumed as soon as it did. The reader still came back 17.2 to 18.4
   seconds after the kill: the fix doesn't touch issue 1531.
 
+## Blnk results
+
+Blnk (https://github.com/blnkfinance/blnk) is an open-source double-entry ledger in Go for fintech
+products. It has four parts: an API server, a worker that applies transactions, Redis for its
+queue and balance locks, and Postgres for the ledger itself. A ledger makes two promises a checker
+can hold it to: what it records adds up, every debit matched by a credit, and what it tells a
+caller it recorded really is recorded. Blnk is driftlab's first ledger, and these first runs used
+Python probes, standard library only, before a Blnk driver or ledger checks exist. They work from
+outside, through Blnk's API and docker, and read the ledger straight from Postgres.
+
+`deploy/blnk.yaml` runs Blnk v0.15.7, the latest release (tagged 2026-10-24), with Postgres 16 and
+Redis 7.2.4, in a compose project of its own. Its container names start with `blnk-`, no restart
+policy is set, so only a probe restarts what it stopped, and the API is published on the machine
+itself; `deploy/blnk.json` leaves the API's authentication off, as Blnk's default does.
+`scripts/blnk-smoke.py` checks a fresh stack with two queued transfers and the balances adding up
+to zero. It also shows how Blnk records a queued transaction: the row saved at queue time stays
+`QUEUED`, and the worker applies a copy of it whose reference ends in `_q`.
+
+**The promise.** Blnk's concurrency guide says "Blnk saves the transaction in a `QUEUED` state and
+returns that status to the caller", and its lifecycle page calls `QUEUED` "received" and says each
+state change "is stored as a separate record in the database". In v0.15.7 the API answers first:
+`POST /transactions` replies `201 QUEUED` as soon as `QueueTransaction` returns
+(api/transactions.go L186–195), and `QueueTransaction` hands the transaction to a goroutine that
+saves it and queues it afterwards, 20 at a time (transaction_queue.go L121–131 and L157–184). A
+server that stops before that goroutine runs loses a transaction it has already answered for, and
+queue recovery, which looks for saved `QUEUED` rows, can't find it. A shutdown waits for HTTP
+requests, not for those goroutines (cmd/server.go L322–336), and with Blnk's own compose file,
+where `/bin/sh -c "blnk migrate up && blnk start"` is the container's first process, `docker stop`
+doesn't reach Blnk at all. `skip_queue` saves before it answers (transaction_queue.go L107–120).
+The worker is careful: it locks both balances in Redis, reads them again, saves the transaction
+and both balances in one database transaction, and updates a balance only if its version hasn't
+changed (database/balance.go L1030–1031).
+
+**The probes.** `scripts/blnk-probe-queued.py` sends 0.01 transfers between two balances from 8
+threads for 12 seconds, about 850 a second, while it stops the API server, kills it, or freezes
+Postgres for 3 seconds and stops the server 2 seconds in. It then reads `blnk.transactions` and
+sorts every transfer answered `201 QUEUED`: applied; pending, saved but not applied, which queue
+recovery should fix; or lost, with no row at all. It also checks the balances against the
+transfers applied. `scripts/blnk-probe-recheck.py` sorts a run again later.
+`scripts/blnk-probe-rate.py` sends at a fixed rate between 20 balances for 20 seconds, and every
+half second counts the transfers answered `201` and the rows saved: the difference is what a crash
+at that moment would lose. `scripts/blnk-repro-queued-loss.py` is the short reproduction posted
+upstream, using only the API and docker. The runs took place on 2026-11-02, on a 4-core machine
+with 8 GB that also runs other services, so the rates are this machine's:
+
+| Run | Answered `201 QUEUED` | Never saved | Balances |
+|---|---|---|---|
+| `docker stop` at 5 s, at full speed | 10,227 | 6,011: every transfer answered from 4.96 s on | all matched |
+| `docker kill` at 5 s, at full speed | 7,974 | 2,267, answered from 2.37 s to the kill | all matched |
+| Postgres frozen from 4 to 7 s, stop at 6 s | 9,237 | 5,307, answered from 2.87 s to 9.06 s | all matched |
+| kill at 10 s, 100 a second | 1,772 | 246 | all matched |
+| kill at 10 s, 400 a second | 7,126 | 851 | all matched |
+| the reproduction posted upstream, kill at 5 s | 5,434 | 1,579, answered from 2.77 s to the kill | not checked |
+
+- **The answers outran the saves.** With no fault, the saves kept up at 100 transfers a second but
+  fell 1,498 behind at 200, 2,957 at 400 and 12,601 at 800, while every `201` still came back in 1
+  to 2 ms: Blnk doesn't slow down or refuse while it's behind. Each crash lost the backlog of that
+  moment in one block; in the `docker stop` run everything answered up to 4.958 s was applied and
+  everything from 4.959 s on was lost. While Postgres was frozen, Blnk answered `201 QUEUED` 2,611
+  times. At 100 a second, a slowdown just before the kill had put the saves 253 behind, and the
+  kill lost 246; what caused the slowdown isn't known.
+- **The lost transfers stayed lost.** Twenty minutes later, after Blnk's own recovery pass, the
+  counts were unchanged, while the 530 left pending in the kill run had been applied: recovery
+  works for saved transactions and can't see the rest. A recovery pass also re-ran transfers
+  already applied, and the reference check refused them, 99 times in one pass.
+- **`docker stop` never stopped Blnk.** It kept answering for the whole 10-second timeout and was
+  then killed, without logging "Shutting down server...": the container's first process is
+  `/bin/sh`.
+- **The money was right every time.** Every balance matched the transfers applied to it, the total
+  never changed, and no transfer was applied twice. The damage is to completeness: a caller holds
+  a `201` and a transaction ID for a transfer the ledger has no record of.
+- **Two side findings, not losses.** Under load the background save sometimes deadlocked in
+  Postgres with the worker's batch update of the balances: 41 times in the 800-a-second run, which
+  had exactly 41 transfers applied straight from the queue with no `QUEUED` row, Blnk's fallback
+  when that save fails (transaction_queue.go L173–182). And the worker's batching, on by default,
+  kept picking up transfers already applied, failed the batch and redid it one transfer at a time:
+  about 15,300 "reference has already been used" refusals for 16,000 transfers, which is why
+  catching up took tens of seconds.
+
+Reported as https://github.com/blnkfinance/blnk/issues/418 on 2026-11-02, with the reproduction.
+Next for ledgers: a Blnk driver that writes a history, ledger checks (a transaction answered and
+never recorded, one applied twice, a balance that doesn't match its transactions, a total that
+changed, a balance below zero without an overdraft), and a calibration on
+https://github.com/blnkfinance/blnk/issues/408, a repeated partial commit of a hold that 0.15.6
+applied twice and 0.15.7 doesn't.
+
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -1269,12 +1356,19 @@ driftlab/
 │   ├── compose.yaml
 │   ├── kafka.yaml
 │   ├── kafka-source.yaml
+│   ├── blnk.yaml
+│   ├── blnk.json
 │   └── nft/
 └── scripts/
     ├── matrix.sh
     ├── kafka-calibrate.sh
     ├── sarama-calibrate.sh
-    └── compare-nats.sh
+    ├── compare-nats.sh
+    ├── blnk-smoke.py
+    ├── blnk-probe-queued.py
+    ├── blnk-probe-recheck.py
+    ├── blnk-probe-rate.py
+    └── blnk-repro-queued-loss.py
 ```
 
 | Path | What it is |
@@ -1309,11 +1403,18 @@ driftlab/
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `deploy/kafka-source.yaml` | a one-broker Kafka cluster in a compose project of its own: the source for programs that copy messages between two clusters |
+| `deploy/blnk.yaml` | Blnk, the open-source ledger, with its worker, Redis and Postgres, in a compose project of their own; `BLNK_IMAGE` picks the release, 0.15.7 unless set |
+| `deploy/blnk.json` | Blnk's config for that compose file: where Postgres and Redis are, and the API's port |
 | `deploy/nft/` | the image the cut fault of the relay and sarama drivers runs `nft` from: Alpine with nftables, built once with `docker build -t driftlab-nft deploy/nft` |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 | `scripts/kafka-calibrate.sh` | runs v1's calibration (2 franz-go versions × 2 scenarios × 3 repeats) and checks every verdict against the expected one |
 | `scripts/sarama-calibrate.sh` | runs the sarama calibration (2 commits and 2 releases × 3 scenarios × 3 repeats), checks every verdict against the expected one, and counts each run's out-of-order rejections; `RUNS` and `ARGS` work as in `compare-nats.sh` |
 | `scripts/compare-nats.sh` | runs the eight NATS scenarios against two or more driver builds, such as a nats.go pull request and the commit it starts from, and prints their verdicts, recovery and lag side by side; `RUNS` repeats them, `SCENARIOS` picks some, and `ARGS` adds driver flags such as `-block-disconnect` |
+| `scripts/blnk-smoke.py` | a first check of a fresh Blnk: two queued transfers, and the balances adding up to zero |
+| `scripts/blnk-probe-queued.py` | queues transfers as fast as Blnk answers while it stops or kills the API server, or freezes Postgres, then sorts every transfer answered `201 QUEUED` as applied, pending or lost |
+| `scripts/blnk-probe-recheck.py` | sorts a run of `blnk-probe-queued.py` again against the database as it is now |
+| `scripts/blnk-probe-rate.py` | queues transfers at a fixed rate between many balances, measures how far the saves fall behind the answers, and can kill the API server halfway |
+| `scripts/blnk-repro-queued-loss.py` | the short reproduction posted as Blnk issue 418, using only Blnk's API and docker |
 
 ## Milestones
 
@@ -1347,6 +1448,10 @@ driftlab/
   franz-go issue 1531. On 2026-10-31 every client also ran a leader crash during steady writing
   (see the steady kill), and on 2026-11-02 the table across the four went into README.md, which
   ends the version.
+- **v2 (started 2026-11-02; ledgers):** Blnk v0.15.7 on the New PC, probed from outside with
+  Python scripts before a driver exists. A transaction answered `QUEUED` can be lost when the API
+  server stops, reported as Blnk issue 418 (see Blnk results). The version ends with a Blnk driver
+  and ledger checks, calibrated on Blnk issue 408.
 
 ## Beyond v0 (one line each, so v0 stays small)
 

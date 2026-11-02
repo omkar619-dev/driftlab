@@ -1,0 +1,12 @@
+{
+  "project_name": "driftlab-blnk",
+  "data_source": {
+    "dns": "postgres://postgres:password@blnk-postgres:5432/blnk?sslmode=disable"
+  },
+  "redis": {
+    "dns": "blnk-redis:6379"
+  },
+  "server": {
+    "port": "5001"
+  }
+}
