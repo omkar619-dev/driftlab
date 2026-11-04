@@ -1149,6 +1149,17 @@ with 8 GB that also runs other services, so the rates are this machine's:
   second, 29,598 batches failed this way, from the tasks of 14,803 of the 16,000 transfers, while
   654 batches worked and applied 15,970 transactions. Nothing wrong was written; how much this
   slows the worker wasn't measured.
+- **The hot lane tries again even after a batch worked, not a loss either.** With Blnk's hot lane
+  on (off by default), the worker runs the normal batch attempt and then the hot-lane one for every
+  task from the hot queue, and the second result replaces the first (cmd/workers.go L66–69).
+  `scripts/blnk-probe-hotlane.py` makes one pair of balances hot, which takes 3 lock failures on it
+  and an empty normal queue, and then sends 1,000 transfers that all take the hot lane. On
+  2026-11-03, 9 batches applied all of them, and 8 of the tasks that led those batches then failed
+  2 more batches each on the transfer they had just applied; the other 754 tasks failed 3 batches
+  each instead of 2, and the single path refused all 1,000 tasks as already used. With the hot lane
+  off, the same probe found none of the first kind, 2 failed batches per task and 952 refusals.
+  https://github.com/blnkfinance/blnk/pull/423, a fix for 421 from another contributor, removes
+  the extra try as well.
 
 Reported as https://github.com/blnkfinance/blnk/issues/418 on 2026-11-02, with the reproduction;
 the deadlocks went in as https://github.com/blnkfinance/blnk/issues/422, with the lock demo, and
@@ -1376,6 +1387,7 @@ driftlab/
 │   ├── kafka-source.yaml
 │   ├── blnk.yaml
 │   ├── blnk.json
+│   ├── blnk-hotlane.yaml
 │   └── nft/
 └── scripts/
     ├── matrix.sh
@@ -1387,7 +1399,8 @@ driftlab/
     ├── blnk-probe-recheck.py
     ├── blnk-probe-rate.py
     ├── blnk-repro-queued-loss.py
-    └── blnk-pg-lockdemo.sh
+    ├── blnk-pg-lockdemo.sh
+    └── blnk-probe-hotlane.py
 ```
 
 | Path | What it is |
@@ -1424,6 +1437,7 @@ driftlab/
 | `deploy/kafka-source.yaml` | a one-broker Kafka cluster in a compose project of its own: the source for programs that copy messages between two clusters |
 | `deploy/blnk.yaml` | Blnk, the open-source ledger, with its worker, Redis and Postgres, in a compose project of their own; `BLNK_IMAGE` picks the release, 0.15.7 unless set |
 | `deploy/blnk.json` | Blnk's config for that compose file: where Postgres and Redis are, and the API's port |
+| `deploy/blnk-hotlane.yaml` | turns Blnk's hot lane on, on top of `blnk.yaml`, for both the API server, which picks a transfer's lane, and the worker |
 | `deploy/nft/` | the image the cut fault of the relay and sarama drivers runs `nft` from: Alpine with nftables, built once with `docker build -t driftlab-nft deploy/nft` |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 | `scripts/kafka-calibrate.sh` | runs v1's calibration (2 franz-go versions × 2 scenarios × 3 repeats) and checks every verdict against the expected one |
@@ -1435,6 +1449,7 @@ driftlab/
 | `scripts/blnk-probe-rate.py` | queues transfers at a fixed rate between many balances, measures how far the saves fall behind the answers, and can kill the API server halfway |
 | `scripts/blnk-repro-queued-loss.py` | the short reproduction posted as Blnk issue 418, using only Blnk's API and docker |
 | `scripts/blnk-pg-lockdemo.sh` | the script posted with Blnk issue 422: on plain Postgres 16, a `BEFORE UPDATE` trigger makes an update that names a unique column in `SET` block foreign-key checks, even when the value doesn't change |
+| `scripts/blnk-probe-hotlane.py` | makes one pair of balances hot, sends transfers through Blnk's hot lane, and counts the batches the worker builds around transfers already applied, including the ones the same task had just applied; with the hot lane off it is its own control |
 
 ## Milestones
 

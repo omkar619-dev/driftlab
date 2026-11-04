@@ -1,0 +1,14 @@
+# Blnk's hot lane, on top of blnk.yaml, for scripts/blnk-probe-hotlane.py. The hot
+# lane is off by default; both the API server, which picks a transfer's lane, and the
+# worker, which runs the hot queue, have to see the setting.
+#
+#   docker compose -f deploy/blnk.yaml -f deploy/blnk-hotlane.yaml up -d
+#
+# Run blnk.yaml alone again (docker compose -f deploy/blnk.yaml up -d) to turn it off.
+services:
+  blnk-server:
+    environment:
+      BLNK_QUEUE_ENABLE_HOT_LANE: "true"
+  blnk-worker:
+    environment:
+      BLNK_QUEUE_ENABLE_HOT_LANE: "true"

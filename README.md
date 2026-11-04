@@ -169,7 +169,8 @@ Against Blnk, an open-source double-entry ledger for fintech products, at v0.15.
 - **Its batching mostly redoes work that's already done.** A batch starts from one queued transfer
   and checks the others it adds, but not that one, which an earlier batch has often applied
   already; the batch then fails on its reference and is tried once more. At 800 transfers a
-  second, 29,598 batches failed this way against 654 that worked. Nothing wrong was written.
+  second, 29,598 batches failed this way against 654 that worked, and with the hot lane on the
+  worker tries again even after a batch worked. Nothing wrong was written.
   https://github.com/blnkfinance/blnk/issues/421 (reported 2026-11-02).
 
 All three are reported upstream and not yet confirmed by the maintainers. These runs used Python
