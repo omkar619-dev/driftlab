@@ -23,8 +23,9 @@ Then it reads the worker's log since step 3. A batch that fails on a reference
 already used names the task it started from. A task's own transaction ID is in
 Postgres only if the task applied its transfer itself, so a task whose ID is
 there under the very reference its failed batch names had already applied that
-transfer when it built the batch. With the hot lane off, the same run is the
-control: the pair stays normal.
+transfer when it built the batch. It counts the batches that worked, and the
+transfers applied one at a time, in Postgres. With the hot lane off, the same
+run is the control: the pair stays normal.
 
     docker compose -f deploy/blnk.yaml -f deploy/blnk-hotlane.yaml up -d
     python3 scripts/blnk-probe-hotlane.py
@@ -176,25 +177,38 @@ def wait_idle(a, b, step, answered, limit=900):
     raise SystemExit(f"the worker didn't finish within {limit} s")
 
 
+def applied_in(step):
+    """How the worker applied a step's transfers: the size of each batch, and how many
+    it applied one at a time. Its log can't tell: it says "Transaction ... processed
+    successfully" whenever ProcessQueuedTransaction succeeds, which in v0.15.7 includes
+    a batch that worked on its second try (cmd/workers.go L79 and L140), and in
+    https://github.com/blnkfinance/blnk/pull/423 is every task that worked. Blnk's
+    journal stamps every row with the time its database transaction began, and the
+    connection that wrote it, so the transfers one batch applied share a stamp. A
+    batch has at least 2 (transaction_coalescing.go, v0.15.7, L81), so a transfer with
+    a stamp of its own was applied by the single path."""
+    sizes = [int(row[0]) for row in psql(
+        "select count(*) from blnk.transactions t join blnk.transaction_journal j "
+        "on j.transaction_id = t.transaction_id and j.action_type = 'INSERT' "
+        f"where t.reference like '{RUN}-{step}-%' and t.status = 'APPLIED' "
+        "group by j.timestamp, j.backend_pid")]
+    return sorted(n for n in sizes if n > 1), sizes.count(1)
+
+
 def read_worker(since):
-    """Reads the worker's log since step 3: the batches that worked, the transfers it
-    applied one at a time, the batches that failed on a step-3 reference already
-    used, and the step-3 transfers the single path refused as already used."""
-    worked, singles, failed, refused = [], 0, [], 0
+    """Reads the worker's log since step 3: the batches that failed on a step-3
+    reference already used, and the step-3 transfers the single path refused as
+    already used."""
+    failed, refused = [], 0
     for line in log_lines("blnk-worker", since):
-        if 'msg="Transactions processed successfully"' in line:
-            size = re.search(r"batch_size=(\d+)", line)
-            worked.append(int(size.group(1)) if size else 0)
-        elif re.search(r'msg="Transaction txn_\S+ processed successfully"', line):
-            singles += 1
-        elif "failed open" in line and "already been used" in line:
+        if "failed open" in line and "already been used" in line:
             match = FAILED.search(line)
             if match and match.group(2).startswith(f"{RUN}-3-"):
                 failed.append({"batch_size": int(match.group(1)), "reference": match.group(2),
                                "task": match.group(3)})
         elif 'msg="transaction validation failed"' in line and f"reference {RUN}-3-" in line:
             refused += 1
-    return worked, singles, failed, refused
+    return failed, refused
 
 
 def own_rows(ids):
@@ -268,7 +282,8 @@ def main():
                       f"where reference like '{RUN}-3-%' and right(reference, 2) <> '_q' group by 1"))
     promoted = sum(1 for line in log_lines("blnk-server", since)
                    if "Promoted hot pair to hot queue" in line and a in line)
-    worked, singles, failed, refused = read_worker(since)
+    worked, singles = applied_in(3)
+    failed, refused = read_worker(since)
     per_task = Counter(entry["task"] for entry in failed)
     rows = own_rows(per_task)
     again = {task: row for task, row in rows.items()

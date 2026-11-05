@@ -1164,6 +1164,45 @@ with 8 GB that also runs other services, so the rates are this machine's:
 Reported as https://github.com/blnkfinance/blnk/issues/418 on 2026-11-02, with the reproduction;
 the deadlocks went in as https://github.com/blnkfinance/blnk/issues/422, with the lock demo, and
 the batching as https://github.com/blnkfinance/blnk/issues/421, the same day.
+
+**PR 423, tested.** PR 423 makes both changes that 421 suggested: a task whose transfer an earlier
+batch has already applied is acknowledged before a batch is built around it, and each task tries a
+batch only once. On 2026-11-04 the rate probe and the hot-lane probe, on and off, ran against the
+PR's first commit, 5d66318, built from source (`docker build -t blnk:pr423 .` in a clone, started
+with `BLNK_IMAGE=blnk:pr423`), on the same machine as the v0.15.7 runs. Balances matched in every
+run.
+
+| 800 transfers a second for 20 s, across 20 balances | v0.15.7 | PR 423 |
+|---|---|---|
+| batches that failed on a reference already used | 29,598 | 70 |
+| from the first save to the last background save | 66.3 s | 68.9 s |
+| from the first save to the last transfer applied | 182.4 s | 76.2 s |
+
+| One pair, 1,000 transfers at 100 a second | v0.15.7, hot lane on | PR 423, on | v0.15.7, off | PR 423, off |
+|---|---|---|---|---|
+| batches that failed on one of the 1,000 references, already used | 2,278 | 0 | 1,881 | 59 |
+| tasks that applied their own transfer, then failed a batch on it | 8 | 0 | 0 | 0 |
+| tasks the single path refused as already used | 1,000 | 0 | 952 | 58 |
+| time to clear the backlog sent first, about 3,100 (on) or 4,700 (off) | 79 s | 15 s | 171 s | 33 s |
+
+So at 800 a second the worker now finishes about 7 s after the last background save instead of
+about 116 s. The failures left come from a race between the normal lane's workers, which run 4
+tasks at a time by default: the new check runs before the balance-set lock is taken
+(transaction_coalescing.go L69 and L168 at 5d66318), so another task's batch can apply the transfer
+in between. In 55 of the 59, and 56 of the 70, the batch failed on the task's own transfer, whose
+transaction ID isn't in `blnk.transactions`; the other 4 and 14 failed on another transfer in the
+batch and then applied their own one at a time, as before. The hot lane runs one task at a time and
+had none. The deadlock from 422 is unchanged: 39 at 800 a second (43 on v0.15.7), 36 of them on the
+background save. The results went on the PR on 2026-11-05, and its author then added the check
+again once the lock is held, in 9157478, not run here yet.
+
+The hot-lane probe counted the transfers applied one at a time by the worker's log line
+`Transaction %s processed successfully`, which the worker writes whenever `ProcessQueuedTransaction`
+succeeds: in v0.15.7 that includes a batch that worked on its second try, and in PR 423 every task
+that worked. So it printed 8 for v0.15.7 with the hot lane off, where the right count is 4, and
+1,001 and 946 for PR 423, where it is 11 and 10. It now counts the batches and the transfers
+applied one at a time in Postgres, by the database transaction that wrote each one.
+
 Next for ledgers: a Blnk driver that writes a history, ledger checks (a transaction answered and
 never recorded, one applied twice, a balance that doesn't match its transactions, a total that
 changed, a balance below zero without an overdraft), and a calibration on
