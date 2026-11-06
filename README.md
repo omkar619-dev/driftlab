@@ -18,6 +18,9 @@ judged again after a checker fix without re-running anything.
 
 ## Findings so far
 
+Ten issues reported to five projects so far: four are fixed, and fixes for three more are in
+review.
+
 Against nats.go, the Go client for NATS JetStream, at v1.53.1 and v1.54.0:
 
 - **The push ordered consumer, and the KV watchers built on it, go silent for up to about 14
@@ -58,7 +61,8 @@ Against franz-go, the Go client for Kafka:
   10 seconds instead of 5. With the defaults it came back 17 to 18 seconds after the kill in all
   twelve leader crashes, three of them during steady writing; with the limit lowered to 4.5 seconds
   it came back 2 to 3 seconds after the election, but a request was again dropped at the new line.
-  https://github.com/twmb/franz-go/issues/1531 (reported 2026-10-31).
+  https://github.com/twmb/franz-go/issues/1531 (reported 2026-10-31). Another contributor
+  reproduced it on 2026-11-06, with franz-go's fake cluster and on a real one.
 
 Against sarama, another Go client for Kafka, at v1.61.1:
 
@@ -71,7 +75,7 @@ Against sarama, another Go client for Kafka, at v1.61.1:
   reproduces it with mock brokers. https://github.com/IBM/sarama/issues/3843 (reported
   2026-10-20). A maintainer suggested copying the Java client, which refreshes metadata before a
   retry only when the error says it is stale, and https://github.com/IBM/sarama/pull/3849 does
-  that; it is waiting for review.
+  that; it is in review.
 - **With its default settings, a leader crash loses acknowledged messages.** By default sarama
   waits only for the partition's leader to store a write, which Kafka documents can lose messages
   the leader acknowledged if it dies before a follower copies them; Kafka's own Java producer has
@@ -157,7 +161,10 @@ Against Blnk, an open-source double-entry ledger for fintech products, at v0.15.
   transfers a second, and stopping or killing the server lost 246 transfers at 100 a second, 851
   at 400 and up to 6,011 at full speed, while every balance stayed consistent with the transfers
   that were applied. `scripts/blnk-repro-queued-loss.py` reproduces it.
-  https://github.com/blnkfinance/blnk/issues/418 (reported 2026-11-02).
+  https://github.com/blnkfinance/blnk/issues/418 (reported 2026-11-02). Fixed by
+  https://github.com/blnkfinance/blnk/pull/425, which saves a transfer before it answers: on
+  Blnk's main, killing the server, and stopping it with Postgres frozen, lost nothing it had
+  answered.
 - **Under load, its balance updates deadlock with its own transaction inserts.** A
   `BEFORE UPDATE` trigger on the balances makes Postgres pick a row lock by the columns an update
   names, not the values it changes, and Blnk's update names `currency`, which is in a unique
@@ -165,17 +172,23 @@ Against Blnk, an open-source double-entry ledger for fintech products, at v0.15.
   wait for. Postgres broke 146 such deadlocks in the rate runs; when it aborted the insert, Blnk
   applied the transfer anyway, without its `QUEUED` record, 41 times at 800 a second.
   `scripts/blnk-pg-lockdemo.sh` shows the lock on plain Postgres 16.
-  https://github.com/blnkfinance/blnk/issues/422 (reported 2026-11-02).
+  https://github.com/blnkfinance/blnk/issues/422 (reported 2026-11-02). Fixed by
+  https://github.com/blnkfinance/blnk/pull/424, which leaves `currency` out of the update: on
+  Blnk's main, Postgres broke no deadlocks in six runs.
 - **Its batching mostly redoes work that's already done.** A batch starts from one queued transfer
   and checks the others it adds, but not that one, which an earlier batch has often applied
   already; the batch then fails on its reference and is tried once more. At 800 transfers a
   second, 29,598 batches failed this way against 654 that worked, and with the hot lane on the
   worker tries again even after a batch worked. Nothing wrong was written.
-  https://github.com/blnkfinance/blnk/issues/421 (reported 2026-11-02).
+  https://github.com/blnkfinance/blnk/issues/421 (reported 2026-11-02). Fixed by
+  https://github.com/blnkfinance/blnk/pull/423, from another contributor, which driftlab tested
+  before it was merged: on Blnk's main, at 800 a second, the worker applied the last transfer 2.5
+  seconds after the last save, not 116.
 
-All three are reported upstream and not yet confirmed by the maintainers. These runs used Python
-probes in `scripts/`, before a Blnk driver exists; the driver, the ledger checks and a calibration
-come next.
+All three were fixed in Blnk's main on 2026-11-05, three days after the reports, and driftlab ran
+the same probes against it, at `cb48a92`, on 2026-11-06. None of the fixes is in a release yet.
+These runs used Python probes in `scripts/`, before a Blnk driver exists; the driver, the ledger
+checks and a calibration come next.
 
 Before any of that counted, driftlab was calibrated on a known, fixed bug,
 https://github.com/nats-io/nats.go/issues/2107. It fails v1.53.1 exactly as the issue describes,
@@ -294,6 +307,7 @@ bash scripts/blnk-pg-lockdemo.sh
   confluent-kafka-go are checked, and the fault tables of all four are done, each with its
   strongest settings and with its defaults, which for franz-go are the same, and summed up in the
   table above. A relay driver tests programs that copy topics between clusters.
-- v2, ledgers, has started with Blnk: probed so far, with a driver and ledger checks next.
+- v2, ledgers, has started with Blnk: three issues found with probes, all three fixed in Blnk's
+  main, with a driver and ledger checks next.
 
 Apache-2.0.

@@ -1194,7 +1194,8 @@ transaction ID isn't in `blnk.transactions`; the other 4 and 14 failed on anothe
 batch and then applied their own one at a time, as before. The hot lane runs one task at a time and
 had none. The deadlock from 422 is unchanged: 39 at 800 a second (43 on v0.15.7), 36 of them on the
 background save. The results went on the PR on 2026-11-05, and its author then added the check
-again once the lock is held, in 9157478, not run here yet.
+again once the lock is held, in 9157478; the PR was merged with it the same day, and the runs on
+Blnk's main below include it.
 
 The hot-lane probe counted the transfers applied one at a time by the worker's log line
 `Transaction %s processed successfully`, which the worker writes whenever `ProcessQueuedTransaction`
@@ -1202,6 +1203,73 @@ succeeds: in v0.15.7 that includes a batch that worked on its second try, and in
 that worked. So it printed 8 for v0.15.7 with the hot lane off, where the right count is 4, and
 1,001 and 946 for PR 423, where it is 11 and 10. It now counts the batches and the transfers
 applied one at a time in Postgres, by the database transaction that wrote each one.
+
+**All three fixed, and run again on Blnk's main.** All three issues were closed on 2026-11-05. PR
+423 fixed 421 and was merged with 9157478. https://github.com/blnkfinance/blnk/pull/424 fixed 422
+by leaving `currency` out of the balance update. https://github.com/blnkfinance/blnk/pull/425
+fixed 418: the API now saves and queues a transfer before it answers, 20 saves at a time at most,
+answers `409` to a reference already used and `404` to a balance that doesn't exist, and Blnk's
+compose file starts it with `exec blnk start`. https://github.com/blnkfinance/blnk/pull/426,
+merged with it, drops the `data_change` NOTIFY triggers in a migration and leaves alone the
+`transaction_journal` trigger, which the probes read. None of them is in a release yet; the latest
+is still v0.15.8. On 2026-11-06 the queued, rate and hot-lane probes ran against main at cb48a92,
+built from source like PR 423 (`blnk:main-cb48a92`), on the same machine. The stack went
+`down -v` first: with the migration, the two versions can't share a database.
+
+| Run | v0.15.7, answered `201 QUEUED` | never saved | main, answered `201 QUEUED` | never saved |
+|---|---|---|---|---|
+| `docker stop` at 5 s, at full speed | 10,227 | 6,011 | 5,927 | 0 |
+| `docker kill` at 5 s, at full speed | 7,974 | 2,267 | 4,821 | 0 |
+| Postgres frozen from 4 to 7 s, stop at 6 s | 9,237 | 5,307 | 4,176 | 0 |
+
+- **Nothing answered was lost.** On main every transfer answered `201 QUEUED` was applied, none was
+  left pending, and the balances matched in all six runs. Fewer were answered in the same 12
+  seconds, because each answer now waits for its save. Some requests got no `201`, an error or no
+  answer while the server was down: 346 in the kill run and 116 in the frozen-Postgres run. 2 of
+  them in each run were saved and applied anyway, because the server died between the save and
+  the answer, so the caller can't know how they ended, and only a retry can settle it. With PR 425
+  a retry with the same reference is answered `409` instead of being applied twice; driftlab
+  didn't run a retry.
+- **The stop run proves less than the other two.** `deploy/blnk.yaml` still starts Blnk under
+  `/bin/sh`, so `docker stop` waited out its 10 seconds and killed Blnk at about 15 s, after the
+  probe had stopped sending at 12 s: nothing was in flight. In the frozen-Postgres run, with
+  `-t 3`, the kill came at about 9 s, while transfers were still being sent, so that run and the
+  kill run are the evidence. Neither stop logged "Shutting down server...". A stop that reaches
+  Blnk needs `exec blnk start` in `deploy/blnk.yaml` too, as Blnk's own compose file now has.
+- **No deadlocks.** Postgres logged no "deadlock detected" in any of the six runs, against 43 at
+  800 a second on v0.15.7 and 39 on PR 423's first commit, and no transfer was applied without its
+  `QUEUED` row, against 41 and 36. The worker logged no failed balance update; two batches in the
+  frozen-Postgres run failed on a lock timeout.
+
+| 800 transfers a second, 16,000 across 20 balances | v0.15.7 | PR 423's first commit | main |
+|---|---|---|---|
+| batches that failed on a reference already used | 29,598 | 70 | 192 |
+| of them, on the task's own transfer | not counted | 56 | 0 |
+| from the first save to the last save | 66.3 s | 68.9 s | 24.2 s |
+| from the first save to the last transfer applied | 182.4 s | 76.2 s | 26.7 s |
+
+- **The answers wait for the saves.** At no half-second count were more transfers answered than
+  saved, against 12,601 at once on v0.15.7. Blnk kept up with 800 a second for about 15 s and then
+  answered 400 to 600 a second, so the 16,000 took 24.2 s, not 20. An answer took 10 ms at the
+  median, 31 ms at the 99th percentile and 668 ms at the slowest, against 1 to 2 ms on v0.15.7.
+  PR 425 reports the same trade from its author's own test: with 64 clients, a `kill -9` lost
+  58,478 transfers before it and none after, and the answers a second fell from 8,760 to 1,168.
+- **The batching works.** The worker applied the last transfer 2.5 s after the last save, against
+  about 116 s on v0.15.7 and 7 s on PR 423's first commit. 2,255 batches carried 15,438 of the
+  transfers, the largest 64, and 562 were applied one at a time; 13,157 times a task found its
+  transfer already applied and skipped the batch. None of the 192 failed batches failed on the
+  task's own transfer, so 9157478 closed the race above. All 192 failed on another transfer in the
+  batch that a parallel batch had just applied, the case PR 423 leaves as it was: 192 different
+  tasks, once each, in batches of 2 to 71 transfers, 4 at the median. That is more than the 14 on
+  the first commit, for a reason not known here. Each costs one failed batch, and the single path
+  refused 45 tasks as already used (57 on the first commit). Nothing wrong was written.
+- **The hot lane wasn't tested.** A pair goes to the hot lane only after 3 lock failures on it with
+  its normal queue empty. On main the worker kept up with the probe's 5-second flood, so there
+  were no lock failures, no pair was promoted, and all 1,000 transfers took the normal lane: the
+  trigger never fired, so by driftlab's rule the run is invalid, not clean. It had 3 failed
+  batches, all on another transfer, and 7 refusals. With the hot lane off, 4 batches failed, none
+  on the task's own transfer (59 and 55 on the first commit, 1,881 on v0.15.7), the single path
+  refused 5 (58 and 952), and the backlog sent first cleared in 7 s (33 s and 171 s).
 
 Next for ledgers: a Blnk driver that writes a history, ledger checks (a transaction answered and
 never recorded, one applied twice, a balance that doesn't match its transactions, a total that
@@ -1525,8 +1593,9 @@ driftlab/
 - **v2 (started 2026-11-02; ledgers):** Blnk v0.15.7 on the New PC, probed from outside with
   Python scripts before a driver exists. A transaction answered `QUEUED` can be lost when the API
   server stops, reported as Blnk issue 418; deadlocks and wasted batches came up on the way,
-  reported as 422 and 421 (see Blnk results). The version ends with a Blnk driver and ledger
-  checks, calibrated on Blnk issue 408.
+  reported as 422 and 421 (see Blnk results). Blnk fixed all three in its main on 2026-11-05, and
+  on 2026-11-06 the same probes found them fixed there. The version ends with a Blnk driver and
+  ledger checks, calibrated on Blnk issue 408.
 
 ## Beyond v0 (one line each, so v0 stays small)
 
