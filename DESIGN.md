@@ -1397,6 +1397,8 @@ for its process. The `subscribe` command and its `subscribed` answer become the 
    an `info`.
 6. Refuse a setting or option you don't know, and exit. A run must never quietly ignore one.
 7. Write each line under one lock, so lines from two threads never mix.
+8. Write `ready` first. Then answer each command once, and only after reading it. When stdin
+   closes, exit with status 0.
 
 **Settings and options.** `settings` names a set of producer settings. `defaults` always means the
 client as it ships, and a driver adds names of its own, such as sarama's `idempotent` or kafka-go's
@@ -1406,12 +1408,12 @@ before it answers REQUEST_TIMED_OUT, and `max_batch_messages`, the most messages
 request may carry. Between them, sarama's calibration scenarios set both, and a driver whose client
 can't apply an option refuses the scenario.
 
-**When a driver breaks.** If the driver exits early, writes a line that isn't one of these, or
-misses a deadline, the runner records what happened as an `info` from a `driver` process, heals the
-fault, and skips the final read. A history with no final read is already invalid, so the checker
-needs no change, and since the checker counts as consumers only the processes that subscribe or
-deliver, the `driver` line can't be taken for one. The driver's stderr is kept: a crash can still
-turn out to be the client's own, and a finding. The deadlines are minutes long, longer than any
+**When a driver breaks.** If the driver exits early, writes a line that isn't one of these, breaks
+rule 8 or misses a deadline, the runner records what happened as an `info` from a `driver` process,
+heals the fault, and skips the final read. A history with no final read is already invalid, so the
+checker needs no change, and since the checker counts as consumers only the processes that subscribe
+or deliver, the `driver` line can't be taken for one. The driver's stderr is kept: a crash can still
+turn out to be the client's own, and a finding. Every deadline is 10 minutes, longer than any
 client's own delivery timeout (librdkafka's is 5 minutes), so a client that is still retrying is
 never taken for a hung driver.
 
