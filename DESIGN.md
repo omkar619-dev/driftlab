@@ -281,7 +281,8 @@ reported as a lost write, and an acked message the reader skipped would look exa
 before a lost write goes upstream, a second witness reads the topic again: Kafka's own Java console
 consumer, which shares no code with the Go client. Every run writes to a topic of its own, so the
 evidence stays in the cluster until it is torn down. Kafka offsets have no legitimate holes only
-while nothing uses transactions, whose markers take up offsets (principle 5). That changes in v2.
+while nothing uses transactions, whose markers take up offsets (principle 5). That changes when a
+driver uses them, to test exactly-once claims (see Beyond v0).
 
 **Two new anomalies, and a rename.** Both new ones are Jepsen's names, with Jepsen's meanings:
 
@@ -339,8 +340,8 @@ runs of `scripts/kafka-calibrate.sh` came out as expected:
   Those diaries show the same failures, and are kept.
 
 **Orchestration.** Still a script. v1 starts with v0's shape, one client library in two versions,
-and the faults stay inside each driver. A Go `driftlab run` comes with v3, whose fault schedules
-have to be generated, re-run and shrunk.
+and the faults stay inside each driver. A Go runner was planned for v3, whose fault schedules have
+to be generated, re-run and shrunk. On 2026-11-08 it moved ahead of the ledgers (see Driver split).
 
 **The witness.** `drivers/franzgo` is a module of its own, built twice like the NATS driver: its
 `go.mod` pins franz-go v1.20.7, and `v1.20.6.mod` pins the release before the fix. Both franz-go
@@ -1814,13 +1815,24 @@ Each version ends with something public, a finding or a published results table,
 one starts.
 
 - **v1:** the Go Kafka client matrix (franz-go, sarama, kafka-go, confluent-kafka-go) against a
-  three-broker cluster, with consumer-group rebalances and leader elections (see v1 design). Then
-  Redpanda and Redis Streams. The output is a published table of client × documented guarantee ×
-  verdict under each fault.
-- **v2:** backpressure, exactly-once claims, redelivery semantics, time-to-recovery.
+  three-broker cluster, with consumer-group rebalances and leader elections (see v1 design). The
+  output is a published table of client × documented guarantee × verdict under each fault.
+- **v2:** ledgers, starting with Blnk: probes from outside, then a Blnk driver and ledger checks,
+  calibrated on Blnk issue 408 (see Blnk results).
 - **v3:** seeded fault schedules, shrinking a failing schedule down to a minimal one, and a CI mode
   so maintainers can run it nightly.
 - **v4:** each client's documented guarantees encoded as machine-readable claims files.
+- **Other systems (decided 2026-11-08):** after the ledger checks, one at a time. A system is added
+  when it is widely used, is its own code and not a wrapper around a client already tested,
+  documents a promise the checker can test, and runs on servers driftlab can fault itself. RabbitMQ
+  comes first, through amqp091-go's automatic recovery: the code is new, and it sets consumers up
+  again after a reconnect, which is what nats.go got wrong in issues 2107 and 2180. aiokafka,
+  Python's async Kafka client, comes later as one more driver, and Redpanda as a second server for
+  the same Kafka clients. Redis Streams waits for the durable-consumer checker (see Durable
+  consumers): Redis documents that a failover can lose acknowledged writes, so a lost write there
+  isn't a bug, and what's left to test is how its consumer groups redeliver.
+- **Not placed yet:** backpressure, exactly-once claims, redelivery semantics (see Durable
+  consumers) and time-to-recovery. They were v2 until the ledgers took their place.
 
 ## Open questions (decided when we reach them)
 
