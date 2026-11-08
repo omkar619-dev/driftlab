@@ -1,13 +1,15 @@
 # driftlab: design
 
-> Status: last updated 2026-11-02. v0 is done: the checker, and one system (NATS JetStream, Go
+> Status: last updated 2026-11-08. v0 is done: the checker, and one system (NATS JetStream, Go
 > client) under stall, network and server faults. The calibration matrix reproduces, and weekend 3
 > produced two upstream reports (see Weekend 3 results). v1, the Go Kafka clients, is done: every
 > client calibrated or checked, all four fault tables run, with a leader crash during steady
 > writing added to each (see sarama, kafka-go, confluent-kafka-go and franz-go results), and the
 > table across the four published in README.md. The first ledger, Blnk, has been probed: a
 > transaction it answered `QUEUED` can be lost when its API server stops, and two smaller bugs
-> came up on the way (see Blnk results).
+> came up on the way. Blnk has since fixed all three (see Blnk results). Next is the driver split,
+> which moves the faults and the final read out of the Go drivers into one runner, so that Kafka's
+> Java and Python clients can run the same faults (see Driver split).
 
 ## What driftlab is
 
@@ -1277,6 +1279,211 @@ changed, a balance below zero without an overdraft), and a calibration on
 https://github.com/blnkfinance/blnk/issues/408, a repeated partial commit of a hold that 0.15.6
 applied twice and 0.15.7 doesn't.
 
+## Driver split: one runner, drivers in any language
+
+Decided on 2026-11-08, before any of its code was written. Until that code exists, the sections
+that describe the code, from History format to Repo layout, still describe the drivers as they are.
+
+**Why.** Each Kafka driver is one Go program doing two jobs. The first is the client under test:
+writing through its producer and reading through its consumer. The second is everything else:
+creating the topic, picking each value's partition, pacing the writes, starting and healing the
+faults, watching the in-sync set, waiting for the reader, reading the topic back with the witness,
+and numbering and timing the history. The code for most of the second job, from creating the topic
+through the faults to the final read, is 605 lines, the same byte for byte in drivers/kafkago,
+drivers/confluent and drivers/franzgo/faults; sarama's copy differs in a few places. A client in
+another language can't share Go code, so Kafka's Java and Python clients would each need those
+lines written again, and each copy would be one more witness to trust. So the second job moves into
+one program, the runner, and a driver keeps only the first.
+
+**Shape.** The runner is a new Go module, `runner/`, built as `bin/driftlab-run`. It is a module of
+its own because it imports franz-go, for the witness, and the root module imports no client
+library. It pins franz-go v1.20.7, the witness the other Kafka drivers use now, so franz-go's own
+rows also stop using the client under test as their witness.
+`driftlab-run [flags] -- <driver command>` starts the driver as a child process, and the two talk
+over the driver's stdin and stdout, one JSON object per line, the way Maelstrom runs nodes written
+in any language (https://github.com/jepsen-io/maelstrom). The runner takes the flags the Kafka
+drivers take now, such as `-scenario`, `-n`, `-interval`, `-hold` and `-grace`, plus `-settings`
+and `-option name=value`, which it passes on to the driver; a scenario can set options of its own.
+It writes the history to its own stdout, as the drivers do now, so the scripts keep piping it to
+`driftlab check`. The format doesn't change, so neither does the checker, and every old history
+keeps its verdict. The runner shares no code with the checker, as the drivers don't: the format
+stays the only interface.
+
+**Commands.** The runner sends five:
+
+| Command | Fields | The driver |
+|---|---|---|
+| `setup` | `protocol`, `brokers`, `topic`, `partitions`, `settings`, `options` | makes its producer with the named settings and options |
+| `subscribe` | | starts its reader on every partition from offset 0, with no group and no committed offsets |
+| `publish` | `value`, `partition` | hands the value to its producer, for that partition |
+| `close-writer` | | closes its producer, once it has reported what became of every value |
+| `stop-reader` | | stops its reader |
+
+When the runner closes the driver's stdin, the driver exits. A driver whose runner dies sees the
+same end of input, so no driver outlives its run.
+
+**Events.** The driver reports:
+
+| Event | Fields | Meaning |
+|---|---|---|
+| `ready` | `driver`, `client`, `settings` | the producer is made; `client` is the library version actually loaded, and `settings` the value in force of every setting a scenario can change |
+| `subscribed` | | the reader has started |
+| `taken` | `value` | the producer's send call for this value has returned |
+| `ok` | `value`, `partition`, `offset` | the broker acknowledged the value at this position |
+| `info` | `value`, `error`, `code` | what became of the value is unknown |
+| `fail` | `value`, `error`, `code` | the client's docs promise the value was not written |
+| `deliver` | `value`, `partition`, `offset`, `poll` | the reader received the value at this position |
+| `error` | `process`, `error` | a client error about no one value, from the `producer` or the `consumer` |
+| `writer-closed`, `reader-stopped` | | the answers to `close-writer` and `stop-reader` |
+
+`code` is Kafka's error number, when the client gives one: 7 is REQUEST_TIMED_OUT. `poll` numbers
+the reader's polls, for a client that hands messages over in batches. The start of a run, with the
+runner's lines marked `cmd` and the driver's `event`:
+
+```jsonl
+{"cmd":"setup","protocol":1,"brokers":["127.0.0.1:29092","127.0.0.1:39092","127.0.0.1:49092"],"topic":"driftlab-follower-cut-1762600000000","partitions":1,"settings":"defaults","options":{}}
+{"event":"ready","driver":"java","client":"org.apache.kafka:kafka-clients@4.4.0","settings":{"acks":"all","enable.idempotence":"true"}}
+{"cmd":"subscribe"}
+{"event":"subscribed"}
+{"cmd":"publish","value":1,"partition":0}
+{"event":"taken","value":1}
+{"event":"ok","value":1,"partition":0,"offset":0}
+{"event":"deliver","value":1,"partition":0,"offset":0,"poll":1}
+```
+
+**A run.** The runner does what each driver's main loop does now, in the same order:
+
+1. It waits for three live brokers, creates the topic, waits for its leaders, and clears any freeze
+   or cut an earlier run left behind.
+2. It starts the driver and sends `setup`. On `ready` it writes the meta line.
+3. If the scenario has a reader, it sends `subscribe` and waits for `subscribed`.
+4. It sends the values, one `publish` at a time, and starts the fault before the scenario's value.
+5. It sends `close-writer`, waits for `writer-closed`, and waits for the fault to end.
+6. It waits until the reader has reached where the witness says each partition ends, and the ends
+   haven't moved when it asks again, or until the grace runs out. That is how drivers/kafkago,
+   drivers/confluent and drivers/franzgo/faults wait now; drivers/sarama waited for its last
+   acknowledged offsets instead, which leave out a value stored without an acknowledgement. Then it
+   sends `stop-reader`, waits for `reader-stopped`, closes the driver's stdin and waits for it to
+   exit.
+7. It reads the topic back with the witness.
+
+**Pace.** The runner sends a `publish`, waits for its `taken`, pauses for the scenario's interval,
+10 ms unless it sets one, and sends the next. The pause starts where it does now, when the send
+call returns, so a client that stops taking values, as franz-go's `Produce` does while its buffer
+is full, still shows as a gap between values. Value v goes to partition (v - 1) mod the partition
+count, as before.
+
+**Mapping to the history.** The runner numbers and times every line as it records it, on its one
+clock, as the field rules in History format already planned for runs with several processes. It
+writes a publish's `invoke` when it sends the command, so the `invoke` comes first even when a
+client acknowledges a value before its send call has returned. `taken` writes nothing. `ok`, `info`
+and `fail` become the producer's lines, `deliver` the consumer's, and `error` a `client-error` line
+for its process. The `subscribe` command and its `subscribed` answer become the consumer's
+`subscribe` pair, an `invoke` and then an `ok`, all as now. The meta line keeps its fields:
+`driver`, `client` and the settings come from `ready`, everything else from the runner.
+
+**Rules for a driver.**
+
+1. Flush every line as it is written. Python, for one, holds output back when it goes into a pipe.
+2. Stdout carries only these lines. Logs go to stderr, which the runner copies to its own with the
+   history's clock in front of each line, so any client's log lines up with the history.
+3. Never write times or line numbers. The runner stamps them.
+4. Give each record no key, and its value as decimal text, `17`, as the Go drivers do, so the
+   witness reads every driver's records the same way.
+5. Report `ok` only with the partition and offset of the acknowledgement; without them it is an
+   `info`, as librdkafka's -1001 already is. Report `fail` only where the client's docs promise the
+   record was not written, as franz-go's do, and quote that line in the driver. Everything else is
+   an `info`.
+6. Refuse a setting or option you don't know, and exit. A run must never quietly ignore one.
+7. Write each line under one lock, so lines from two threads never mix.
+
+**Settings and options.** `settings` names a set of producer settings. `defaults` always means the
+client as it ships, and a driver adds names of its own, such as sarama's `idempotent` or kafka-go's
+`acks-all`. `options` change one setting for a scenario, and are named for what Kafka does, not for
+any one client's field: `produce_timeout`, how long the leader may wait for the in-sync copies
+before it answers REQUEST_TIMED_OUT, and `max_batch_messages`, the most messages one produce
+request may carry. Between them, sarama's calibration scenarios set both, and a driver whose client
+can't apply an option refuses the scenario.
+
+**When a driver breaks.** If the driver exits early, writes a line that isn't one of these, or
+misses a deadline, the runner records what happened as an `info` from a `driver` process, heals the
+fault, and skips the final read. A history with no final read is already invalid, so the checker
+needs no change, and since the checker counts as consumers only the processes that subscribe or
+deliver, the `driver` line can't be taken for one. The driver's stderr is kept: a crash can still
+turn out to be the client's own, and a finding. The deadlines are minutes long, longer than any
+client's own delivery timeout (librdkafka's is 5 minutes), so a client that is still retrying is
+never taken for a hung driver.
+
+**The pipe check.** The runner times each `publish` to `taken` round trip, and prints the median
+and the slowest at the end of its stderr. The pause between values starts after that round trip, so
+the pipe slows the pace a little: at `leader-kill-live`'s 1 ms interval, a 0.1 ms round trip
+stretches the run by a tenth. Once, the thin sarama driver runs both directly and inside a
+container, to measure what Docker adds.
+
+**Every table fault starts live.** drivers/kafkago, drivers/confluent and drivers/franzgo/faults
+start every fault live, on a goroutine of its own, while values keep going out (see the live kill).
+drivers/sarama starts `followers-pause`, `follower-pause` and `follower-cut` on the writer's loop
+instead, so no values go out while docker acts. The runner starts every table fault live, for every
+driver, so those three sarama rows are run again, and may change. The scenarios outside the table,
+sarama's calibration and its first `leader-kill`, keep their start on the loop: the runner sends
+nothing while the fault goes in.
+
+**Proof.** The runner is calibrated before any new client goes through it (principle 6). A thin
+sarama driver, sarama's writer and reader and nothing more, runs two known results through it on
+the New PC:
+
+- `scripts/sarama-calibrate.sh` must give the table of 2026-10-19 again: all 36 runs as expected,
+  with `followers-cut-single` failing on the two builds without PR 3762, two messages swallowed
+  back to back, and publishes turned away as out of order on those two builds only. The timeout
+  evidence now comes from `code` 7.
+- sarama's defaults in `leader-kill-live` must still lose acknowledged messages.
+
+Between them they use every part of the protocol: settings, options, a cut, error codes and the
+reader. If either result changes, the runner has a bug, and nothing else moves until it is found.
+
+**Java and Python.** Each runs in a Docker image, pinned the way a `.mod` file pins a Go driver:
+the base image by digest, the client library by exact version, and that version in the image's tag.
+The New PC needs nothing installed beyond Docker, which it already runs. The container uses the
+host's network, because the brokers' client listeners are on the host's 127.0.0.1
+(`deploy/kafka.yaml`), and the runner starts it as its driver command,
+`docker run --rm -i --network host <image>`.
+
+- `drivers/java` writes through kafka-clients 4.4.0, released on 2026-10-06. Its defaults are
+  already its strongest, acknowledgements from every in-sync copy with idempotence on, so it gets
+  one row, `defaults`, as franz-go does.
+- `drivers/python` writes through kafka-python 3.0.13, released on 2026-11-06, whose defaults are
+  the same. kafka-python's 2.x line still gets releases, 2.3.3 on 2026-10-26, and still defaults to
+  the leader's acknowledgement alone, without idempotence, so its defaults can be a second Python
+  row.
+
+Before its rows, each gets the settings check kafka-go and confluent-kafka-go had: with `acks-one`,
+a leader crash in `leader-kill-live` must lose acknowledged messages. Neither client's docs promise
+that a failed record wasn't written, so both report errors as `info`. The cluster stays on Kafka
+4.3.1, so the new rows compare with the old ones; Kafka 4.4.0 is out, and moving to it is a step of
+its own.
+
+**Steps.**
+
+1. This section.
+2. The runner. Its protocol side is tested on the Mac against fake drivers, with no cluster: one
+   that behaves, and one for each way a driver can break.
+3. The thin sarama driver and the proof, on the New PC, with the pipe check.
+4. `drivers/java`: the settings check, then the five table faults, three runs each.
+5. `drivers/python`: the same.
+6. drivers/kafkago, drivers/confluent and drivers/franzgo/faults move to the runner, and every
+   Kafka row in README.md's table, sarama's included, is run again through it. sarama's three
+   freeze and cut rows may change, since they now start live; any other row that changes is a bug
+   in the split, found before the table goes out.
+
+**What stays.** The checker and the history format. drivers/natsgo and drivers/relay, which test
+other things. drivers/franzgo's own command, the 1217 calibration, because it needs a deadline on
+each send. The 1484 calibration comes next and needs one too, so it adds a deadline to `publish`,
+and both calibrations then run through the runner. `protocol` is 1. A new field that changes what a
+driver must do comes with a new number, and a driver refuses a number it doesn't know.
+
+**Done when** Java and Python have rows in README.md's table, and every Kafka row there comes from
+the runner.
+
 ## History format (the wire contract)
 
 A history is one JSON object per line. The first line is a `meta` record, so every history says
@@ -1596,6 +1803,10 @@ driftlab/
   reported as 422 and 421 (see Blnk results). Blnk fixed all three in its main on 2026-11-05, and
   on 2026-11-06 the same probes found them fixed there. The version ends with a Blnk driver and
   ledger checks, calibrated on Blnk issue 408.
+- **The driver split (started 2026-11-08; drivers in other languages):** the runner in Driver
+  split, then Kafka's Java and Python clients through the same five faults. It comes before v2's
+  ledger checks, whose Blnk driver can then follow the same split. Exit: Java and Python rows in
+  README.md's table, and every Kafka row there produced through the runner.
 
 ## Beyond v0 (one line each, so v0 stays small)
 
@@ -1615,11 +1826,14 @@ one starts.
 
 - **Batch deliveries (decided 2026-10-13).** One `deliver` line per message, with a `poll`
   number, and Kafka positions in new `partition` and `offset` fields. See v1 design.
-- **Orchestration (decided 2026-10-06, revised 2026-10-13).** A shell script, `scripts/matrix.sh`,
-  runs the v0 matrix. Weekend 3 didn't need more: each driver injects its own faults and records
-  them in its history, so a run stayed "run the driver, then judge the history". v1 starts the
-  same way, with one client library in two versions, so a Go `driftlab run` command now comes
-  with v3, when fault schedules have to be generated, re-run and shrunk.
+- **Orchestration (decided 2026-10-06, revised 2026-10-13 and 2026-11-08).** A shell script,
+  `scripts/matrix.sh`, runs the v0 matrix. Weekend 3 didn't need more: each driver injects its own
+  faults and records them in its history, so a run stayed "run the driver, then judge the history".
+  v1 started the same way, with one client library in two versions. On 2026-11-08 it was decided to
+  move the faults out of the drivers, into one Go runner, `driftlab-run`, because a driver in
+  another language can't share Go code (see Driver split). The scripts stay, and a run becomes "run
+  the runner with a driver, then judge the history". v3 still brings fault schedules that are
+  generated, re-run and shrunk, on top of the runner.
 - **Durable consumers.** With acks, receiving a message twice becomes legal, but only as a
   redelivery. NATS marks its redeliveries; Kafka doesn't, so the checker will have to work them
   out from a group's assignments and committed offsets. That's a different contract, so it
