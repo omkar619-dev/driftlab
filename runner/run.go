@@ -13,6 +13,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -42,13 +43,16 @@ type plan struct {
 // partition 0's other copies, or all of them when followers is 0. A live
 // fault starts on a goroutine of its own, while values keep going out; any
 // other starts on the loop, which sends nothing until the fault is in place
-// (DESIGN.md, Every table fault starts live).
+// (DESIGN.md, Every table fault starts live). With timeout set, the run also
+// declares the trigger of sarama's calibration: a publish that fails with
+// REQUEST_TIMED_OUT once the fault is in place (DESIGN.md, Proof).
 type fault struct {
 	kind      string
 	followers int
 	at        uint64
 	hold      time.Duration
 	live      bool
+	timeout   bool
 }
 
 // activeFault is a fault in place. over closes once it has ended and healed
@@ -103,12 +107,15 @@ func run(p plan, cl cluster, out, logs io.Writer) error {
 	}
 
 	// 2. The driver. Each event it writes is recorded as soon as it is
-	// read, on the history's clock, and each delivery also moves the
-	// reader's progress on.
+	// read, on the history's clock. Each delivery also moves the reader's
+	// progress on, and a publish that timed out can be the timeout's
+	// evidence.
 	pr := newProgress()
+	tw := &timeoutWatch{rec: rec}
 	d, err := startDriver(p.driver, func(e event) {
 		rec.got(e)
 		pr.saw(e)
+		tw.saw(e)
 	}, logs, rec.clock, p.deadline)
 	if err != nil {
 		return err
@@ -153,9 +160,15 @@ func run(p plan, cl cluster, out, logs io.Writer) error {
 	// 4. The values, one publish at a time, value v to partition (v - 1)
 	// mod the partition count. After each is taken, the run pauses for the
 	// interval, so a client that stops taking values shows as a gap between
-	// them (DESIGN.md, Pace). The fault starts just before its value.
+	// them (DESIGN.md, Pace). The fault starts just before its value, and a
+	// run that declares the timeout starts watching for it once the fault is
+	// in place.
 	start := func() (*activeFault, error) {
-		return cl.startFault(ctx, rec, p.topic, p.fault)
+		started, err := cl.startFault(ctx, rec, p.topic, p.fault)
+		if err == nil && p.fault.timeout {
+			tw.arm()
+		}
+		return started, err
 	}
 	for v := uint64(1); v <= p.n; v++ {
 		if p.fault.kind != "" && v == p.fault.at {
@@ -213,8 +226,9 @@ func run(p plan, cl cluster, out, logs io.Writer) error {
 // metaLine is the meta line as far as the runner knows it; the driver's
 // ready adds the rest. A run whose driver reads says how: "direct", every
 // partition from the start, with no group (DESIGN.md, Commands). A run with
-// a fault declares it, so if the fault then leaves no evidence, the checker
-// calls the run invalid instead of clean.
+// a fault declares it, and the timeout too when it has one, so if either
+// then leaves no evidence, the checker calls the run invalid instead of
+// clean.
 func (p plan) metaLine() meta {
 	m := meta{
 		Server:   p.server,
@@ -235,6 +249,9 @@ func (p plan) metaLine() meta {
 	}
 	if p.fault.kind != "" {
 		m.Faults = []string{p.fault.kind}
+		if p.fault.timeout {
+			m.Faults = append(m.Faults, "timeout")
+		}
 		m.Params.Hold = p.fault.hold.String()
 		m.Params.Live = p.fault.live
 	}
@@ -258,6 +275,39 @@ func startLive(start func() (*activeFault, error)) *activeFault {
 		ft.err = started.err
 	}()
 	return ft
+}
+
+// requestTimedOut is Kafka's error number for REQUEST_TIMED_OUT, which a
+// driver reports as the code of an info or a fail.
+const requestTimedOut = 7
+
+// timeoutWatch makes the evidence of the timeout a run declares, as
+// drivers/sarama made it: once the fault is in place, arm records the
+// timeout's invoke, and then the first publish the driver reports as failed
+// with REQUEST_TIMED_OUT records its ok. A watch that is never armed records
+// nothing, so a run with no timeout gets no timeout lines.
+type timeoutWatch struct {
+	rec   *recorder
+	armed atomic.Bool // the fault is in place, and the invoke recorded
+	once  sync.Once   // the ok is recorded only once
+}
+
+// arm records the timeout's invoke, and starts the watch.
+func (tw *timeoutWatch) arm() {
+	tw.rec.op(op{Process: "nemesis", Type: "invoke", F: "timeout"})
+	tw.armed.Store(true)
+}
+
+// saw records the timeout's ok, if the event is the first info or fail with
+// code 7 since the watch was armed. It is part of the driver's onEvent, so
+// the ok comes right after the line that the event became.
+func (tw *timeoutWatch) saw(e event) {
+	timedOut := (e.Event == "info" || e.Event == "fail") && e.Code != nil && *e.Code == requestTimedOut
+	if timedOut && tw.armed.Load() {
+		tw.once.Do(func() {
+			tw.rec.op(op{Process: "nemesis", Type: "ok", F: "timeout"})
+		})
+	}
 }
 
 // progress is how far the driver's reader has got: the highest offset it has

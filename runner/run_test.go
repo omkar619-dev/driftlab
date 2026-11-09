@@ -236,6 +236,46 @@ func TestRunPublishOnly(t *testing.T) {
 	}
 }
 
+// A run that declares the timeout, through a driver whose every publish times
+// out. A timeout before the fault is in place is no evidence. Once the fault
+// is in, the timeout's invoke comes right after the fault's, and its ok right
+// after the first publish that timed out, only once. Without the timeout
+// declared, the same run records no timeout at all.
+func TestRunTimeout(t *testing.T) {
+	p := testPlan(t, "times-out")
+	p.n = 3
+	p.reader = false
+	p.fault = fault{kind: "cut", at: 2, hold: testHold, timeout: true}
+	var out, logs bytes.Buffer
+	if err := run(p, &fakeCluster{}, &out, &logs); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		`{"type":"meta","driver":"fake","client":"fake@1","server":"apache/kafka:4.3.1","scenario":"test","faults":["cut","timeout"],"params":{"n":3,"partitions":1,"topic":"driftlab-test","interval":"1ms","settings":"defaults","settings_in_force":{"acks":"all"},"hold":"300ms","witness":"github.com/twmb/franz-go@v1.20.7"},"driftlab":"test"}`,
+		`{"process":"producer","type":"invoke","f":"publish","value":1}`,
+		`{"process":"producer","type":"info","f":"publish","value":1,"error":"request timed out","code":7}`,
+		`{"process":"nemesis","type":"invoke","f":"cut"}`,
+		`{"process":"nemesis","type":"invoke","f":"timeout"}`,
+		`{"process":"producer","type":"invoke","f":"publish","value":2}`,
+		`{"process":"producer","type":"info","f":"publish","value":2,"error":"request timed out","code":7}`,
+		`{"process":"nemesis","type":"ok","f":"timeout"}`,
+		`{"process":"producer","type":"invoke","f":"publish","value":3}`,
+		`{"process":"producer","type":"info","f":"publish","value":3,"error":"request timed out","code":7}`,
+		`{"process":"nemesis","type":"ok","f":"cut"}`,
+	}
+	sameLines(t, untimed(t, out.String()), want)
+
+	p.fault.timeout = false
+	out.Reset()
+	if err := run(p, &fakeCluster{}, &out, &logs); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), `"timeout"`) {
+		t.Errorf("recorded a timeout the run didn't declare:\n%s", out.String())
+	}
+}
+
 // A driver that breaks ends the run. After its ready, the history says how
 // it broke and has no final read, and the run first waits for the fault to
 // end, so no broker is left faulted. Before its ready, no run began, so

@@ -29,7 +29,9 @@ func TestMain(m *testing.M) {
 // Once its reader has started, it delivers each value it publishes. sync
 // keeps every rule, but reports on each value before it answers the
 // publish, as a driver of a synchronous client would: one whose send call
-// returns only once the value is acknowledged.
+// returns only once the value is acknowledged. times-out keeps every rule
+// too, but reports each value as an info with code 7, REQUEST_TIMED_OUT,
+// before it answers, and delivers nothing.
 func fake(name string) int {
 	fmt.Fprintln(os.Stderr, "fake", name+": started")
 	if name == "reports-first" {
@@ -75,6 +77,9 @@ func fake(name string) int {
 				say(`{"event":"taken","value":%d,"time_ns":5}`, c.Value)
 			case "wrong-value":
 				say(`{"event":"taken","value":%d}`, c.Value+1)
+			case "times-out":
+				say(`{"event":"info","value":%d,"error":"request timed out","code":7}`, c.Value)
+				say(`{"event":"taken","value":%d}`, c.Value)
 			default:
 				o := offsets[c.Partition]
 				offsets[c.Partition]++
