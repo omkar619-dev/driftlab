@@ -18,8 +18,7 @@ judged again after a checker fix without re-running anything.
 
 ## Findings so far
 
-Ten issues reported to five projects so far: four are fixed, and fixes for three more are in
-review.
+Ten issues reported to five projects so far: six are fixed, and fixes for two more are in review.
 
 Against nats.go, the Go client for NATS JetStream, at v1.53.1 and v1.54.0:
 
@@ -52,8 +51,8 @@ Against franz-go, the Go client for Kafka:
   `drivers/franzgo/repro1505` reproduces it with no broker at all.
   https://github.com/twmb/franz-go/issues/1505 (reported 2026-10-17). The maintainer opened a fix
   the same day, https://github.com/twmb/franz-go/pull/1506, which driftlab checked: with it the
-  call returns at its own deadline, and franz-go's fault table came through clean. It isn't merged
-  yet.
+  call returns at its own deadline, and franz-go's fault table came through clean. It was merged on
+  2026-11-08 and isn't in a release yet.
 - **After a leader crash, the reader found the new leader up to 5 seconds later than it could.**
   After a failed fetch, franz-go asks for fresh metadata, but drops the request if its last refresh
   finished less than 5 seconds before. Once the retry waits reach their 5-second cap, every second
@@ -62,7 +61,10 @@ Against franz-go, the Go client for Kafka:
   twelve leader crashes, three of them during steady writing; with the limit lowered to 4.5 seconds
   it came back 2 to 3 seconds after the election, but a request was again dropped at the new line.
   https://github.com/twmb/franz-go/issues/1531 (reported 2026-10-31). Another contributor
-  reproduced it on 2026-11-06, with franz-go's fake cluster and on a real one.
+  reproduced it on 2026-11-06, with franz-go's fake cluster and on a real one, and proposed the
+  fix: hold the request until the limit has passed, instead of dropping it.
+  https://github.com/twmb/franz-go/pull/1537 makes that change, with their test. It was merged on
+  2026-11-08 and isn't in a release yet.
 
 Against sarama, another Go client for Kafka, at v1.61.1:
 
