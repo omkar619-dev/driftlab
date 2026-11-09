@@ -1379,9 +1379,12 @@ clock, as the field rules in History format already planned for runs with severa
 writes a publish's `invoke` when it sends the command, so the `invoke` comes first even when a
 client acknowledges a value before its send call has returned. `taken` writes nothing. `ok`, `info`
 and `fail` become the producer's lines, `deliver` the consumer's, and `error` a `client-error` line
-for its process. The `subscribe` command and its `subscribed` answer become the consumer's
-`subscribe` pair, an `invoke` and then an `ok`, all as now. The meta line keeps its fields:
-`driver`, `client` and the settings come from `ready`, everything else from the runner.
+for its process. An `info` or `fail` line also carries the driver's `code`, when it gave one: the
+field is new, and the checker ignores it, as it does any field it doesn't know. The `subscribe`
+command and its `subscribed` answer become the consumer's `subscribe` pair, an `invoke` and then an
+`ok`, all as now. The meta line keeps its fields: `driver`, `client` and the settings come from
+`ready`, everything else from the runner. The settings go into `params` as `settings_in_force`,
+beside `settings`, the name the runner asked for.
 
 **Rules for a driver.**
 
@@ -1410,12 +1413,14 @@ can't apply an option refuses the scenario.
 
 **When a driver breaks.** If the driver exits early, writes a line that isn't one of these, breaks
 rule 8 or misses a deadline, the runner records what happened as an `info` from a `driver` process,
-heals the fault, and skips the final read. A history with no final read is already invalid, so the
-checker needs no change, and since the checker counts as consumers only the processes that subscribe
-or deliver, the `driver` line can't be taken for one. The driver's stderr is kept: a crash can still
-turn out to be the client's own, and a finding. Every deadline is 10 minutes, longer than any
-client's own delivery timeout (librdkafka's is 5 minutes), so a client that is still retrying is
-never taken for a hung driver.
+with `f` set to `broke` and `error` saying how, heals the fault, and skips the final read. A history
+with no final read is already invalid, so the checker needs no change, and since the checker counts
+as consumers only the processes that subscribe or deliver, the `driver` line can't be taken for one.
+A driver that breaks before `ready` leaves no history at all: with no meta line yet, no run began,
+and the runner's stderr says what happened. The driver's stderr is kept: a crash can still turn out
+to be the client's own, and a finding. Every deadline is 10 minutes, longer than any client's own
+delivery timeout (librdkafka's is 5 minutes), so a client that is still retrying is never taken for
+a hung driver.
 
 **The pipe check.** The runner times each `publish` to `taken` round trip, and prints the median
 and the slowest at the end of its stderr. The pause between values starts after that round trip, so
