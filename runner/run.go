@@ -59,8 +59,8 @@ type activeFault struct {
 }
 
 // cluster is what a run needs from Kafka, beyond the driver. kafka.go and
-// faults.go will give the real one, which works through franz-go and docker;
-// the tests give a fake.
+// faults.go give the real one, which works through franz-go and docker; the
+// tests give a fake.
 type cluster interface {
 	// prepare waits for three live brokers, creates the topic, waits until
 	// each of its partitions has a leader, and clears any fault of this kind
