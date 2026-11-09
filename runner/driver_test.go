@@ -26,12 +26,17 @@ func TestMain(m *testing.M) {
 
 // fake acts as a driver. It answers each command the way a driver should,
 // except where its name says it breaks a rule, and returns its exit status.
+// Once its reader has started, it delivers each value it publishes. sync
+// keeps every rule, but reports on each value before it answers the
+// publish, as a driver of a synchronous client would: one whose send call
+// returns only once the value is acknowledged.
 func fake(name string) int {
 	fmt.Fprintln(os.Stderr, "fake", name+": started")
 	if name == "reports-first" {
 		say(`{"event":"error","process":"producer","error":"too soon"}`)
 	}
 	offsets := map[int32]int64{}
+	reading := false // the reader has started
 	in := bufio.NewScanner(os.Stdin)
 	for in.Scan() {
 		var c struct {
@@ -60,6 +65,7 @@ func fake(name string) int {
 				time.Sleep(time.Hour)
 			default:
 				say(`{"event":"subscribed"}`)
+				reading = true
 			}
 		case "publish":
 			switch name {
@@ -72,9 +78,16 @@ func fake(name string) int {
 			default:
 				o := offsets[c.Partition]
 				offsets[c.Partition]++
-				say(`{"event":"taken","value":%d}`, c.Value)
+				if name != "sync" {
+					say(`{"event":"taken","value":%d}`, c.Value)
+				}
 				say(`{"event":"ok","value":%d,"partition":%d,"offset":%d}`, c.Value, c.Partition, o)
-				say(`{"event":"deliver","value":%d,"partition":%d,"offset":%d,"poll":%d}`, c.Value, c.Partition, o, c.Value)
+				if reading {
+					say(`{"event":"deliver","value":%d,"partition":%d,"offset":%d,"poll":%d}`, c.Value, c.Partition, o, c.Value)
+				}
+				if name == "sync" {
+					say(`{"event":"taken","value":%d}`, c.Value)
+				}
 			}
 		case "close-writer":
 			say(`{"event":"writer-closed"}`)
