@@ -40,6 +40,7 @@ func main() {
 		out:         &events{enc: json.NewEncoder(os.Stdout)},
 		client:      client(),
 		newProducer: sarama.NewAsyncProducer,
+		newConsumer: sarama.NewConsumer,
 	}
 	if err := d.serve(os.Stdin); err != nil {
 		fmt.Fprintln(os.Stderr, "sarama-thin:", err)
@@ -54,12 +55,20 @@ type driver struct {
 	out    *events // where events go: stdout, or a buffer in the tests
 	client string  // the sarama this binary links, for ready
 
-	// newProducer makes sarama's producer: sarama.NewAsyncProducer, or
-	// sarama's mock in the tests.
+	// newProducer makes sarama's producer, and newConsumer its consumer:
+	// sarama.NewAsyncProducer and sarama.NewConsumer, or sarama's mocks in
+	// the tests.
 	newProducer func(brokers []string, cfg *sarama.Config) (sarama.AsyncProducer, error)
+	newConsumer func(brokers []string, cfg *sarama.Config) (sarama.Consumer, error)
 
 	ready bool    // setup is done, and ready written
 	w     *writer // sarama's producer, which setup made
+	r     *reader // sarama's consumer, which subscribe made
+
+	// Where the reader reads, as setup said.
+	brokers    []string
+	topic      string
+	partitions int32
 }
 
 // command is one of the runner's commands, with the fields any of them can
@@ -99,15 +108,23 @@ type event struct {
 // mix (rule 7), and in one write, straight to stdout, which holds nothing
 // back, so each line is flushed as it is written (rule 1).
 type events struct {
-	mu  sync.Mutex
-	enc *json.Encoder
+	mu    sync.Mutex
+	enc   *json.Encoder
+	polls uint64 // the deliver lines written so far
 }
 
-// write writes one event. Once a write has failed, every later one fails
-// with the same error, which the json.Encoder keeps.
+// write writes one event. A deliver gets its poll number here, under the
+// lock, so the numbers count 1, 2, 3 down the output, whichever partition's
+// goroutine writes it. sarama's partition consumer hands messages over one at
+// a time, so each one is a poll of its own. Once a write has failed, every
+// later one fails with the same error, which the json.Encoder keeps.
 func (o *events) write(e event) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if e.Event == "deliver" {
+		o.polls++
+		e.Poll = o.polls
+	}
 	return o.enc.Encode(e)
 }
 
@@ -133,21 +150,28 @@ func (d *driver) serve(in io.Reader) error {
 	return nil
 }
 
-// do carries out one command. setup comes first, and only once (rule 8).
+// do carries out one command. setup comes first, and only once (rule 8), and
+// stop-reader needs a reader that subscribe started.
 func (d *driver) do(c command) error {
 	switch {
 	case c.Cmd == "setup" && d.ready:
 		return errors.New("came twice")
 	case c.Cmd != "setup" && !d.ready:
 		return errors.New("came before setup")
+	case c.Cmd == "stop-reader" && d.r == nil:
+		return errors.New("came before subscribe")
 	}
 	switch c.Cmd {
 	case "setup":
 		return d.setup(c)
+	case "subscribe":
+		return d.subscribe()
 	case "publish":
 		return d.w.publish(c.Value, c.Partition)
 	case "close-writer":
 		return d.w.close()
+	case "stop-reader":
+		return d.r.stop()
 	default:
 		return errors.New("no such command")
 	}
@@ -174,6 +198,7 @@ func (d *driver) setup(c command) error {
 		return fmt.Errorf("starting sarama's producer: %w", err)
 	}
 	d.w = &writer{p: p, out: d.out, topic: c.Topic, partitions: c.Partitions, done: make(chan struct{})}
+	d.brokers, d.topic, d.partitions = c.Brokers, c.Topic, c.Partitions
 	d.ready = true
 	if err := d.out.write(event{Event: "ready", Driver: "sarama", Client: d.client, Settings: inForce(cfg)}); err != nil {
 		return err
@@ -393,4 +418,106 @@ func kafkaCode(err error) *int {
 	}
 	code := int(ke)
 	return &code
+}
+
+// subscribe starts the reader: sarama's consumer, a client of its own beside
+// the producer, with sarama's defaults, as drivers/sarama's helper has it. It
+// reads every partition directly from its oldest offset, which in the run's
+// fresh topic is 0, with no group and no committed offsets, and its errors
+// come back on a channel, so they are reported, not only logged. It answers
+// subscribed once every partition has a partition consumer, and the reports
+// start only once that is written, so no deliver comes before it. A partition
+// sarama can't start reading stops the driver, as a consumer it can't make
+// does.
+func (d *driver) subscribe() error {
+	if d.r != nil {
+		return errors.New("came twice")
+	}
+	cfg := sarama.NewConfig()
+	cfg.Consumer.Return.Errors = true
+	c, err := d.newConsumer(d.brokers, cfg)
+	if err != nil {
+		return fmt.Errorf("starting sarama's consumer: %w", err)
+	}
+	r := &reader{c: c, out: d.out}
+	for p := int32(0); p < d.partitions; p++ {
+		pc, err := c.ConsumePartition(d.topic, p, sarama.OffsetOldest)
+		if err != nil {
+			return fmt.Errorf("reading partition %d: %w", p, err)
+		}
+		r.pcs = append(r.pcs, pc)
+	}
+	d.r = r
+	if err := d.out.write(event{Event: "subscribed"}); err != nil {
+		return err
+	}
+	for _, pc := range r.pcs {
+		r.wg.Go(func() { r.read(pc) })
+	}
+	return nil
+}
+
+// reader is sarama's consumer, with a partition consumer on each of the
+// topic's partitions, and what it needs to report what they hand over.
+type reader struct {
+	c       sarama.Consumer
+	pcs     []sarama.PartitionConsumer
+	out     *events
+	wg      sync.WaitGroup // counts the goroutines still reporting
+	stopped bool           // stop-reader has come
+}
+
+// read reports what one partition consumer hands over, until sarama has
+// closed both of its channels, which it does once stop-reader has closed the
+// partition consumer, or if the partition consumer stops on its own. A
+// message that holds a driftlab value is a deliver, with the partition and
+// offset it was read from. Anything else is an error event from the
+// consumer, about no one value: an error sarama hands back, or a message that
+// holds no driftlab value, which no message in the run's own topic should.
+func (r *reader) read(pc sarama.PartitionConsumer) {
+	messages, failures := pc.Messages(), pc.Errors()
+	for messages != nil || failures != nil {
+		select {
+		case m, ok := <-messages:
+			if !ok {
+				messages = nil
+				continue
+			}
+			p, o := m.Partition, m.Offset
+			v, err := strconv.ParseUint(string(m.Value), 10, 64)
+			if err != nil || v == 0 {
+				bad := fmt.Sprintf("partition %d offset %d holds %q, not a driftlab value", p, o, m.Value)
+				r.out.write(event{Event: "error", Process: "consumer", Error: bad})
+				continue
+			}
+			r.out.write(event{Event: "deliver", Value: v, Partition: &p, Offset: &o})
+		case e, ok := <-failures:
+			if !ok {
+				failures = nil
+				continue
+			}
+			r.out.write(event{Event: "error", Process: "consumer", Error: e.Error()})
+		}
+	}
+}
+
+// stop closes every partition consumer, waits until each one's goroutine has
+// reported everything sarama handed over, and closes the consumer, which
+// sarama's docs say must come after its partition consumers are closed. Only
+// then does it answer reader-stopped, so no deliver comes after it. An error
+// from closing the consumer doesn't stop the driver, since every delivery is
+// reported by then: it becomes an error event from the consumer.
+func (r *reader) stop() error {
+	if r.stopped {
+		return errors.New("came twice")
+	}
+	r.stopped = true
+	for _, pc := range r.pcs {
+		pc.AsyncClose()
+	}
+	r.wg.Wait()
+	if err := r.c.Close(); err != nil {
+		r.out.write(event{Event: "error", Process: "consumer", Error: err.Error()})
+	}
+	return r.out.write(event{Event: "reader-stopped"})
 }
