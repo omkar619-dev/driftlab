@@ -58,8 +58,8 @@ type driver struct {
 	// sarama's mock in the tests.
 	newProducer func(brokers []string, cfg *sarama.Config) (sarama.AsyncProducer, error)
 
-	ready    bool                 // setup is done, and ready written
-	producer sarama.AsyncProducer // the producer setup made
+	ready bool    // setup is done, and ready written
+	w     *writer // sarama's producer, which setup made
 }
 
 // command is one of the runner's commands, with the fields any of them can
@@ -144,6 +144,10 @@ func (d *driver) do(c command) error {
 	switch c.Cmd {
 	case "setup":
 		return d.setup(c)
+	case "publish":
+		return d.w.publish(c.Value, c.Partition)
+	case "close-writer":
+		return d.w.close()
 	default:
 		return errors.New("no such command")
 	}
@@ -151,7 +155,9 @@ func (d *driver) do(c command) error {
 
 // setup makes sarama's producer, with the named set of settings and the
 // scenario's options, and answers ready: the driver's name, the sarama it
-// links, and the value in force of each setting a scenario can change.
+// links, and the value in force of each setting a scenario can change. The
+// writer starts reporting outcomes only once ready is written, so ready is
+// the first line (rule 8).
 func (d *driver) setup(c command) error {
 	if c.Protocol != protocol {
 		return fmt.Errorf("protocol %d, but this driver speaks %d", c.Protocol, protocol)
@@ -167,15 +173,19 @@ func (d *driver) setup(c command) error {
 	if err != nil {
 		return fmt.Errorf("starting sarama's producer: %w", err)
 	}
-	d.producer = p
+	d.w = &writer{p: p, out: d.out, topic: c.Topic, partitions: c.Partitions, done: make(chan struct{})}
 	d.ready = true
-	return d.out.write(event{Event: "ready", Driver: "sarama", Client: d.client, Settings: inForce(cfg)})
+	if err := d.out.write(event{Event: "ready", Driver: "sarama", Client: d.client, Settings: inForce(cfg)}); err != nil {
+		return err
+	}
+	go d.w.report()
+	return nil
 }
 
 // producerConfig is sarama's configuration for a named set of settings, with
-// a scenario's options applied. Two more settings only serve the driver,
-// whatever the name: successes come back on a channel, so every
-// acknowledgement is reported with its position, and each value goes to the
+// a scenario's options applied. Three more settings only serve the driver,
+// whatever the name: successes and failures both come back on channels, so
+// the outcome of every value is reported, and each value goes to the
 // partition the runner gave it.
 //
 // defaults is sarama as it ships: acknowledgements from the leader alone
@@ -206,6 +216,7 @@ func producerConfig(settings string, options map[string]string) (*sarama.Config,
 		return nil, fmt.Errorf("no settings named %q: want defaults or idempotent", settings)
 	}
 	cfg.Producer.Return.Successes = true
+	cfg.Producer.Return.Errors = true
 	cfg.Producer.Partitioner = sarama.NewManualPartitioner
 	if err := applyOptions(cfg, options); err != nil {
 		return nil, err
@@ -276,4 +287,110 @@ func client() string {
 		}
 	}
 	return "github.com/IBM/sarama@unknown"
+}
+
+// writer is sarama's producer, with what it needs to hand each value over
+// and to report what becomes of it.
+type writer struct {
+	p          sarama.AsyncProducer
+	out        *events
+	topic      string
+	partitions int32
+	closed     bool          // close-writer has come
+	done       chan struct{} // closed once every value's outcome is reported
+}
+
+// publish hands one value to sarama's producer, for the partition the runner
+// gave it, and answers taken once sarama has taken it: once the send on the
+// producer's Input channel has gone through. The value goes as decimal text
+// with no key (rule 4), and rides along in the message's Metadata, which
+// sarama hands back with the value's outcome.
+func (w *writer) publish(v uint64, partition int32) error {
+	switch {
+	case w.closed:
+		return errors.New("came after close-writer")
+	case v == 0:
+		return errors.New("values start at 1")
+	case partition < 0 || partition >= w.partitions:
+		return fmt.Errorf("partition %d, but the topic's partitions run from 0 to %d", partition, w.partitions-1)
+	}
+	w.p.Input() <- &sarama.ProducerMessage{
+		Topic:     w.topic,
+		Partition: partition,
+		Value:     sarama.StringEncoder(strconv.FormatUint(v, 10)),
+		Metadata:  v,
+	}
+	return w.out.write(event{Event: "taken", Value: v})
+}
+
+// report reports what becomes of each value, as sarama hands the outcomes
+// back, until sarama has closed both of its channels, which it does once
+// close-writer has closed the producer and the last outcome is out. A
+// success is an ok, with the partition and offset the broker gave. A
+// failure is an info, never a fail (rule 5): sarama's ProducerError says
+// only that the producer failed to deliver the message, which doesn't
+// promise that the broker never stored it, and a write that timed out may
+// still land. Its code is Kafka's error number, when sarama's error is one
+// of Kafka's. A failure that carries no value of the run's is an error
+// event from the producer, about no one value.
+//
+// A failed write isn't returned from here. The events' encoder keeps it,
+// though, so the answer to close-writer, which comes after the last report,
+// fails with it.
+func (w *writer) report() {
+	defer close(w.done)
+	successes, failures := w.p.Successes(), w.p.Errors()
+	for successes != nil || failures != nil {
+		select {
+		case m, ok := <-successes:
+			if !ok {
+				successes = nil
+				continue
+			}
+			v, _ := m.Metadata.(uint64)
+			p, o := m.Partition, m.Offset
+			w.out.write(event{Event: "ok", Value: v, Partition: &p, Offset: &o})
+		case e, ok := <-failures:
+			if !ok {
+				failures = nil
+				continue
+			}
+			var v uint64
+			if e.Msg != nil {
+				v, _ = e.Msg.Metadata.(uint64)
+			}
+			if v == 0 {
+				w.out.write(event{Event: "error", Process: "producer", Error: fmt.Sprint(e.Err)})
+				continue
+			}
+			w.out.write(event{Event: "info", Value: v, Error: fmt.Sprint(e.Err), Code: kafkaCode(e.Err)})
+		}
+	}
+}
+
+// close closes sarama's producer, which first sends whatever it still holds,
+// and answers writer-closed once every value's outcome has been reported:
+// sarama closes its two channels only after the last outcome, and report
+// returns only after both have closed.
+func (w *writer) close() error {
+	if w.closed {
+		return errors.New("came twice")
+	}
+	w.closed = true
+	w.p.AsyncClose()
+	<-w.done
+	return w.out.write(event{Event: "writer-closed"})
+}
+
+// kafkaCode is Kafka's error number for err, such as 7 for
+// REQUEST_TIMED_OUT, when err is one of the errors a broker returns, and nil
+// when it isn't, as for a refused connection. The runner takes the
+// calibration's timeout evidence from code 7 (DESIGN.md, Proof).
+func kafkaCode(err error) *int {
+	var ke sarama.KError
+	if !errors.As(err, &ke) {
+		return nil
+	}
+	code := int(ke)
+	return &code
 }
