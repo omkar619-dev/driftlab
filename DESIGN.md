@@ -374,8 +374,9 @@ values are in flight at once, as they are for most sarama users. A success is re
 the partition and offset the broker gave. An error is recorded as `info`, not `fail`, because sarama
 only says the producer failed to deliver the message, which doesn't promise that the broker never
 stored it. In `control` the helper is a `PartitionConsumer` on every partition, reading from the
-oldest offset with no group; sarama hands messages over one at a time, so its deliver lines carry no
-poll number.
+oldest offset with no group. sarama hands messages over one at a time, so each one is a poll of its
+own: drivers/sarama leaves the poll number out, and the thin sarama driver (see Driver split)
+numbers each delivery as its own poll.
 
 **The sarama calibration pair.** Before https://github.com/IBM/sarama/pull/3762, sarama numbered
 each idempotent message as it queued it for a broker, not when its batch was sent. So a message
@@ -1282,8 +1283,9 @@ applied twice and 0.15.7 doesn't.
 
 ## Driver split: one runner, drivers in any language
 
-Decided on 2026-11-08, before any of its code was written. Until that code exists, the sections
-that describe the code, from History format to Repo layout, still describe the drivers as they are.
+Decided on 2026-11-08, before any of its code was written. The runner and the thin sarama driver
+are now written, and Repo layout lists them; until step 6, the other Kafka drivers still do both
+jobs.
 
 **Why.** Each Kafka driver is one Go program doing two jobs. The first is the client under test:
 writing through its producer and reading through its consumer. The second is everything else:
@@ -1448,6 +1450,12 @@ the New PC:
 
 Between them they use every part of the protocol: settings, options, a cut, error codes and the
 reader. If either result changes, the runner has a bug, and nothing else moves until it is found.
+
+The thin driver is `drivers/sarama/thin/`, a second command in the sarama module, so `go.mod` and
+the three `.mod` files pin its sarama too, as they pin drivers/sarama's. The calibration script,
+`scripts/sarama-calibrate.sh`, now builds it once for each of them and runs every scenario through
+the runner with `-settings idempotent`, the settings drivers/sarama was calibrated with. It keeps
+each run's stderr, with the driver's log and the pipe check, beside the run's history.
 
 **Java and Python.** Each runs in a Docker image, pinned the way a `.mod` file pins a Go driver:
 the base image by digest, the client library by exact version, and that version in the image's tag.
@@ -1669,6 +1677,10 @@ scripts: 0 clean, 1 failed, 2 invalid, and 3 when the command couldn't run (bad 
 can't open or parse). An invalid run exits non-zero on purpose, so a script can never mistake a
 broken experiment for a pass.
 
+`driftlab-run [flags] -- <driver command>` runs one Kafka scenario through a driver and writes its
+history to stdout, the way a driver does, for `driftlab check` to judge (see Driver split). `-h`
+lists its flags and scenarios.
+
 ## Repo layout
 
 ```
@@ -1680,6 +1692,8 @@ driftlab/
 │   ├── history/
 │   └── checker/
 │       └── testdata/
+├── runner/
+│   └── go.mod
 ├── drivers/
 │   ├── natsgo/
 │   │   ├── go.mod
@@ -1702,7 +1716,8 @@ driftlab/
 │       ├── v1.61.0.mod
 │       ├── pr3762-before.mod
 │       ├── pr3762-after.mod
-│       └── repro3843/
+│       ├── repro3843/
+│       └── thin/
 ├── deploy/
 │   ├── compose.yaml
 │   ├── kafka.yaml
@@ -1732,6 +1747,8 @@ driftlab/
 | `internal/history/` | the Op type and the JSONL reader |
 | `internal/checker/` | `Check()` and its anomaly kinds |
 | `internal/checker/testdata/` | hand-written histories: one clean, one per anomaly kind, and more for the verdict rules and the measurements |
+| `runner/` | a separate module, built as `driftlab-run`, that runs one Kafka scenario through a driver in any language: it creates the topic, tells the driver over its stdin what to send, reads the driver's events from its stdout, puts the fault in place, keeps the history and reads the topic back with franz-go, the witness (see Driver split) |
+| `runner/go.mod` | pins franz-go v1.20.7, the witness |
 | `drivers/natsgo/` | a separate module that talks to NATS and writes a history to stdout |
 | `drivers/natsgo/go.mod` | pins nats.go v1.54.0 (the fixed release) |
 | `drivers/natsgo/v1.53.1.mod` | pins nats.go v1.53.1 (the last buggy release), used via `-modfile` |
@@ -1748,12 +1765,13 @@ driftlab/
 | `drivers/kafkago/go.mod` | pins kafka-go v0.4.51 and franz-go v1.20.7 |
 | `drivers/relay/` | a separate module that tests a program copying messages between two Kafka clusters: it starts the program with a given command and keeps it running as a supervisor would, writes into the source, can freeze or cut the copy's followers and crash the program meanwhile, and reads the copy back |
 | `drivers/relay/go.mod` | pins franz-go v1.20.7 for the driver's own reads and writes, whatever the program under test uses |
-| `drivers/sarama/` | a separate module that writes through sarama's idempotent producer, or with `-defaults` its default one, and, with a helper, reads through its partition consumer, with franz-go v1.20.7 as the witness; it can cut the partition's followers off from its leader, freeze them, or kill the leader |
+| `drivers/sarama/` | a separate module whose command at its root writes through sarama's idempotent producer, or with `-defaults` its default one, and, with a helper, reads through its partition consumer, with franz-go v1.20.7 as the witness; it can cut the partition's followers off from its leader, freeze them, or kill the leader |
 | `drivers/sarama/go.mod` | pins sarama v1.61.1 and franz-go v1.20.7 |
 | `drivers/sarama/v1.61.0.mod` | pins sarama v1.61.0, the last release without sarama PR 3762, used via `-modfile` |
 | `drivers/sarama/pr3762-before.mod` | pins sarama at d0755db, the commit just before PR 3762, used via `-modfile` |
 | `drivers/sarama/pr3762-after.mod` | pins sarama at 477992f, PR 3762's last commit, used via `-modfile` |
 | `drivers/sarama/repro3843/` | a test that reproduces sarama issue 3843 with mock brokers, which needs no broker at all, and fails while the bug is there |
+| `drivers/sarama/thin/` | the thin sarama driver, a second command in the module: sarama's writer and reader and nothing more, which the runner drives over its stdin and stdout; it links no franz-go |
 | `deploy/compose.yaml` | nats-server with JetStream (weekend 2), toxiproxy (weekend 3) |
 | `deploy/kafka.yaml` | three Kafka 4.3.1 brokers for v1, in a compose project of their own |
 | `deploy/kafka-source.yaml` | a one-broker Kafka cluster in a compose project of its own: the source for programs that copy messages between two clusters |
@@ -1763,7 +1781,7 @@ driftlab/
 | `deploy/nft/` | the image the cut fault of the relay and sarama drivers runs `nft` from: Alpine with nftables, built once with `docker build -t driftlab-nft deploy/nft` |
 | `scripts/matrix.sh` | runs the full matrix (2 versions × 2 APIs × 8 scenarios) and checks every verdict against the table |
 | `scripts/kafka-calibrate.sh` | runs v1's calibration (2 franz-go versions × 2 scenarios × 3 repeats) and checks every verdict against the expected one |
-| `scripts/sarama-calibrate.sh` | runs the sarama calibration (2 commits and 2 releases × 3 scenarios × 3 repeats), checks every verdict against the expected one, and counts each run's out-of-order rejections; `RUNS` and `ARGS` work as in `compare-nats.sh` |
+| `scripts/sarama-calibrate.sh` | runs the sarama calibration (2 commits and 2 releases × 3 scenarios × 3 repeats) through the runner with the thin driver, checks every verdict against the expected one, and counts each run's out-of-order rejections; `RUNS` sets the repeats, and `ARGS` adds runner flags |
 | `scripts/compare-nats.sh` | runs the eight NATS scenarios against two or more driver builds, such as a nats.go pull request and the commit it starts from, and prints their verdicts, recovery and lag side by side; `RUNS` repeats them, `SCENARIOS` picks some, and `ARGS` adds driver flags such as `-block-disconnect` |
 | `scripts/blnk-smoke.py` | a first check of a fresh Blnk: two queued transfers, and the balances adding up to zero |
 | `scripts/blnk-probe-queued.py` | queues transfers as fast as Blnk answers while it stops or kills the API server, or freezes Postgres, then sorts every transfer answered `201 QUEUED` as applied, pending or lost |
@@ -1814,7 +1832,8 @@ driftlab/
 - **The driver split (started 2026-11-08; drivers in other languages):** the runner in Driver
   split, then Kafka's Java and Python clients through the same five faults. It comes before v2's
   ledger checks, whose Blnk driver can then follow the same split. Exit: Java and Python rows in
-  README.md's table, and every Kafka row there produced through the runner.
+  README.md's table, and every Kafka row there produced through the runner. The runner was written
+  by 2026-11-10 and the thin sarama driver by 2026-11-12; the proof, on the New PC, comes next.
 
 ## Beyond v0 (one line each, so v0 stays small)
 
