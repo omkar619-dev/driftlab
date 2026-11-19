@@ -18,7 +18,7 @@ judged again after a checker fix without re-running anything.
 
 ## Findings so far
 
-Ten issues reported to five projects so far: six are fixed, and fixes for two more are in review.
+Ten issues reported to five projects so far: seven are fixed, and a fix for one more is in review.
 
 Against nats.go, the Go client for NATS JetStream, at v1.53.1 and v1.54.0:
 
@@ -52,7 +52,7 @@ Against franz-go, the Go client for Kafka:
   https://github.com/twmb/franz-go/issues/1505 (reported 2026-10-17). The maintainer opened a fix
   the same day, https://github.com/twmb/franz-go/pull/1506, which driftlab checked: with it the
   call returns at its own deadline, and franz-go's fault table came through clean. It was merged on
-  2026-11-08 and isn't in a release yet.
+  2026-11-08 and released in v1.22.3.
 - **After a leader crash, the reader found the new leader up to 5 seconds later than it could.**
   After a failed fetch, franz-go asks for fresh metadata, but drops the request if its last refresh
   finished less than 5 seconds before. Once the retry waits reach their 5-second cap, every second
@@ -64,7 +64,7 @@ Against franz-go, the Go client for Kafka:
   reproduced it on 2026-11-06, with franz-go's fake cluster and on a real one, and proposed the
   fix: hold the request until the limit has passed, instead of dropping it.
   https://github.com/twmb/franz-go/pull/1537 makes that change, with their test. It was merged on
-  2026-11-08 and isn't in a release yet.
+  2026-11-08 and released in v1.22.3.
 
 Against sarama, another Go client for Kafka, at v1.61.1:
 
@@ -77,7 +77,7 @@ Against sarama, another Go client for Kafka, at v1.61.1:
   reproduces it with mock brokers. https://github.com/IBM/sarama/issues/3843 (reported
   2026-10-20). A maintainer suggested copying the Java client, which refreshes metadata before a
   retry only when the error says it is stale, and https://github.com/IBM/sarama/pull/3849 does
-  that; it is in review.
+  that. It was merged on 2026-11-18 and isn't in a release yet.
 - **With its default settings, a leader crash loses acknowledged messages.** By default sarama
   waits only for the partition's leader to store a write, which Kafka documents can lose messages
   the leader acknowledged if it dies before a follower copies them; Kafka's own Java producer has
