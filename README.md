@@ -18,7 +18,8 @@ judged again after a checker fix without re-running anything.
 
 ## Findings so far
 
-Ten issues reported to five projects so far: seven are fixed, and a fix for one more is in review.
+Ten issues reported to five projects so far: seven are fixed, all of them in a release, and a fix
+for one more is in review.
 
 Against nats.go, the Go client for NATS JetStream, at v1.53.1 and v1.54.0:
 
@@ -77,7 +78,7 @@ Against sarama, another Go client for Kafka, at v1.61.1:
   reproduces it with mock brokers. https://github.com/IBM/sarama/issues/3843 (reported
   2026-10-20). A maintainer suggested copying the Java client, which refreshes metadata before a
   retry only when the error says it is stale, and https://github.com/IBM/sarama/pull/3849 does
-  that. It was merged on 2026-11-18 and isn't in a release yet.
+  that. It was merged on 2026-11-18 and released in v1.62.0 on 2026-11-20.
 - **With its default settings, a leader crash loses acknowledged messages.** By default sarama
   waits only for the partition's leader to store a write, which Kafka documents can lose messages
   the leader acknowledged if it dies before a follower copies them; Kafka's own Java producer has
@@ -188,7 +189,7 @@ Against Blnk, an open-source double-entry ledger for fintech products, at v0.15.
   seconds after the last save, not 116.
 
 All three were fixed in Blnk's main on 2026-11-05, three days after the reports, and driftlab ran
-the same probes against it, at `cb48a92`, on 2026-11-06. None of the fixes is in a release yet.
+the same probes against it, at `cb48a92`, on 2026-11-06. All three shipped in v0.15.9 on 2026-11-16.
 These runs used Python probes in `scripts/`, before a Blnk driver exists; the driver, the ledger
 checks and a calibration come next.
 
@@ -282,7 +283,8 @@ go build -C drivers/franzgo -o ../../bin/repro1505 ./repro1505
 ./bin/repro1505
 ```
 
-The one for sarama 3843 is a test with mock brokers, and it fails while the bug is there:
+The one for sarama 3843 is a test with mock brokers. It fails on v1.61.1, which `drivers/sarama`
+pins, because the bug is there, and passes on v1.62.0, which has the fix:
 
 ```bash
 go test -C drivers/sarama -run TestRetryWaitsForSilentBroker -count=1 -v ./repro3843
@@ -309,7 +311,7 @@ bash scripts/blnk-pg-lockdemo.sh
   confluent-kafka-go are checked, and the fault tables of all four are done, each with its
   strongest settings and with its defaults, which for franz-go are the same, and summed up in the
   table above. A relay driver tests programs that copy topics between clusters.
-- v2, ledgers, has started with Blnk: three issues found with probes, all three fixed in Blnk's
-  main, with a driver and ledger checks next.
+- v2, ledgers, has started with Blnk: three issues found with probes, all three fixed in v0.15.9,
+  with a driver and ledger checks next.
 
 Apache-2.0.

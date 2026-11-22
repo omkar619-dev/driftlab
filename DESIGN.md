@@ -1215,10 +1215,11 @@ fixed 418: the API now saves and queues a transfer before it answers, 20 saves a
 answers `409` to a reference already used and `404` to a balance that doesn't exist, and Blnk's
 compose file starts it with `exec blnk start`. https://github.com/blnkfinance/blnk/pull/426,
 merged with it, drops the `data_change` NOTIFY triggers in a migration and leaves alone the
-`transaction_journal` trigger, which the probes read. None of them is in a release yet; the latest
-is still v0.15.8. On 2026-11-06 the queued, rate and hot-lane probes ran against main at cb48a92,
-built from source like PR 423 (`blnk:main-cb48a92`), on the same machine. The stack went
-`down -v` first: with the migration, the two versions can't share a database.
+`transaction_journal` trigger, which the probes read. All four shipped in v0.15.9 on 2026-11-16;
+when these runs were made, the latest release was still v0.15.8. On 2026-11-06 the queued, rate and
+hot-lane probes ran against main at cb48a92, built from source like PR 423 (`blnk:main-cb48a92`), on
+the same machine. The stack went `down -v` first: with the migration, the two versions can't share a
+database.
 
 | Run | v0.15.7, answered `201 QUEUED` | never saved | main, answered `201 QUEUED` | never saved |
 |---|---|---|---|---|
