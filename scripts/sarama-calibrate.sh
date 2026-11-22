@@ -13,21 +13,27 @@
 # The script counts those rejections in a column of their own, and only the
 # two builds without PR 3762 should have any.
 #
+# Every run goes through the runner, bin/driftlab-run, with the thin sarama
+# driver, drivers/sarama/thin, built once for each pin, and with sarama's
+# idempotent settings, the ones drivers/sarama was calibrated with
+# (DESIGN.md, Driver split, Proof).
+#
 # Run it on the machine that hosts the Kafka brokers, because followers-cut
 # changes their firewalls through docker:
 #
 #	scripts/sarama-calibrate.sh
 #
 # RUNS sets how many times each build runs each scenario (3). ARGS adds
-# driver flags to every run, and its letters and digits to every file name,
+# runner flags to every run, and its letters and digits to every file name,
 # so those runs don't overwrite plain ones:
 #
 #	RUNS=1 ARGS="-hold 15s" scripts/sarama-calibrate.sh
 #
 # Each scenario runs on every build back to back, so the rows to compare sit
 # together and a busy moment on the machine lands on every build. Each run's
-# history and verdict land in runs/sarama-calibrate/. It exits 0 when every
-# verdict is as expected, and 1 when any is not.
+# history, verdict and log land in runs/sarama-calibrate/: the log is the
+# runner's stderr, with the driver's log and the pipe check. It exits 0 when
+# every verdict is as expected, and 1 when any is not.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
@@ -49,12 +55,13 @@ scenarios=(timeout-control followers-cut followers-cut-single)
 
 echo "building from commit $(git rev-parse --short HEAD)"
 go build -o bin/driftlab ./cmd/driftlab || exit 1
+go build -C runner -o ../bin/driftlab-run . || exit 1
 for build in "${builds[@]}"; do
 	modfile=()
 	if [ "$build" != v1.61.1 ]; then
 		modfile=(-modfile="$build.mod")
 	fi
-	go build -C drivers/sarama ${modfile[@]+"${modfile[@]}"} -o "../../bin/saramadriver-$build" . || exit 1
+	go build -C drivers/sarama ${modfile[@]+"${modfile[@]}"} -o "../../bin/sarama-thin-$build" ./thin || exit 1
 done
 docker build -q -t driftlab-nft deploy/nft >/dev/null || exit 1
 docker compose -f deploy/kafka.yaml up -d || exit 1
@@ -85,11 +92,12 @@ for run in $(seq "$runs"); do
 			total=$((total + 1))
 			name=$build-$scenario${tag:+-$tag}-$run
 			rm -f "$out/$name.txt"
-			if "bin/saramadriver-$build" -scenario "$scenario" ${extra[@]+"${extra[@]}"} >"$out/$name.jsonl"; then
+			# The runner's flags come before --, and the driver's command after.
+			if bin/driftlab-run -scenario "$scenario" -settings idempotent ${extra[@]+"${extra[@]}"} -- "bin/sarama-thin-$build" >"$out/$name.jsonl" 2>"$out/$name.log"; then
 				bin/driftlab check "$out/$name.jsonl" >"$out/$name.txt"
 				got=${verdicts[$?]}
 			else
-				got="driver error"
+				got="run error"
 			fi
 
 			# How many publishes ended unknown, out of all of them, from the
