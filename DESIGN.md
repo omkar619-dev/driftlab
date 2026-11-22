@@ -1725,6 +1725,10 @@ lists its flags and scenarios.
 
 ```
 driftlab/
+├── .github/
+│   ├── pull_request_template.md
+│   └── workflows/
+│       └── ci.yml
 ├── DESIGN.md
 ├── go.mod
 ├── cmd/driftlab/
@@ -1782,6 +1786,8 @@ driftlab/
 
 | Path | What it is |
 |---|---|
+| `.github/pull_request_template.md` | the sections every pull request fills in |
+| `.github/workflows/ci.yml` | the checks GitHub runs on every pull request and every push to main: gofmt over the tree, `go vet` and `go test -race` in each module and against each pinned `.mod` file, and the scripts' syntax; the Kafka runs stay on the New PC |
 | `go.mod` | the root module: the checker and the CLI, with no client libraries |
 | `cmd/driftlab/` | the CLI: `driftlab check <history.jsonl>` |
 | `internal/history/` | the Op type and the JSONL reader |
