@@ -1457,6 +1457,46 @@ the three `.mod` files pin its sarama too, as they pin drivers/sarama's. The cal
 the runner with `-settings idempotent`, the settings drivers/sarama was calibrated with. It keeps
 each run's stderr, with the driver's log and the pipe check, beside the run's history.
 
+**Proof results.** On 2026-11-22, at commit `1dd411e`, against apache/kafka 4.3.1 on the New PC, the
+runner and the thin driver gave both known results again.
+
+- `scripts/sarama-calibrate.sh` came out as expected in all 36 runs. `followers-cut-single` failed
+  all three times on d0755db and on v1.61.0, each run with two lost writes, two inconsistent offsets
+  and one or two nonmonotonic sends, and passed every time on 477992f and v1.61.1. In
+  `followers-cut`, the two builds without 3762 had 410 to 1,656 publishes turned away as out of
+  order, where October's runs had 415 to 1,269, and the fixed builds had none in any of their 18
+  runs.
+- The first run of all wasn't quiet. `timeout-control` on d0755db, which has no fault, began 20
+  seconds after the script had started the brokers, which had been stopped, and 327 of its 3,200
+  publishes failed, all among the first 400 values: 240 with UNKNOWN_TOPIC_OR_PARTITION (`code` 3),
+  and 87 turned away as out of order. Every later control run had none, and so had all 12 of
+  October's. Each run writes to a topic of its own, and `waitForLeaders`, which `runner/kafka.go`
+  took from the drivers unchanged, stops waiting as soon as one broker's answer shows the topic with
+  a leader, so on a cluster that has just started, a run can begin before every broker knows its
+  topic. The verdict was still clean, as expected. Waiting for every broker is a change of its own,
+  after the split.
+- sarama's defaults in `leader-kill-live`, on v1.61.1, still lose acknowledged messages: 521, 1, 522
+  and 1 in four of five runs with the driver started directly, and 2 in one run with it inside a
+  container. October's five lost 1, 526, 1, 524 and 521, the same two sizes. In each of these runs
+  the new leader's first acknowledgement reused an offset the old leader had already acknowledged:
+  its last one when 1 was lost, the one before it when 2 were, and offset 0 when the follower that
+  took over had copied nothing.
+- The other direct run lost nothing, and the runner did its part there too: it killed the leader,
+  kafka-1, and broker 2 took over 8.8 seconds later, within the 8.6 to 12.5 seconds of all six runs.
+  The new leader's first acknowledgement came at offset 526, right after the old leader's last at
+  525, so the follower that took over had every message the leader had acknowledged. With the
+  defaults, an acknowledged message is lost only if the leader dies before the follower that takes
+  over has copied it, so a run can lose nothing, as two of the three `leader-kill-steady` runs with
+  the defaults did.
+- The pipe check, with the same binary built with `CGO_ENABLED=0`: the round trip from `publish` to
+  `taken` took 0.070 to 0.077 ms at the median in the five direct runs, and 0.252 ms with the driver
+  inside a container (`docker run --rm -i --network host`, from the `driftlab-nft` image, alpine
+  3.22). Docker adds about 0.18 ms. At `leader-kill-live`'s 1 ms interval, that stretches a direct
+  run's pace by about 7% and a container's by about a quarter, so a driver in a container writes
+  about a sixth slower than one started directly at the same interval. The slowest round trips took
+  2.7 to 19.2 ms; the runner doesn't record when. Whether the runner should take the round trip off
+  the pause, so every driver writes at the same pace, is still open.
+
 **Java and Python.** Each runs in a Docker image, pinned the way a `.mod` file pins a Go driver:
 the base image by digest, the client library by exact version, and that version in the image's tag.
 The New PC needs nothing installed beyond Docker, which it already runs. The container uses the
