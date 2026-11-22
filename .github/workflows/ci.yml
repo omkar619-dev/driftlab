@@ -1,0 +1,111 @@
+# The checks the pull request template asks for, run by GitHub on every pull
+# request and every push to main: gofmt over the tree, then go vet and
+# go test -race in each Go module and against each pinned .mod file, and the
+# scripts' syntax. The Kafka runs, the calibrations and the proof, are not
+# here: they need three real brokers, faults made with docker and nftables,
+# and a quiet machine, so they run on the New PC (DESIGN.md, Proof).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  format:
+    name: gofmt and scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.27.x'
+          cache: false
+      - name: gofmt -l
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            printf 'gofmt would change these files:\n%s\n' "$out"
+            exit 1
+          fi
+      - name: bash -n scripts/*.sh
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+      - name: the Python scripts parse
+        run: python3 -I -c 'import ast, glob; [ast.parse(open(f).read(), f) for f in sorted(glob.glob("scripts/*.py"))]'
+
+  module:
+    name: go ${{ matrix.dir == '.' && 'root module' || matrix.dir }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [., runner, drivers/confluent, drivers/franzgo, drivers/kafkago, drivers/natsgo, drivers/relay, drivers/sarama]
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.27.x'
+          # The root module has no dependencies, so it has no go.sum to key a cache on.
+          cache: ${{ matrix.dir != '.' }}
+          cache-dependency-path: ${{ matrix.dir }}/go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        # drivers/sarama/repro3843 reproduces https://github.com/IBM/sarama/issues/3843
+        # and fails on purpose on the sarama this module pins, so it is left out
+        # (README.md, Running it, shows how to run it by hand).
+        run: |
+          pkgs=$(go list ./... | grep -v '/repro3843$')
+          go test -race -count=1 $pkgs
+
+  pin:
+    name: go ${{ matrix.dir }} with ${{ matrix.mod }}.mod
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { dir: drivers/sarama, mod: pr3762-before }
+          - { dir: drivers/sarama, mod: pr3762-after }
+          - { dir: drivers/sarama, mod: v1.61.0 }
+          - { dir: drivers/franzgo, mod: v1.20.6 }
+          - { dir: drivers/franzgo, mod: v1.22.2 }
+          - { dir: drivers/natsgo, mod: v1.53.1 }
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.27.x'
+          cache-dependency-path: ${{ matrix.dir }}/${{ matrix.mod }}.sum
+      - name: go vet
+        run: go vet -modfile=${{ matrix.mod }}.mod ./...
+      - name: go test -race
+        run: |
+          pkgs=$(go list -modfile=${{ matrix.mod }}.mod ./... | grep -v '/repro3843$')
+          go test -race -count=1 -modfile=${{ matrix.mod }}.mod $pkgs
