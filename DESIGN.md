@@ -1475,7 +1475,7 @@ runner and the thin driver gave both known results again.
   took from the drivers unchanged, stops waiting as soon as one broker's answer shows the topic with
   a leader, so on a cluster that has just started, a run can begin before every broker knows its
   topic. The verdict was still clean, as expected. Waiting for every broker is a change of its own,
-  after the split.
+  before the Java driver's runs.
 - sarama's defaults in `leader-kill-live`, on v1.61.1, still lose acknowledged messages: 521, 1, 522
   and 1 in four of five runs with the driver started directly, and 2 in one run with it inside a
   container. October's five lost 1, 526, 1, 524 and 521, the same two sizes. In each of these runs
@@ -1492,11 +1492,16 @@ runner and the thin driver gave both known results again.
 - The pipe check, with the same binary built with `CGO_ENABLED=0`: the round trip from `publish` to
   `taken` took 0.070 to 0.077 ms at the median in the five direct runs, and 0.252 ms with the driver
   inside a container (`docker run --rm -i --network host`, from the `driftlab-nft` image, alpine
-  3.22). Docker adds about 0.18 ms. At `leader-kill-live`'s 1 ms interval, that stretches a direct
-  run's pace by about 7% and a container's by about a quarter, so a driver in a container writes
-  about a sixth slower than one started directly at the same interval. The slowest round trips took
-  2.7 to 19.2 ms; the runner doesn't record when. Whether the runner should take the round trip off
-  the pause, so every driver writes at the same pace, is still open.
+  3.22). Docker adds about 0.18 ms. The slowest round trips took 2.7 to 19.2 ms; the runner doesn't
+  record when.
+- The pipe doesn't set the pace, though. In the same six histories, the time from one `publish` to
+  the next was 1.16 to 1.44 ms at the median in the direct runs and 1.40 ms in the container's,
+  against the 1 ms interval, and a tenth of the gaps took more than 1.83 ms. Most of that extra time
+  isn't the pipe's, and it differs from run to run; the pause running long is the likely cause. The
+  pipe shows only in the shortest gaps: a tenth took 1.13 ms or less in the direct runs and 1.30 ms
+  or less in the container's, which differ by about the 0.18 ms Docker adds. Holding every run to
+  its interval, whatever the pipe and the pause cost, is a change of its own, before the Java
+  driver's runs.
 
 **Java and Python.** Each runs in a Docker image, pinned the way a `.mod` file pins a Go driver:
 the base image by digest, the client library by exact version, and that version in the image's tag.
